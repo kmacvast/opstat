@@ -79,8 +79,8 @@ placed under [`releases/`](releases/).
 | Platform | Artifact name (typical) |
 |----------|-------------------------|
 | Linux x86_64 | `opstat-linux-x86_64` |
-| macOS (Intel / Apple Silicon) | `opstat-macos-x86_64` / `opstat-macos-arm64` |
-| Windows | `opstat-windows-x86_64.exe` |
+| macOS Apple Silicon | `opstat-macos-arm64` |
+| Windows x86_64 | `opstat-windows-x86_64.exe` |
 
 ```bash
 # Linux / macOS

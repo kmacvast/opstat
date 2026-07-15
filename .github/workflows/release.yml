@@ -1,8 +1,9 @@
 # Build and publish standalone opstat binaries on tag push.
 #
 # Triggers: git tag v* (e.g. v0.1.2) && git push --tags
-# Matrix:   Ubuntu, macOS, Windows (native PyInstaller per OS)
+# Matrix:   Ubuntu, macOS (Apple Silicon), Windows (native PyInstaller per OS)
 # Result:   Artifacts uploaded to the GitHub Release for that tag
+# Note:     Intel macOS (x86_64) builds are intentionally not produced.
 
 name: Release
 
@@ -26,8 +27,6 @@ jobs:
             artifact: opstat-linux-x86_64
           - os: macos-latest
             artifact: opstat-macos-arm64
-          - os: macos-13
-            artifact: opstat-macos-x86_64
           - os: windows-latest
             artifact: opstat-windows-x86_64.exe
 
