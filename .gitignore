@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local PyInstaller staging under releases/ (keep docs / gitkeep; ignore binaries)
+releases/opstat-*
+!releases/README.md
+!releases/.gitkeep

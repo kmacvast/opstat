@@ -1,0 +1,322 @@
+#!/usr/bin/env python3
+################################################################################
+# Script Name: opstat
+# Description: Multi-protocol VAST performance statistics tool. Phase 1 routes
+#              --nfs --version=3.0 to NFS v3; --nfs --version=4.1 to NFS v4.1;
+#              Phase 2 routes --block --nvme-over-tcp to NVMe-oTCP block statistics;
+#              --smb routes to SMB statistics (v0.1.2).
+#
+# Author: KMac kmac@vastdata.com
+# Version: 0.1.2
+################################################################################
+
+import argparse
+import os
+import sys
+import textwrap
+
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
+import nfs_v3
+import nfs_v41
+import nvme_tcp
+import smb
+import wizard
+
+VERSION = "0.1.2"
+
+DEFAULT_PORT = 443
+DEFAULT_USER = "admin"
+DEFAULT_REFRESH_SECONDS = 5
+
+SUPPORTED_NFS_VERSIONS = frozenset({"3.0", "4.1"})
+# Convenience aliases so users can pass shorthand major versions.
+NFS_VERSION_ALIASES = {"3": "3.0", "4": "4.1"}
+PLANNED_NFS_VERSIONS = frozenset({"4.2"})
+
+EPILOG = textwrap.dedent(
+    """\
+    examples:
+      ./opstat                                       # interactive wizard (TTY)
+      ./opstat --nfs --version=3.0 --vms <HOST>
+      ./opstat --nfs --version=4.1 --vms <HOST>
+      ./opstat --block --nvme-over-tcp --vms <HOST>
+      ./opstat --smb --vms <HOST> --clients 10.1.1.5
+      ./opstat --nfs --version=3.0 --vms localhost --vms-port 8443
+
+    protocols:
+      --nfs --version={3.0|4.1}     NFS v3 or NFS v4.1
+      --block --nvme-over-tcp       NVMe over TCP block storage
+      --smb                         SMB / SMB2
+
+    auth:
+      Prefer VAST_PASSWORD or VAST_TOKEN env vars, or omit --password
+      to be prompted securely (never put secrets on the command line).
+
+    docs:
+      README.md, SETUP.md, and the protocol-specific READMEs in this repo.
+    """
+)
+
+
+def new_argument_parser(description):
+    kwargs = dict(
+        prog="opstat",
+        description=description,
+        epilog=EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        allow_abbrev=False,
+    )
+    try:
+        return argparse.ArgumentParser(**kwargs, color=False)
+    except TypeError:
+        return argparse.ArgumentParser(**kwargs)
+
+
+def validate_protocol_args(args):
+    """Validate protocol flag combinations after argparse parsing."""
+    if args.clients and not args.smb:
+        raise SystemExit(
+            "ERROR: --client/--clients is only supported with --smb."
+        )
+
+    if args.nfs:
+        if not args.protocol_version:
+            raise SystemExit(
+                "ERROR: --version is required when using --nfs.\n"
+                "Example: opstat --nfs --version=3.0 --vms <VMS_IP>"
+            )
+        args.protocol_version = NFS_VERSION_ALIASES.get(
+            args.protocol_version, args.protocol_version
+        )
+        if args.protocol_version in PLANNED_NFS_VERSIONS:
+            raise SystemExit(
+                f"ERROR: NFS version '{args.protocol_version}' is not implemented yet.\n"
+                f"Supported NFS versions: {', '.join(sorted(SUPPORTED_NFS_VERSIONS))}"
+            )
+        if args.protocol_version not in SUPPORTED_NFS_VERSIONS:
+            raise SystemExit(
+                f"ERROR: Unsupported NFS version '{args.protocol_version}'.\n"
+                f"Supported NFS versions: {', '.join(sorted(SUPPORTED_NFS_VERSIONS))}"
+            )
+        return
+
+    if args.block:
+        if not args.nvme_over_tcp:
+            raise SystemExit(
+                "ERROR: --block requires --nvme-over-tcp.\n"
+                "Example: opstat --block --nvme-over-tcp --vms <VMS_IP>"
+            )
+        return
+
+
+def parse_args(argv=None):
+    parser = new_argument_parser(
+        "Live multi-protocol performance statistics for VAST Data clusters."
+    )
+
+    protocol = parser.add_argument_group("protocol (exactly one required)")
+    exclusive = protocol.add_mutually_exclusive_group(required=True)
+    exclusive.add_argument(
+        "--block",
+        action="store_true",
+        help="Block storage statistics (requires --nvme-over-tcp)",
+    )
+    exclusive.add_argument(
+        "--nfs",
+        action="store_true",
+        help="NFS protocol statistics (requires --version)",
+    )
+    exclusive.add_argument(
+        "--smb",
+        action="store_true",
+        help="SMB protocol statistics",
+    )
+
+    protocol.add_argument(
+        "--nvme-over-tcp",
+        action="store_true",
+        help="NVMe-oTCP transport for --block",
+    )
+    protocol.add_argument(
+        "--version",
+        dest="protocol_version",
+        default=None,
+        metavar="VER",
+        help="NFS version: 3 or 3.0, 4 or 4.1 (required with --nfs)",
+    )
+
+    conn = parser.add_argument_group("connection")
+    conn.add_argument(
+        "--vms",
+        required=True,
+        metavar="HOST",
+        help="VMS hostname or IP (use localhost with an SSH tunnel)",
+    )
+    conn.add_argument(
+        "--vms-port",
+        dest="port",
+        type=int,
+        default=DEFAULT_PORT,
+        metavar="PORT",
+        help=f"VMS HTTPS port (default: {DEFAULT_PORT})",
+    )
+    conn.add_argument(
+        "--port",
+        dest="port",
+        type=int,
+        help=argparse.SUPPRESS,
+    )
+    conn.add_argument(
+        "--user",
+        default=DEFAULT_USER,
+        metavar="USER",
+        help=f"VMS username (default: {DEFAULT_USER})",
+    )
+    conn.add_argument(
+        "--password",
+        default=None,
+        metavar="PASS",
+        help="VMS password (omit to prompt; prefer VAST_PASSWORD env var)",
+    )
+
+    run = parser.add_argument_group("runtime")
+    run.add_argument(
+        "--sample-average",
+        default=None,
+        metavar="WIN",
+        help="Rolling sample-average window (e.g. 10m, 1h, 4h)",
+    )
+    run.add_argument(
+        "--refresh",
+        type=int,
+        default=DEFAULT_REFRESH_SECONDS,
+        metavar="SEC",
+        help=f"Dashboard refresh interval in seconds (default: {DEFAULT_REFRESH_SECONDS})",
+    )
+    run.add_argument(
+        "--csv",
+        default=None,
+        metavar="FILE",
+        help="Append captured samples to a CSV file",
+    )
+    run.add_argument(
+        "--no-color",
+        action="store_true",
+        help="Disable ANSI color output",
+    )
+    run.add_argument(
+        "--discover-metrics",
+        action="store_true",
+        help="Enumerate available VMS metrics/objects, then exit",
+    )
+
+    scope = parser.add_argument_group("scoping")
+    scope.add_argument(
+        "--volume",
+        dest="volumes",
+        default=None,
+        metavar="NAME",
+        help="Limit NVMe-oTCP stats to one volume (alias of --volumes)",
+    )
+    scope.add_argument(
+        "--volumes",
+        dest="volumes",
+        default=None,
+        metavar="NAMES",
+        help="Comma-separated volume names for NVMe-oTCP scoping",
+    )
+    scope.add_argument(
+        "--client",
+        dest="clients",
+        default=None,
+        metavar="IP",
+        help="Limit SMB stats to one client IP/hostname (alias of --clients)",
+    )
+    scope.add_argument(
+        "--clients",
+        dest="clients",
+        default=None,
+        metavar="IPS",
+        help="Comma-separated client IPs/hostnames for SMB scoping",
+    )
+
+    export = parser.add_argument_group("export and diagnostics")
+    export.add_argument(
+        "--log-api-calls",
+        action="store_true",
+        help="Log VMS REST requests/responses under /tmp",
+    )
+    export.add_argument(
+        "--export-openmetrics",
+        action="store_true",
+        help="Stream polled metrics to a JSON Lines (.jsonl) file",
+    )
+    export.add_argument(
+        "--openmetrics-file",
+        dest="openmetrics_file",
+        default=None,
+        metavar="FILE",
+        help="Destination .jsonl path for --export-openmetrics (default: auto under /tmp)",
+    )
+
+    ui = parser.add_argument_group("interactive")
+    ui.add_argument(
+        "--menu",
+        "-i",
+        action="store_true",
+        help="Launch the interactive setup wizard",
+    )
+    ui.add_argument(
+        "--no-menu",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    ui.add_argument(
+        "-V",
+        "--tool-version",
+        action="version",
+        version=f"%(prog)s {VERSION}",
+        help="Print opstat version and exit",
+    )
+
+    args = parser.parse_args(argv)
+    validate_protocol_args(args)
+    return args
+
+
+def dispatch(args):
+    """Route parsed arguments to the appropriate protocol handler."""
+    if args.nfs and args.protocol_version == "3.0":
+        return nfs_v3.run(args)
+    if args.nfs and args.protocol_version == "4.1":
+        return nfs_v41.run(args)
+    if args.block and args.nvme_over_tcp:
+        return nvme_tcp.run(args)
+    if args.smb:
+        return smb.run(args)
+    raise SystemExit("ERROR: No protocol handler matched the supplied flags.")
+
+
+def main(argv=None):
+    source = list(argv) if argv is not None else sys.argv[1:]
+    if wizard.should_launch(source, sys.stdin.isatty(), sys.stdout.isatty()):
+        built = wizard.run()
+        if built is None:
+            return 0
+        source = built
+    args = parse_args(source)
+    if any(a == "--password" or a.startswith("--password=") for a in source):
+        print(
+            "WARNING: passing --password on the command line exposes it via `ps` "
+            "and shell history. Prefer the VAST_PASSWORD/VAST_TOKEN env var or the "
+            "secure prompt.",
+            file=sys.stderr,
+        )
+    return dispatch(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)
