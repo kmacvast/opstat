@@ -1,12 +1,18 @@
-# Staging area for standalone opstat binaries
+# Pre-built opstat binaries (v0.1.2)
 
-Build outputs from `scripts/build.sh`, `scripts/build.bat`, or
-`scripts/build_opstat.py` are copied here as:
+Standalone PyInstaller builds from the `v0.1.2` GitHub Actions release workflow.
 
-- `opstat-linux-x86_64`
-- `opstat-macos-x86_64` / `opstat-macos-arm64`
-- `opstat-windows-x86_64.exe`
+| File | Platform |
+|------|----------|
+| `opstat-linux-x86_64` | Linux x86_64 |
+| `opstat-macos-arm64` | macOS Apple Silicon |
+| `opstat-windows-x86_64.exe` | Windows x86_64 |
 
-CI attaches the same names to GitHub Releases when you push a `v*` tag.
-Do not commit large binaries unless you intentionally want them in git history;
-prefer Releases for distribution.
+`opstat-macos-x86_64` (Intel Mac) is pending; the `macos-13` builder was still queued when these were published.
+
+```bash
+chmod +x opstat-linux-x86_64   # Linux / macOS
+./opstat-linux-x86_64 --help
+```
+
+Prefer [GitHub Releases](https://github.com/kmacvast/opstat/releases) once the full matrix completes.
