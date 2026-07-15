@@ -1,0 +1,15 @@
+# opstat runtime dependencies
+#
+# opstat and the protocol engines use Python 3.8+ standard library only
+# (urllib, ssl, argparse, csv, termios, etc.). No third-party pip packages are
+# required to run the application.
+#
+# Python version: >=3.8
+#
+# Optional - development / unit tests:
+#   pip install pytest>=8.0.0 pytest-mock>=3.12.0
+#
+# Optional - standalone binary builds:
+#   pip install pyinstaller>=6.0
+#   ./scripts/build.sh          # Linux / macOS
+#   scripts\build.bat           # Windows
