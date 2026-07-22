@@ -236,9 +236,10 @@ sample:2026-07-07T17:15:33Z   vast-os-release-5.4.3-sp4
 
 **S3** ([details](S3_README.md))
 
-1. **S3 HEALTH & WORKLOAD** - ops, latency, BW, GET/PUT/metadata mix
-2. **LATENCY & THROUGHPUT** - GET / PUT data path with size and latency
-3. **S3 OPCODE BREAKDOWN** - GET, PUT, DELETE, HEAD, LIST, MULTIPART when live
+1. **S3 HEALTH & WORKLOAD** - ops, latency (**ms**), BW, GET/PUT/DELETE/LIST+HEAD mix
+2. **S3 REST OPERATIONS** - one row per live call (GET, PUT, DELETE, HEAD, LIST, …);
+   BW auto-scales KB/MB/GB. Drills show GET/s · PUT/s · DEL/s · LIST/s with Top Op
+   as a REST name. See [S3_README.md](S3_README.md) for ViewMetrics / VIP unit notes.
 
 ### OpenMetrics lines
 

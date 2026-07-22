@@ -28,6 +28,7 @@ import base64
 import csv
 import getpass
 import io
+import ipaddress
 import json
 import os
 import re
@@ -35,6 +36,7 @@ import shutil
 import ssl
 import sys
 import time
+import urllib.parse
 from datetime import datetime
 
 import openmetrics
@@ -43,8 +45,8 @@ import vast_common
 from tui_layout import (
     display_width, format_fixed_number, format_scaled_metric, join_columns,
     pad_display, truncate_display, c, set_color, set_unicode, glyph_set,
-    as_float, raw_bw_to_mb_sec, raw_bw_to_gb_sec, format_throughput_mbs,
-    format_latency_us, format_iops, format_block_size, format_os_release,
+    as_float, raw_bw_to_mb_sec, format_throughput_mbs,
+    format_iops, format_block_size, format_os_release,
     _RST, _BOLD, _DIM, _GREEN, _YELLOW, _CYAN,
     _BRED, _BGREEN, _BYELLOW, _BCYAN, _BWHITE,
 )
@@ -78,19 +80,19 @@ S3_HISTOGRAM_OPS = (
     "get_object_acl", "put_object_copy", "initiate_mpu", "complete_mpu",
 )
 
-# Opcode workflow panel (order = troubleshooting priority).
+# S3 REST call rows (order = troubleshooting priority). Labels are API names.
 S3_OPCODES = (
-    ("GET / READ", "data", "get_object"),
-    ("PUT / WRITE", "data", "put_object"),
+    ("GET", "data", "get_object"),
+    ("PUT", "data", "put_object"),
     ("DELETE", "data", "delete_object"),
     ("HEAD", "metadata", "head_object"),
     ("LIST", "metadata", "get_bucket"),
     ("MULTIPART", "data", "multi_part_upload"),
-    ("INIT MPU", "data", "initiate_mpu"),
-    ("COMPLETE MPU", "data", "complete_mpu"),
+    ("INIT_MPU", "data", "initiate_mpu"),
+    ("COMPLETE_MPU", "data", "complete_mpu"),
 )
 
-_OPCODE_COL = {"label": 16, "iops": 11, "throughput": 11, "size": 9, "latency": 11, "source": 10}
+_OPCODE_COL = {"label": 14, "iops": 11, "throughput": 12, "size": 9, "latency": 10, "source": 10}
 
 OBJECT_ENDPOINTS = (
     "/cnodes/", "/views/", "/tenants/", "/vips/",
@@ -154,18 +156,22 @@ _DRILL_CFG = {
         "label": "VIP",
         "object_type": "vip",
         "endpoint": "/vips/",
-        "name_fields": ("ip", "name", "address"),
+        # Prefer human names; never lead with internal 192.168.* IPs.
+        "name_fields": ("name", "vippool", "pool", "title", "hostname", "ip", "address"),
         "no_aggregation": False,
     },
 }
 
 _MAX_DRILL_OBJECTS = 8
 _DRILL_PROBE_LIMIT = 32
-_DRILL_COL = {"name": 24, "ops": 12, "lat": 10, "bw": 9, "top": 12, "pct": 6}
+# Bucket/VIP drill: per-REST-call rates + auto-scaled bandwidth.
+_DRILL_COL = {
+    "name": 18, "get": 9, "put": 9, "delete": 9, "list": 9,
+    "bw": 11, "lat": 8, "top": 8, "pct": 5,
+}
 
 HEALTH_PANEL_TITLE = "S3 HEALTH & WORKLOAD"
-LATENCY_PANEL_TITLE = "LATENCY & THROUGHPUT"
-OPCODE_PANEL_TITLE = "S3 OPCODE BREAKDOWN"
+REST_PANEL_TITLE = "S3 REST OPERATIONS"
 
 DATA_OPS = [("get", "GET"), ("put", "PUT")]
 METADATA_OPS = [
@@ -175,7 +181,6 @@ METADATA_OPS = [
 ]
 
 _COL_SEP = "  "
-_COL = {"label": 14, "iops": 12, "throughput": 12, "size": 10, "latency": 12}
 
 _ANSI_RE = re.compile(r"\033\[[^m]*m")
 _UTF8 = (sys.stdout.encoding or "ascii").lower().startswith("utf")
@@ -212,6 +217,7 @@ DRILL_MONITORS = []
 LAST_DRILL_ROWS = []
 DRILL_ERROR = None
 DRILL_STATUS = None
+VIP_TOPN = None
 CSV_FILE = None
 RUN_STARTED_AT = None
 
@@ -330,11 +336,68 @@ def _first_positive(*values):
     return None
 
 
+def format_latency_ms(us, active=True):
+    """Format latency for S3 TUI: always milliseconds (never µs)."""
+    if not active:
+        return "-", None
+    us = as_float(us)
+    if us is None or us <= 0:
+        return "-", None
+    return f"{us / 1000.0:.2f} ms", us
+
+
 def fmt_delta(value, precision=2):
     if value is None:
         return "-"
     sign = "+" if value > 0 else ""
     return f"{sign}{value:,.{precision}f}"
+
+
+def _is_192_168_ip(value):
+    """True when *value* is an IPv4 address in 192.168.0.0/16."""
+    if value is None:
+        return False
+    token = str(value).strip().split()[0].split("/")[0]
+    try:
+        ip = ipaddress.ip_address(token)
+    except ValueError:
+        return False
+    return isinstance(ip, ipaddress.IPv4Address) and ip in ipaddress.ip_network("192.168.0.0/16")
+
+
+def _vip_display_name(obj):
+    """Human VIP label that never surfaces 192.168.* addresses."""
+    for field in ("name", "vippool", "pool", "title", "hostname"):
+        val = obj.get(field)
+        if val is None:
+            continue
+        text = str(val).strip()
+        if text and not _is_192_168_ip(text):
+            return text
+    for field in ("ip", "address", "vip"):
+        val = obj.get(field)
+        if val is None:
+            continue
+        text = str(val).strip()
+        if text and not _is_192_168_ip(text):
+            return text
+    pool = obj.get("vippool") or obj.get("pool") or "vip"
+    return f"{pool}-{obj.get('id', '?')}"
+
+
+def _vip_objects_for_drill(objects):
+    """Filter VIP list and attach safe display names (hide 192.168.*)."""
+    selected = []
+    for obj in objects:
+        if "id" not in obj:
+            continue
+        # Skip VIPs whose only identifiable address is 192.168.* with no other label.
+        name = _vip_display_name(obj)
+        ip_val = obj.get("ip") or obj.get("address")
+        if _is_192_168_ip(ip_val) and name == str(ip_val).strip():
+            continue
+        selected.append({"id": obj["id"], "name": name, "_raw": obj})
+    return selected
 
 
 def box_top(title, width):
@@ -742,39 +805,51 @@ def build_rows_from_results(headline_result):
 
 
 def _s3_op_rate_and_lat(result, op):
-    """Resolve ops/s and latency for an S3Metrics op across FQN forms."""
+    """Resolve ops/s and latency for an S3Metrics op across FQN forms.
+
+    Instantaneous ``*__rate`` / ``*_latency__rate`` fields are taken from the
+    latest sample as-is. Bare counters (``S3Metrics,{op}``) are cumulative and
+    must be converted via sample deltas; never treat the raw counter as ops/s.
+    """
     if not result:
         return None, None
-    rate_candidates = (
+    rate_fqns = (
         f"S3Metrics,{op}__rate",
         f"S3Metrics,{op}_latency__rate",
-        f"S3Metrics,{op}",
     )
+    counter_fqn = f"S3Metrics,{op}"
     avg_candidates = (
         f"S3Metrics,{op}__avg",
         f"S3Metrics,{op}_latency__avg",
     )
+
+    values, _sample = _latest_row(result)
     ops = None
-    for fqn in rate_candidates:
-        ops = _delta_rate_from_samples(result, fqn)
-        if ops is None:
-            values, _s = _latest_row(result)
-            ops = as_float(values.get(fqn))
-        if ops is not None and ops > 0:
+    for fqn in rate_fqns:
+        instant = as_float(values.get(fqn))
+        if instant is not None and instant > 0:
+            ops = instant
             break
-        ops = None
+    if ops is None:
+        # Cumulative counter only: delta over the monitor window.
+        ops = _delta_rate_from_samples(result, counter_fqn)
+        if ops is not None and ops <= 0:
+            ops = None
 
     lat = None
     for avg_fqn in avg_candidates:
-        for rate_fqn in rate_candidates:
-            lat = _avg_from_sum_count_deltas(result, avg_fqn, rate_fqn)
+        lat = as_float(values.get(avg_fqn))
+        if lat is not None and lat > 0:
+            break
+        lat = None
+    if lat is None:
+        for avg_fqn in avg_candidates:
+            for rate_fqn in rate_fqns + (counter_fqn,):
+                lat = _avg_from_sum_count_deltas(result, avg_fqn, rate_fqn)
+                if lat is not None:
+                    break
             if lat is not None:
                 break
-        if lat is None:
-            values, _s = _latest_row(result)
-            lat = as_float(values.get(avg_fqn))
-        if lat is not None:
-            break
     return ops, lat
 
 
@@ -815,28 +890,58 @@ def _visible_opcode_rows(rows):
     return [row for row in rows if _opcode_has_data(row)]
 
 
+def _s3metrics_looks_like_cumulative(native_rows, meta):
+    """Reject S3Metrics rates that dwarf S3Common (classic cumulative misuse)."""
+    native_total = sum(as_float(r.get("ops_sec")) or 0 for r in native_rows)
+    if native_total <= 0:
+        return False
+    common_total = as_float(meta.get("total_iops")) or 0
+    if common_total <= 0:
+        # No S3Common baseline; still reject absurd absolute rates.
+        return native_total > 1_000_000
+    return native_total > max(common_total * 20.0, common_total + 10_000)
+
+
 def build_opcode_breakdown_rows(data_rows, metadata_rows, meta, s3_metrics_result):
-    """Build S3 opcode table - only rows with live data are returned."""
+    """Build the unified S3 REST operations table (one row per call name)."""
     if s3_metrics_result and S3_METRICS_EXPORTED:
         native = _build_opcode_rows_from_s3metrics(s3_metrics_result)
+        # Attach S3Common GET/PUT throughput + latency onto matching native rows.
+        data_by_key = {r["key"]: r for r in data_rows}
+        for row in native:
+            if row["cmd"] == "get_object" and data_by_key.get("get"):
+                src = data_by_key["get"]
+                if row.get("bw_mbs") is None:
+                    row["bw_mbs"] = src.get("bw_mbs")
+                if row.get("avg_io_bytes") is None:
+                    row["avg_io_bytes"] = src.get("avg_io_bytes")
+                if row.get("avg_us") is None:
+                    row["avg_us"] = src.get("avg_us")
+            if row["cmd"] == "put_object" and data_by_key.get("put"):
+                src = data_by_key["put"]
+                if row.get("bw_mbs") is None:
+                    row["bw_mbs"] = src.get("bw_mbs")
+                if row.get("avg_io_bytes") is None:
+                    row["avg_io_bytes"] = src.get("avg_io_bytes")
+                if row.get("avg_us") is None:
+                    row["avg_us"] = src.get("avg_us")
         total = sum(as_float(r["ops_sec"]) or 0 for r in native)
-        if total > 0:
+        if total > 0 and not _s3metrics_looks_like_cumulative(native, meta):
             for row in native:
                 ops = as_float(row["ops_sec"]) or 0
                 row["pct"] = (ops / total * 100) if total > 0 else None
             return _visible_opcode_rows(native)
 
     data_by_key = {r["key"]: r for r in data_rows}
-    md_total = as_float(meta.get("md_iops"))
     rd_md = as_float(meta.get("rd_md_iops"))
     wr_md = as_float(meta.get("wr_md_iops"))
+    md_total = as_float(meta.get("md_iops"))
     rows = []
 
-    # Proxy GET/PUT from S3Common rd/wr when S3Metrics absent.
     get_src = data_by_key.get("get")
     if get_src and (as_float(get_src.get("ops_sec")) or 0) > 0:
         rows.append({
-            "label": "GET / READ",
+            "label": "GET",
             "category": "data",
             "cmd": "get_object",
             "ops_sec": get_src.get("ops_sec"),
@@ -849,7 +954,7 @@ def build_opcode_breakdown_rows(data_rows, metadata_rows, meta, s3_metrics_resul
     put_src = data_by_key.get("put")
     if put_src and (as_float(put_src.get("ops_sec")) or 0) > 0:
         rows.append({
-            "label": "PUT / WRITE",
+            "label": "PUT",
             "category": "data",
             "cmd": "put_object",
             "ops_sec": put_src.get("ops_sec"),
@@ -860,19 +965,36 @@ def build_opcode_breakdown_rows(data_rows, metadata_rows, meta, s3_metrics_resul
             "hint": False,
         })
 
-    if md_total and md_total > 0:
+    # Map S3Common metadata components to REST call names (no opaque METADATA row).
+    delete_ops = wr_md if wr_md and wr_md > 0 else None
+    list_ops = rd_md if rd_md and rd_md > 0 else None
+    if delete_ops is None and list_ops is None and md_total and md_total > 0:
+        # Only aggregate md_iops available: attribute to LIST (common listing load).
+        list_ops = md_total
+
+    if delete_ops:
         rows.append({
-            "label": "METADATA (total)",
+            "label": "DELETE",
             "category": "metadata",
-            "cmd": "metadata_total",
-            "ops_sec": md_total,
+            "cmd": "delete_object",
+            "ops_sec": delete_ops,
             "avg_us": None,
             "bw_mbs": None,
             "avg_io_bytes": None,
             "source": "AGGREGATE",
             "hint": False,
-            "_md_rd": rd_md,
-            "_md_wr": wr_md,
+        })
+    if list_ops:
+        rows.append({
+            "label": "LIST",
+            "category": "metadata",
+            "cmd": "get_bucket",
+            "ops_sec": list_ops,
+            "avg_us": None,
+            "bw_mbs": None,
+            "avg_io_bytes": None,
+            "source": "AGGREGATE",
+            "hint": False,
         })
 
     active_ops = sum(as_float(r["ops_sec"]) or 0 for r in rows)
@@ -882,24 +1004,52 @@ def build_opcode_breakdown_rows(data_rows, metadata_rows, meta, s3_metrics_resul
     return _visible_opcode_rows(rows)
 
 
-def s3_workload_mix(meta, data_rows):
-    """Return (get_pct, put_pct, delete_md_pct) - always sum to ~100%."""
-    total = _component_ops_total(meta, data_rows)
+def s3_workload_mix(meta, data_rows, opcodes=None):
+    """Return (get, put, delete, list_head) percentages from REST call rates."""
+    opcodes = opcodes or []
+    by_label = {}
+    for row in opcodes:
+        label = (row.get("label") or "").upper()
+        ops = as_float(row.get("ops_sec")) or 0
+        if ops > 0:
+            by_label[label] = by_label.get(label, 0.0) + ops
+
+    if by_label:
+        get_ops = by_label.get("GET", 0.0)
+        put_ops = by_label.get("PUT", 0.0)
+        delete_ops = by_label.get("DELETE", 0.0)
+        list_ops = by_label.get("LIST", 0.0) + by_label.get("HEAD", 0.0)
+        for label, ops in by_label.items():
+            if label in ("GET", "PUT", "DELETE", "LIST", "HEAD"):
+                continue
+            # Multipart and other calls roll into list/head bucket for mix bars.
+            list_ops += ops
+    else:
+        get_ops = next((as_float(r["ops_sec"]) or 0 for r in data_rows if r["key"] == "get"), 0)
+        put_ops = next((as_float(r["ops_sec"]) or 0 for r in data_rows if r["key"] == "put"), 0)
+        delete_ops = as_float(meta.get("wr_md_iops")) or 0
+        list_ops = as_float(meta.get("rd_md_iops")) or 0
+        if delete_ops <= 0 and list_ops <= 0:
+            list_ops = as_float(meta.get("md_iops")) or 0
+
+    total = get_ops + put_ops + delete_ops + list_ops
     if total <= 0:
-        return 0.0, 0.0, 0.0
-    get_ops = next((as_float(r["ops_sec"]) or 0 for r in data_rows if r["key"] == "get"), 0)
-    put_ops = next((as_float(r["ops_sec"]) or 0 for r in data_rows if r["key"] == "put"), 0)
-    md = as_float(meta.get("md_iops")) or 0
-    return get_ops / total * 100, put_ops / total * 100, md / total * 100
+        return 0.0, 0.0, 0.0, 0.0
+    return (
+        get_ops / total * 100,
+        put_ops / total * 100,
+        delete_ops / total * 100,
+        list_ops / total * 100,
+    )
 
 
-def classify_s3_workload(meta, data_rows):
+def classify_s3_workload(meta, data_rows, opcodes=None):
     """Return a human-readable S3 workload description."""
-    total = _component_ops_total(meta, data_rows)
+    get_pct, put_pct, delete_pct, list_pct = s3_workload_mix(meta, data_rows, opcodes)
+    total = get_pct + put_pct + delete_pct + list_pct
     if total < 0.5:
         return "Idle / no S3 load"
 
-    get_pct, put_pct, md_pct = s3_workload_mix(meta, data_rows)
     get_io = next((as_float(r.get("avg_io_bytes")) for r in data_rows if r["key"] == "get"), None)
     size_tag = ""
     if get_io:
@@ -908,14 +1058,17 @@ def classify_s3_workload(meta, data_rows):
         elif get_io >= 1_048_576:
             size_tag = "large-object "
 
-    if md_pct >= 60:
-        return f"{size_tag}metadata-heavy S3 workload"
+    other_pct = delete_pct + list_pct
+    if other_pct >= 60:
+        if delete_pct >= list_pct:
+            return f"{size_tag}DELETE-heavy S3 workload"
+        return f"{size_tag}LIST/HEAD-heavy S3 workload"
     if get_pct > put_pct * 2:
         return f"{size_tag}GET-biased S3 workload"
     if put_pct > get_pct * 2:
         return f"{size_tag}PUT-biased S3 workload"
-    if md_pct > 25:
-        return f"{size_tag}mixed data + metadata S3 workload"
+    if other_pct > 25:
+        return f"{size_tag}mixed data + LIST/DELETE S3 workload"
     return f"{size_tag}balanced S3 workload"
 
 
@@ -1036,69 +1189,21 @@ def _label_cell(text, w, color):
     return c(pad_display(text, w, "<"), color)
 
 
-def _table_header_titles(titles):
-    cells = []
-    for title, key, align in titles:
-        cells.append(c(pad_display(title, _COL[key], align), _BOLD))
-    return join_columns(cells, _COL_SEP)
-
-
-def _data_row_cells(row):
-    w = _COL
-    ops = as_float(row.get("ops_sec"))
-    active = ops is not None and ops > 0
-    if not active:
-        return join_columns([
-            _label_cell(row["label"], w["label"], _DIM),
-            _dash(w["iops"]), _dash(w["throughput"]), _dash(w["size"]), _dash(w["latency"]),
-        ], _COL_SEP)
-    bw_text, _ = format_throughput_mbs(row.get("bw_mbs"))
-    size_text, _ = format_block_size(row.get("avg_io_bytes"))
-    lat_text, lat_us = format_latency_us(row.get("avg_us"))
-    label_color = _BCYAN if row["key"] == "get" else _BYELLOW
-    lat_color = _BRED if (lat_us or 0) > 10_000 else _YELLOW if (lat_us or 0) > 1_000 else _BGREEN
-    return join_columns([
-        _label_cell(row["label"], w["label"], label_color),
-        _metric_cell(format_iops(ops), w["iops"], _GREEN),
-        _metric_cell(bw_text, w["throughput"], _CYAN),
-        _metric_cell(size_text, w["size"], _CYAN if row["key"] == "get" else _YELLOW),
-        _metric_cell(lat_text, w["latency"], lat_color),
-    ], _COL_SEP)
-
-
-def _simple_row_cells(row):
-    w = _COL
-    ops = as_float(row.get("ops_sec"))
-    active = ops is not None and ops > 0
-    if not active:
-        return join_columns([
-            _label_cell(row["label"], w["label"], _DIM),
-            _dash(w["iops"]), _dash(w["throughput"]), _dash(w["size"]), _dash(w["latency"]),
-        ], _COL_SEP)
-    lat_text, lat_us = format_latency_us(row.get("avg_us"))
-    lat_color = _BRED if (lat_us or 0) > 10_000 else _YELLOW if (lat_us or 0) > 1_000 else _BGREEN
-    return join_columns([
-        _label_cell(row["label"], w["label"], _BWHITE),
-        _metric_cell(format_iops(ops), w["iops"], _GREEN),
-        _dash(w["throughput"]), _dash(w["size"]),
-        _metric_cell(lat_text, w["latency"], lat_color) if lat_us else _dash(w["latency"]),
-    ], _COL_SEP)
-
-
 def _render_health_panel(snapshot, deltas, width):
     meta = snapshot["meta"]
     data_rows = snapshot["data"]
+    opcodes = snapshot.get("opcodes") or []
     total_ops = as_float(meta.get("total_iops")) or 0
     combined_lat = as_float(meta.get("latency_us"))
     total_bw_mbs = as_float(meta.get("total_bw_mbs"))
-    get_pct, put_pct, md_pct = s3_workload_mix(meta, data_rows)
+    get_pct, put_pct, delete_pct, list_pct = s3_workload_mix(meta, data_rows, opcodes)
     health_lbl, health_color = s3_health_label(total_ops, combined_lat)
-    workload_type = classify_s3_workload(meta, data_rows)
+    workload_type = classify_s3_workload(meta, data_rows, opcodes)
     ops_delta, bw_delta, lat_deltas = cluster_delta_summary(deltas)
 
     print(box_top(HEALTH_PANEL_TITLE, width))
     ops_s = c(f"{total_ops:,.2f} ops/s" if total_ops else "- ops/s", _BWHITE)
-    lat_text, _ = format_latency_us(combined_lat)
+    lat_text, _ = format_latency_ms(combined_lat)
     lat_s = c(lat_text if combined_lat else "-", _BGREEN if combined_lat else _DIM)
     bw_text, _ = format_throughput_mbs(total_bw_mbs)
     bw_s = c(bw_text if total_bw_mbs else "-", _CYAN)
@@ -1112,7 +1217,8 @@ def _render_health_panel(snapshot, deltas, width):
     print(box_row(c("Workload  ", _DIM) + c(workload_type, _YELLOW), width))
     print(box_row(c(f"{'GET':<10}", _DIM) + workload_bar(get_pct, 22, _BGREEN), width))
     print(box_row(c(f"{'PUT':<10}", _DIM) + workload_bar(put_pct, 22, _BYELLOW), width))
-    print(box_row(c(f"{'DELETE+MD':<10}", _DIM) + workload_bar(md_pct, 22, _CYAN), width))
+    print(box_row(c(f"{'DELETE':<10}", _DIM) + workload_bar(delete_pct, 22, _CYAN), width))
+    print(box_row(c(f"{'LIST/HEAD':<10}", _DIM) + workload_bar(list_pct, 22, _BCYAN), width))
     if deltas:
         parts = []
         if ops_delta is not None and abs(ops_delta) >= 0.001:
@@ -1121,36 +1227,14 @@ def _render_health_panel(snapshot, deltas, width):
             parts.append(delta_arrow(bw_delta) + " " + c(fmt_delta(bw_delta, 2) + " MB/s", _CYAN))
         if lat_deltas:
             worst = max(lat_deltas, key=lambda x: abs(x[1]))
+            # worst[1] is still microseconds; display as ms.
+            lat_ms_delta = worst[1] / 1000.0
             parts.append(
                 delta_arrow_lat(worst[1])
-                + " " + c(f"Lat {fmt_delta(worst[1], 1)} {_MUS} [{worst[0]}]", _YELLOW)
+                + " " + c(f"Lat {fmt_delta(lat_ms_delta, 2)} ms [{worst[0]}]", _YELLOW)
             )
         if parts:
             print(box_row(c("Delta ", _DIM) + "   ".join(parts), width))
-    print(box_bottom(width))
-
-
-def _render_latency_panel(snapshot, width):
-    """LATENCY & THROUGHPUT: GET/PUT data path + metadata aggregate."""
-    titles = [
-        ("Operation", "label", "<"), ("Ops/s", "iops", ">"), ("Throughput", "throughput", ">"),
-        ("Avg Size", "size", ">"), ("Latency", "latency", ">"),
-    ]
-    print(box_top(LATENCY_PANEL_TITLE, width))
-    print(box_row(_table_header_titles(titles), width))
-    print(box_sep(width))
-    for row in snapshot.get("data") or []:
-        print(box_row(_data_row_cells(row), width))
-    print(box_sep(width))
-    for row in snapshot.get("metadata") or []:
-        if row.get("key") == "md_total":
-            print(box_row(_simple_row_cells(row), width))
-            break
-    note = (
-        f"S3Metrics {'exported' if S3_METRICS_EXPORTED else 'not exported'} - "
-        f"source {METRICS_SOURCE}"
-    )
-    print(box_row(c(note, _DIM), width))
     print(box_bottom(width))
 
 
@@ -1168,17 +1252,21 @@ def _opcode_row_cells(row):
     w = _OPCODE_COL
     ops = as_float(row.get("ops_sec"))
     active = ops is not None and ops > 0
-    label = row["label"]
-    label_color = _BCYAN if "GET" in label and row.get("source") == "MEASURED" else (
-        _BYELLOW if "PUT" in label and row.get("source") == "MEASURED" else
-        _BWHITE if active else _DIM
-    )
-    lat_text, lat_us = format_latency_us(row.get("avg_us"))
+    label = (row.get("label") or "").upper()
+    if label == "GET":
+        label_color = _BCYAN
+    elif label == "PUT":
+        label_color = _BYELLOW
+    elif active:
+        label_color = _BWHITE
+    else:
+        label_color = _DIM
+    lat_text, lat_us = format_latency_ms(row.get("avg_us"))
     lat_color = _BRED if (lat_us or 0) > 10_000 else _YELLOW if (lat_us or 0) > 1_000 else _BGREEN
     bw_text, _ = format_throughput_mbs(row.get("bw_mbs"))
     size_text, _ = format_block_size(row.get("avg_io_bytes"))
     return join_columns([
-        _label_cell(label, w["label"], label_color),
+        _label_cell(row["label"], w["label"], label_color),
         _metric_cell(format_iops(ops), w["iops"], _GREEN) if active else _dash(w["iops"]),
         _metric_cell(bw_text, w["throughput"], _CYAN) if row.get("bw_mbs") else _dash(w["throughput"]),
         _metric_cell(size_text, w["size"], _CYAN) if row.get("avg_io_bytes") else _dash(w["size"]),
@@ -1187,37 +1275,16 @@ def _opcode_row_cells(row):
     ], _COL_SEP)
 
 
-def _render_md_split_note(row, width):
-    """Compact read-md / write-md split under the metadata aggregate row."""
-    rd_md = as_float(row.get("_md_rd"))
-    wr_md = as_float(row.get("_md_wr"))
-    if not rd_md and not wr_md:
-        return
-    parts = []
-    if rd_md:
-        parts.append(f"read-md {format_iops(rd_md)}/s")
-    if wr_md:
-        parts.append(f"write-md {format_iops(wr_md)}/s")
-    line = "    " + "  ·  ".join(parts)
-    print(box_row(c(line, _DIM), width))
-
-
-def _opcode_category_banner(category):
-    return {
-        "data": "Data path",
-        "metadata": "Metadata",
-    }.get(category, category.replace("_", " ").title())
-
-
-def _render_opcode_panel(snapshot, width):
+def _render_rest_panel(snapshot, width):
+    """Unified S3 REST OPERATIONS panel (one row per call name)."""
     rows = _visible_opcode_rows(snapshot.get("opcodes") or [])
     titles = [
-        ("S3 Opcode", "label", "<"), ("Ops/s", "iops", ">"), ("Throughput", "throughput", ">"),
+        ("S3 Call", "label", "<"), ("Ops/s", "iops", ">"), ("Throughput", "throughput", ">"),
         ("Avg Size", "size", ">"), ("Latency", "latency", ">"), ("Source", "source", ">"),
     ]
-    print(box_top(OPCODE_PANEL_TITLE, width))
+    print(box_top(REST_PANEL_TITLE, width))
     if not rows:
-        print(box_row(c("No active S3 opcodes this refresh", _DIM), width))
+        print(box_row(c("No active S3 REST calls this refresh", _DIM), width))
         print(box_bottom(width))
         return
 
@@ -1226,21 +1293,16 @@ def _render_opcode_panel(snapshot, width):
         hdr_cells.append(c(pad_display(title, _OPCODE_COL[key], align), _BOLD))
     print(box_row(join_columns(hdr_cells, _COL_SEP), width))
     print(box_sep(width))
-
-    last_category = None
     for row in rows:
-        cat = row.get("category")
-        if cat != last_category:
-            print(box_row(c(_opcode_category_banner(cat), _BCYAN), width))
-            last_category = cat
         print(box_row(_opcode_row_cells(row), width))
-        if row.get("source") == "AGGREGATE":
-            _render_md_split_note(row, width)
 
     if S3_METRICS_EXPORTED:
-        footer = "Per-opcode S3Metrics active (native counters/histograms)"
+        footer = "Per-call S3Metrics (native counters/histograms)"
     else:
-        footer = "MEASURED: S3Common rd/wr · AGGREGATE: md_iops proxy (S3Metrics absent)"
+        footer = (
+            "MEASURED: S3Common GET/PUT · AGGREGATE: DELETE←wr_md, LIST←rd_md "
+            f"(source {METRICS_SOURCE})"
+        )
     print(box_row(c(footer, _DIM), width))
     print(box_bottom(width))
 
@@ -1357,6 +1419,33 @@ def _weighted_us(pairs):
     return sum(w * v for w, v in valid) / weight
 
 
+def _ns_avg_to_us(value):
+    """Convert ViewMetrics / TenantMetrics latency averages to microseconds.
+
+    ProtoMetrics latencies are already µs. ViewMetrics ``*latency__avg`` and
+    TenantMetrics latency sums are nanoseconds (live VMS: ~3.8e6 ≈ 3.8 ms).
+    """
+    raw = as_float(value)
+    if raw is None or raw <= 0:
+        return None
+    return raw / 1000.0
+
+
+def _view_bw_to_mbs(value):
+    """Convert ViewMetrics / BucketViewMetrics bandwidth to MB/s.
+
+    Unlike ProtoMetrics (bytes/s), view ``*_bw__rate`` values are already MB/s
+    (live VMS: ~9.65 with matching iops for ~1 MiB objects). Defensively accept
+    bytes/s magnitudes if a future build changes units.
+    """
+    raw = as_float(value)
+    if raw is None or raw <= 0:
+        return None
+    if raw >= 1_000_000:
+        return raw / 1_000_000.0
+    return raw
+
+
 def _drill_top_op(op_pairs):
     active = [(label, ops) for label, ops in op_pairs if (ops or 0) > 0]
     if not active:
@@ -1367,29 +1456,198 @@ def _drill_top_op(op_pairs):
     return top_label, pct
 
 
+def _drill_rest_fields(get_ops, put_ops, delete_ops, list_ops, latency_us, bw_mbs, name):
+    """Shared drill row fields: per-REST rates, auto-scaled BW, S3 Top Op."""
+    get_ops = get_ops or 0.0
+    put_ops = put_ops or 0.0
+    delete_ops = delete_ops or 0.0
+    list_ops = list_ops or 0.0
+    total_ops = get_ops + put_ops + delete_ops + list_ops
+    top_rpc, top_pct = _drill_top_op([
+        ("GET", get_ops), ("PUT", put_ops),
+        ("DELETE", delete_ops), ("LIST", list_ops),
+    ])
+    return {
+        "name": name,
+        "get_ops": get_ops if get_ops > 0 else None,
+        "put_ops": put_ops if put_ops > 0 else None,
+        "delete_ops": delete_ops if delete_ops > 0 else None,
+        "list_ops": list_ops if list_ops > 0 else None,
+        "total_ops": total_ops if total_ops > 0 else None,
+        "latency_us": latency_us,
+        "bw_mbs": bw_mbs if bw_mbs and bw_mbs > 0 else None,
+        "top_rpc": top_rpc,
+        "top_rpc_pct": top_pct,
+    }
+
+
 def _build_cnode_drill_row(result, obj_name):
     snapshot, _sample = build_rows_from_results(result)
-    all_rows = snapshot["data"] + snapshot["metadata"]
     meta = snapshot["meta"]
-    total_ops = as_float(meta.get("total_iops")) or sum(as_float(r["ops_sec"]) or 0 for r in all_rows)
+    data_by_key = {r["key"]: r for r in snapshot["data"]}
+    get_ops = as_float((data_by_key.get("get") or {}).get("ops_sec")) or 0.0
+    put_ops = as_float((data_by_key.get("put") or {}).get("ops_sec")) or 0.0
+    delete_ops = as_float(meta.get("wr_md_iops")) or 0.0
+    list_ops = as_float(meta.get("rd_md_iops")) or 0.0
+    if delete_ops <= 0 and list_ops <= 0:
+        list_ops = as_float(meta.get("md_iops")) or 0.0
     latency = as_float(meta.get("latency_us")) or weighted_latency(snapshot["data"])
     bw_mbs = as_float(meta.get("total_bw_mbs"))
-    bw_gbs = (bw_mbs / 1024.0) if bw_mbs else None
-    active = [r for r in all_rows if (as_float(r["ops_sec"]) or 0) > 0]
-    top = max(active, key=lambda r: as_float(r["ops_sec"]) or 0, default=None)
-    return {
-        "name": obj_name,
-        "total_ops": total_ops if total_ops > 0 else None,
-        "latency_us": latency,
-        "bw_gbs": bw_gbs,
-        "top_rpc": top["label"] if top else "-",
-        "top_rpc_pct": as_float(top["pct"]) if top else None,
-    }
+    return _drill_rest_fields(get_ops, put_ops, delete_ops, list_ops, latency, bw_mbs, obj_name)
 
 
 def _build_vip_drill_row(result, obj_name):
     """VIP drill uses S3Common rates when present."""
     return _build_cnode_drill_row(result, obj_name)
+
+
+def _fetch_vip_topn():
+    """Load VIP activity from /monitors/topn/ (ProtoMetrics on vip is often empty)."""
+    global VIP_TOPN
+    frame = urllib.parse.quote(API_TIME_FRAME, safe="")
+    candidates = (
+        f"/monitors/topn/?key=vip&time_frame={frame}&limit=16",
+        f"/monitors/topn/?object_type=vip&prop_list="
+        f"{urllib.parse.quote(_common_fqn('iops'), safe=',')}"
+        f"&time_frame={frame}&limit=16",
+        f"/monitors/topn/?object_type=vip&prop_list="
+        f"{urllib.parse.quote(_common_fqn('bw'), safe=',')}"
+        f"&time_frame={frame}&limit=16",
+    )
+    for path in candidates:
+        try:
+            VIP_TOPN = api_request("GET", path)
+            if isinstance(VIP_TOPN, dict):
+                return VIP_TOPN
+        except RuntimeError:
+            continue
+    VIP_TOPN = None
+    return None
+
+
+def _vip_topn_activity_rows():
+    """Flatten topn VIP rows into ranked activity dicts.
+
+    VMS topn `key=vip` returns several metric buckets that all share the same
+    shape ``{title, total, read, write}``. Only some are ops/s:
+
+    - ``iops``: total/read/write are ops/s (GET←read, PUT←write)
+    - ``md_iops``: metadata ops/s (LIST←read, DELETE←write)
+    - ``bw``: MB/s already
+    - ``latency``: microseconds (must NOT be treated as ops)
+
+    Earlier code took max(read/write) across every non-bw bucket, so latency
+    values like write=68000 were shown as 68k PUT/s.
+    """
+    if not isinstance(VIP_TOPN, dict):
+        return []
+    data = VIP_TOPN.get("data") or {}
+    buckets = []
+    vip_block = data.get("vip")
+    if isinstance(vip_block, dict):
+        for metric, rows in vip_block.items():
+            if isinstance(rows, list):
+                buckets.append((str(metric).lower(), rows))
+    elif isinstance(vip_block, list):
+        buckets.append(("iops", vip_block))
+    else:
+        for key, rows in data.items():
+            if isinstance(rows, list):
+                buckets.append((str(key).lower(), rows))
+            elif isinstance(rows, dict):
+                for metric, nested in rows.items():
+                    if isinstance(nested, list):
+                        buckets.append((str(metric).lower(), nested))
+
+    by_title = {}
+    for metric, rows in buckets:
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            title = str(row.get("title") or row.get("name") or "").strip()
+            if not title or _is_192_168_ip(title.split()[0]):
+                continue
+            entry = by_title.setdefault(title, {
+                "title": title,
+                "ops": 0.0,
+                "bw_mbs": 0.0,
+                "read": 0.0,
+                "write": 0.0,
+                "md_read": 0.0,
+                "md_write": 0.0,
+                "latency_us": None,
+            })
+            total = as_float(row.get("total"))
+            read = as_float(row.get("read")) or 0.0
+            write = as_float(row.get("write")) or 0.0
+
+            if metric in ("bw", "bandwidth") or metric.endswith("_bw"):
+                if total is not None and total > 0:
+                    # topn bw is commonly MB/s already; ProtoMetrics bw is bytes/s.
+                    entry["bw_mbs"] = max(
+                        entry["bw_mbs"], total if total < 1_000_000 else total / 1e6,
+                    )
+            elif metric == "iops" or metric in ("read_iops", "write_iops"):
+                if total is not None and total > 0:
+                    entry["ops"] = max(entry["ops"], total)
+                if metric == "read_iops" and total is not None and total > 0:
+                    entry["read"] = max(entry["read"], total)
+                elif metric == "write_iops" and total is not None and total > 0:
+                    entry["write"] = max(entry["write"], total)
+                else:
+                    if read > 0:
+                        entry["read"] = max(entry["read"], read)
+                    if write > 0:
+                        entry["write"] = max(entry["write"], write)
+            elif metric in ("md_iops", "read_md_iops", "write_md_iops"):
+                if metric == "read_md_iops" and total is not None and total > 0:
+                    entry["md_read"] = max(entry["md_read"], total)
+                elif metric == "write_md_iops" and total is not None and total > 0:
+                    entry["md_write"] = max(entry["md_write"], total)
+                else:
+                    if read > 0:
+                        entry["md_read"] = max(entry["md_read"], read)
+                    if write > 0:
+                        entry["md_write"] = max(entry["md_write"], write)
+            elif metric == "latency":
+                # Prefer combined total; fall back to weighted-ish max of sides.
+                lat = total
+                if lat is None or lat <= 0:
+                    sides = [v for v in (read, write) if v > 0]
+                    lat = sum(sides) / len(sides) if sides else None
+                if lat is not None and lat > 0:
+                    prev = entry["latency_us"]
+                    entry["latency_us"] = lat if prev is None else max(prev, lat)
+            # Ignore qos_wait_time, rows, and any other non-rate buckets.
+
+    ranked = sorted(
+        by_title.values(),
+        key=lambda r: (-(r["ops"] or 0), -(r["bw_mbs"] or 0), r["title"]),
+    )
+    return ranked
+
+
+def _build_vip_rows_from_topn():
+    """Build drill rows from VIP topn when ProtoMetrics monitors are idle."""
+    rows = []
+    for item in _vip_topn_activity_rows()[:_MAX_DRILL_OBJECTS]:
+        get_ops = item.get("read") or 0.0
+        put_ops = item.get("write") or 0.0
+        delete_ops = item.get("md_write") or 0.0
+        list_ops = item.get("md_read") or 0.0
+        ops = item.get("ops") or 0.0
+        bw_mbs = item.get("bw_mbs") or None
+        latency_us = item.get("latency_us")
+        if not any((ops, bw_mbs, get_ops, put_ops, delete_ops, list_ops)):
+            continue
+        row = _drill_rest_fields(
+            get_ops, put_ops, delete_ops, list_ops, latency_us, bw_mbs, item["title"],
+        )
+        # If iops.total is present but read/write split is missing, keep total.
+        if (row.get("total_ops") or 0) <= 0 and ops > 0:
+            row["total_ops"] = ops
+        rows.append(row)
+    return rows
 
 
 def _build_bucket_drill_row(result, obj_name):
@@ -1406,35 +1664,26 @@ def _build_bucket_drill_row(result, obj_name):
     )
     read_md = as_float(values.get(_VIEW_READ_MD)) or 0.0
     write_md = as_float(values.get(_VIEW_WRITE_MD)) or 0.0
-    total_ops = read_ops + write_ops + read_md + write_md
+    # ViewMetrics *latency__avg is nanoseconds; normalize to µs for Avg ms display.
     latency = _weighted_us([
-        (read_ops, as_float(values.get(_VIEW_READ_LAT))),
-        (write_ops, as_float(values.get(_VIEW_WRITE_LAT))),
-        (read_md, as_float(values.get(_VIEW_READ_MD_LAT))),
-        (write_md, as_float(values.get(_VIEW_WRITE_MD_LAT))),
+        (read_ops, _ns_avg_to_us(values.get(_VIEW_READ_LAT))),
+        (write_ops, _ns_avg_to_us(values.get(_VIEW_WRITE_LAT))),
+        (read_md, _ns_avg_to_us(values.get(_VIEW_READ_MD_LAT))),
+        (write_md, _ns_avg_to_us(values.get(_VIEW_WRITE_MD_LAT))),
     ])
     read_bw = (
-        raw_bw_to_gb_sec(values.get(_VIEW_READ_BW))
-        or raw_bw_to_gb_sec(values.get(_BUCKET_VIEW_READ_BW))
+        _view_bw_to_mbs(values.get(_VIEW_READ_BW))
+        or _view_bw_to_mbs(values.get(_BUCKET_VIEW_READ_BW))
         or 0.0
     )
     write_bw = (
-        raw_bw_to_gb_sec(values.get(_VIEW_WRITE_BW))
-        or raw_bw_to_gb_sec(values.get(_BUCKET_VIEW_WRITE_BW))
+        _view_bw_to_mbs(values.get(_VIEW_WRITE_BW))
+        or _view_bw_to_mbs(values.get(_BUCKET_VIEW_WRITE_BW))
         or 0.0
     )
-    top_rpc, top_pct = _drill_top_op([
-        ("GET", read_ops), ("PUT", write_ops),
-        ("RD MD", read_md), ("WR MD", write_md),
-    ])
-    return {
-        "name": obj_name,
-        "total_ops": total_ops if total_ops > 0 else None,
-        "latency_us": latency,
-        "bw_gbs": (read_bw + write_bw) if (read_bw + write_bw) > 0 else None,
-        "top_rpc": top_rpc,
-        "top_rpc_pct": top_pct,
-    }
+    return _drill_rest_fields(
+        read_ops, write_ops, write_md, read_md, latency, read_bw + write_bw, obj_name,
+    )
 
 
 def _build_tenant_drill_row(result, obj_name):
@@ -1442,33 +1691,29 @@ def _build_tenant_drill_row(result, obj_name):
     write_ops = _delta_rate_from_samples(result, _TENANT_WRITE_IOPS) or 0.0
     read_md = _delta_rate_from_samples(result, _TENANT_READ_MD) or 0.0
     write_md = _delta_rate_from_samples(result, _TENANT_WRITE_MD) or 0.0
-    total_ops = read_ops + write_ops + read_md + write_md
-    read_lat = _avg_from_sum_count_deltas(result, _TENANT_READ_LAT, _TENANT_READ_CNT)
-    write_lat = _avg_from_sum_count_deltas(result, _TENANT_WRITE_LAT, _TENANT_WRITE_CNT)
-    read_md_lat = _avg_from_sum_count_deltas(
+    # TenantMetrics latency sums are nanoseconds; avg(delta) → µs.
+    read_lat = _ns_avg_to_us(
+        _avg_from_sum_count_deltas(result, _TENANT_READ_LAT, _TENANT_READ_CNT)
+    )
+    write_lat = _ns_avg_to_us(
+        _avg_from_sum_count_deltas(result, _TENANT_WRITE_LAT, _TENANT_WRITE_CNT)
+    )
+    read_md_lat = _ns_avg_to_us(_avg_from_sum_count_deltas(
         result, _TENANT_READ_MD_LAT_SUM, _TENANT_READ_MD_LAT_CNT,
-    )
-    write_md_lat = _avg_from_sum_count_deltas(
+    ))
+    write_md_lat = _ns_avg_to_us(_avg_from_sum_count_deltas(
         result, _TENANT_WRITE_MD_LAT_SUM, _TENANT_WRITE_MD_LAT_CNT,
-    )
+    ))
     latency = _weighted_us([
         (read_ops, read_lat), (write_ops, write_lat),
         (read_md, read_md_lat), (write_md, write_md_lat),
     ])
-    read_bw_gbs = raw_bw_to_gb_sec(_delta_rate_from_samples(result, _TENANT_READ_BW)) or 0.0
-    write_bw_gbs = raw_bw_to_gb_sec(_delta_rate_from_samples(result, _TENANT_WRITE_BW)) or 0.0
-    top_rpc, top_pct = _drill_top_op([
-        ("GET", read_ops), ("PUT", write_ops),
-        ("RD MD", read_md), ("WR MD", write_md),
-    ])
-    return {
-        "name": obj_name,
-        "total_ops": total_ops if total_ops > 0 else None,
-        "latency_us": latency,
-        "bw_gbs": (read_bw_gbs + write_bw_gbs) if (read_bw_gbs + write_bw_gbs) > 0 else None,
-        "top_rpc": top_rpc,
-        "top_rpc_pct": top_pct,
-    }
+    # Tenant bw sums are cumulative bytes → delta rate is bytes/s.
+    read_bw = raw_bw_to_mb_sec(_delta_rate_from_samples(result, _TENANT_READ_BW)) or 0.0
+    write_bw = raw_bw_to_mb_sec(_delta_rate_from_samples(result, _TENANT_WRITE_BW)) or 0.0
+    return _drill_rest_fields(
+        read_ops, write_ops, write_md, read_md, latency, read_bw + write_bw, obj_name,
+    )
 
 
 def _build_drill_row(mode, result, obj_name):
@@ -1560,7 +1805,26 @@ def enter_drill_mode(mode):
             )
             return
 
-    if mode in ("bucket", "tenant"):
+    if mode == "vip":
+        # Hide 192.168.* labels; prefer pool/name. Rank by topn activity when available.
+        _fetch_vip_topn()
+        vip_entries = _vip_objects_for_drill(all_valid)
+        if not vip_entries:
+            DRILL_ERROR = "No VIP objects available after filtering internal 192.168.* addresses"
+            return
+        topn_titles = [r["title"].lower() for r in _vip_topn_activity_rows()]
+        if topn_titles:
+            def _vip_rank(entry):
+                name = entry["name"].lower()
+                for idx, title in enumerate(topn_titles):
+                    if name in title or title in name:
+                        return idx
+                return len(topn_titles) + 1
+            vip_entries.sort(key=_vip_rank)
+        DRILL_OBJECTS = [
+            {"id": e["id"], "name": e["name"]} for e in vip_entries[:_MAX_DRILL_OBJECTS]
+        ]
+    elif mode in ("bucket", "tenant"):
         DRILL_OBJECTS = _rank_drill_candidates(mode, all_valid, cfg)
     else:
         selected = all_valid[:_MAX_DRILL_OBJECTS]
@@ -1605,13 +1869,23 @@ def enter_drill_mode(mode):
                 last_error = str(e)
 
     if not new_monitors:
+        # VIP often lacks ProtoMetrics on object_type=vip; fall back to topn-only.
+        if mode == "vip":
+            _fetch_vip_topn()
+            topn_rows = _build_vip_rows_from_topn()
+            if topn_rows:
+                DRILL_MONITORS = []
+                DRILL_MODE = mode
+                DRILL_ERROR = None
+                LAST_DRILL_ROWS = topn_rows
+                return
         hint = ""
         if mode == "bucket":
             hint = " (bucket/view monitors require seconds resolution without aggregation)"
         elif mode == "tenant":
             hint = " (tenant scope requires TenantMetrics counters)"
         elif mode == "vip":
-            hint = " (vip object_type may not support S3Common on this build)"
+            hint = " (vip object_type may not support S3Common; topn also empty)"
         detail = f": {last_error}" if last_error else ""
         DRILL_ERROR = (
             f"Could not create any {mode} monitors (object_type="
@@ -1643,6 +1917,16 @@ def fetch_drill_query():
     drill_rows = []
     query_errors = 0
 
+    if DRILL_MODE == "vip" and not DRILL_MONITORS:
+        # Topn-only VIP mode (no ProtoMetrics monitors).
+        _fetch_vip_topn()
+        LAST_DRILL_ROWS = _build_vip_rows_from_topn()
+        if openmetrics.is_enabled():
+            openmetrics.export_drill(CLUSTER_NAME, DRILL_MODE, LAST_DRILL_ROWS, sample=LAST_SAMPLE)
+        if not LAST_DRILL_ROWS:
+            DRILL_ERROR = "VIP topn returned no activity"
+        return
+
     if _is_batch_drill_mode() and DRILL_MONITORS:
         monitor_id, _name = DRILL_MONITORS[0]
         try:
@@ -1659,6 +1943,15 @@ def fetch_drill_query():
                 drill_rows.append(_build_drill_row(DRILL_MODE, result, obj_name))
             except RuntimeError:
                 query_errors += 1
+
+    # VIP ProtoMetrics often returns zeros; prefer topn activity when idle.
+    if DRILL_MODE == "vip":
+        active = sum(as_float(r.get("total_ops")) or 0 for r in drill_rows)
+        if active <= 0:
+            _fetch_vip_topn()
+            topn_rows = _build_vip_rows_from_topn()
+            if topn_rows:
+                drill_rows = topn_rows
 
     LAST_DRILL_ROWS = sorted(
         drill_rows,
@@ -1716,22 +2009,32 @@ def _render_drill_panel(width):
 
     header = join_columns([
         c(pad_display("Name", dc["name"], "<"), _BOLD),
-        c(pad_display("Ops/s", dc["ops"], ">"), _BOLD),
-        c(pad_display(f"Avg {_MUS}", dc["lat"], ">"), _BOLD),
-        c(pad_display("GB/s", dc["bw"], ">"), _BOLD),
+        c(pad_display("GET/s", dc["get"], ">"), _BOLD),
+        c(pad_display("PUT/s", dc["put"], ">"), _BOLD),
+        c(pad_display("DEL/s", dc["delete"], ">"), _BOLD),
+        c(pad_display("LIST/s", dc["list"], ">"), _BOLD),
+        c(pad_display("BW", dc["bw"], ">"), _BOLD),
+        c(pad_display("Avg ms", dc["lat"], ">"), _BOLD),
         c(pad_display("Top Op", dc["top"], ">"), _BOLD),
         c(pad_display("Top%", dc["pct"], ">"), _BOLD),
     ], " ")
     print(box_row(header, width))
     print(box_sep(width))
     for dr in LAST_DRILL_ROWS:
-        pct = pad_display(f"{(dr.get('top_rpc_pct') or 0):.1f}%", dc["pct"], ">")
+        pct_val = dr.get("top_rpc_pct")
+        pct = pad_display(f"{pct_val:.1f}%" if pct_val is not None else "-", dc["pct"], ">")
+        lat_us = as_float(dr.get("latency_us"))
+        lat_ms = (lat_us / 1000.0) if lat_us is not None else None
+        bw_text, bw_val = format_throughput_mbs(dr.get("bw_mbs"))
         line = join_columns([
             pad_display(dr["name"], dc["name"], "<"),
-            c(format_fixed_number(dr["total_ops"], dc["ops"], 2), _BWHITE),
-            c(format_fixed_number(dr["latency_us"], dc["lat"], 2), _BGREEN),
-            c(format_fixed_number(dr["bw_gbs"], dc["bw"], 3), _CYAN),
-            c(pad_display(dr["top_rpc"], dc["top"], ">"), _BWHITE),
+            c(format_fixed_number(dr.get("get_ops"), dc["get"], 1), _BCYAN),
+            c(format_fixed_number(dr.get("put_ops"), dc["put"], 1), _BYELLOW),
+            c(format_fixed_number(dr.get("delete_ops"), dc["delete"], 1), _CYAN),
+            c(format_fixed_number(dr.get("list_ops"), dc["list"], 1), _BWHITE),
+            c(pad_display(bw_text if bw_val else "-", dc["bw"], ">"), _CYAN),
+            c(format_fixed_number(lat_ms, dc["lat"], 2), _BGREEN),
+            c(pad_display(dr.get("top_rpc") or "-", dc["top"], ">"), _BWHITE),
             c(pct, _DIM),
         ], " ")
         print(box_row(line, width))
@@ -1831,9 +2134,7 @@ def _render_frame():
         deltas = compute_deltas(_all_panel_rows(LAST_ROWS), PREV_ROWS)
         _render_health_panel(LAST_ROWS, deltas, width)
         print()
-        _render_latency_panel(LAST_ROWS, width)
-        print()
-        _render_opcode_panel(LAST_ROWS, width)
+        _render_rest_panel(LAST_ROWS, width)
         print()
     print(box_row(
         c("[q]", _BWHITE) + c(" Quit ", _DIM)

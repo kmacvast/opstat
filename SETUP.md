@@ -346,8 +346,13 @@ Reference: [SMB_README.md](SMB_README.md)
 | `Space` | Force refresh |
 | `q` | Quit |
 
-**Panels:** S3 HEALTH & WORKLOAD · LATENCY & THROUGHPUT · S3 OPCODE BREAKDOWN
+**Panels:** S3 HEALTH & WORKLOAD · S3 REST OPERATIONS
 (GET / PUT / DELETE / HEAD / LIST / MULTIPART when live).
+
+Latency is always shown in **ms**. Mix bars are GET / PUT / DELETE / LIST+HEAD
+(no opaque METADATA row). Drills show **GET/s · PUT/s · DEL/s · LIST/s**,
+auto-scaled BW, and **Top Op** as a REST name. Internal `192.168.*` VIP addresses
+are hidden.
 
 **Scoping:** `--buckets` and `--tenants` filter drill candidates.
 
