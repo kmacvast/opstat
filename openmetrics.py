@@ -25,6 +25,11 @@ Each emitted line is a single valid JSON object::
                      "drill_mode": "cluster", "target_name": ...}
     }
 
+Protocol ids passed via ``configure(..., protocol, vms)`` become the metric
+namespace prefix: ``vast.{protocol}.*``. Engines use ``nfs3``, ``nfs41``,
+``smb``, ``nvme_tcp``, and ``s3`` (for example ``vast.s3.operations``,
+``vast.s3.latency``, ``vast.s3.throughput``, ``vast.s3.io_size``).
+
 Rates (operations) are modeled as OpenMetrics gauges because the values are
 instantaneous per-second rates rather than monotonic cumulative counters.
 """

@@ -4,7 +4,8 @@
 # Description: Multi-protocol VAST performance statistics tool. Phase 1 routes
 #              --nfs --version=3.0 to NFS v3; --nfs --version=4.1 to NFS v4.1;
 #              Phase 2 routes --block --nvme-over-tcp to NVMe-oTCP block statistics;
-#              --smb routes to SMB statistics (v0.1.2).
+#              --smb routes to SMB statistics (v0.1.2); --s3 routes to S3
+#              object storage statistics.
 #
 # Author: KMac kmac@vastdata.com
 # Version: 0.1.2
@@ -22,6 +23,7 @@ if _SCRIPT_DIR not in sys.path:
 import nfs_v3
 import nfs_v41
 import nvme_tcp
+import s3
 import smb
 import wizard
 
@@ -44,12 +46,14 @@ EPILOG = textwrap.dedent(
       ./opstat --nfs --version=4.1 --vms <HOST>
       ./opstat --block --nvme-over-tcp --vms <HOST>
       ./opstat --smb --vms <HOST> --clients 10.1.1.5
+      ./opstat --s3 --vms <HOST> --buckets my-bucket
       ./opstat --nfs --version=3.0 --vms localhost --vms-port 8443
 
     protocols:
       --nfs --version={3.0|4.1}     NFS v3 or NFS v4.1
       --block --nvme-over-tcp       NVMe over TCP block storage
       --smb                         SMB / SMB2
+      --s3                          S3 object storage
 
     auth:
       Prefer VAST_PASSWORD or VAST_TOKEN env vars, or omit --password
@@ -80,6 +84,11 @@ def validate_protocol_args(args):
     if args.clients and not args.smb:
         raise SystemExit(
             "ERROR: --client/--clients is only supported with --smb."
+        )
+    if (args.buckets or args.tenants) and not args.s3:
+        raise SystemExit(
+            "ERROR: --bucket/--buckets and --tenant/--tenants are only "
+            "supported with --s3."
         )
 
     if args.nfs:
@@ -133,6 +142,11 @@ def parse_args(argv=None):
         "--smb",
         action="store_true",
         help="SMB protocol statistics",
+    )
+    exclusive.add_argument(
+        "--s3",
+        action="store_true",
+        help="S3 object storage protocol statistics",
     )
 
     protocol.add_argument(
@@ -242,6 +256,34 @@ def parse_args(argv=None):
         metavar="IPS",
         help="Comma-separated client IPs/hostnames for SMB scoping",
     )
+    scope.add_argument(
+        "--bucket",
+        dest="buckets",
+        default=None,
+        metavar="NAME",
+        help="Limit S3 stats to one bucket/view (alias of --buckets)",
+    )
+    scope.add_argument(
+        "--buckets",
+        dest="buckets",
+        default=None,
+        metavar="NAMES",
+        help="Comma-separated bucket/view names for S3 scoping",
+    )
+    scope.add_argument(
+        "--tenant",
+        dest="tenants",
+        default=None,
+        metavar="NAME",
+        help="Limit S3 stats to one tenant (alias of --tenants)",
+    )
+    scope.add_argument(
+        "--tenants",
+        dest="tenants",
+        default=None,
+        metavar="NAMES",
+        help="Comma-separated tenant names for S3 scoping",
+    )
 
     export = parser.add_argument_group("export and diagnostics")
     export.add_argument(
@@ -297,6 +339,8 @@ def dispatch(args):
         return nvme_tcp.run(args)
     if args.smb:
         return smb.run(args)
+    if args.s3:
+        return s3.run(args)
     raise SystemExit("ERROR: No protocol handler matched the supplied flags.")
 
 

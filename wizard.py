@@ -55,6 +55,13 @@ PROTOCOLS = [
         "versions": None,
         "scope": ("clients", "--clients", "client IP(s)/host(s)"),
     },
+    {
+        "key": "s3",
+        "label": "S3",
+        "flags": ["--s3"],
+        "versions": None,
+        "scope": ("buckets", "--buckets", "bucket/view name(s)"),
+    },
 ]
 
 
@@ -76,8 +83,11 @@ def should_launch(argv_source, stdin_isatty, stdout_isatty):
 
 
 def _supports_token(protocol_key, version):
-    """VAST_TOKEN auth is wired for SMB and NFS v4.1 engines today."""
-    return protocol_key == "smb" or (protocol_key == "nfs" and version == "4.1")
+    """VAST_TOKEN auth is wired for SMB, S3, and NFS v4.1 engines today."""
+    return (
+        protocol_key in ("smb", "s3")
+        or (protocol_key == "nfs" and version == "4.1")
+    )
 
 
 class _Prompt:

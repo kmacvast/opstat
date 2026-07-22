@@ -149,7 +149,7 @@ For opstat **runtime**, this confirms the environment is ready (no external runt
 packages are required). For **development tests**, also install:
 
 ```bash
-pip install pytest pytest-mock
+pip install pytest>=8.0.0
 ```
 
 ---
@@ -232,6 +232,18 @@ Single-volume alias:
 .\scripts\Invoke-SmbOpstatLoad.ps1 -NasShare '\\172.200.203.6\opstattest'
 ```
 
+### S3 (object storage)
+
+```bash
+./opstat --s3 \
+  --vms var203.selab.vastdata.com --user admin
+
+# Optional bucket / tenant scoping
+./opstat --s3 \
+  --vms var203.selab.vastdata.com \
+  --buckets my-bucket --tenants default --user admin
+```
+
 ### Remote cluster via SSH tunnel (Teleport / zero-trust)
 
 ```bash
@@ -242,6 +254,7 @@ ssh -L 8443:var203.selab.vastdata.com:443 user@jump-host
 ./opstat --nfs --version=3.0 --vms localhost --vms-port 8443 --user admin
 ./opstat --block --nvme-over-tcp --vms localhost --vms-port 8443 --user admin
 ./opstat --smb --vms localhost --vms-port 8443 --user admin
+./opstat --s3 --vms localhost --vms-port 8443 --user admin
 ```
 
 Default port is `443` when `--vms-port` is omitted.
@@ -256,6 +269,9 @@ Default port is `443` when `--vms-port` is omitted.
   --vms var203.selab.vastdata.com --discover-metrics
 
 ./opstat --smb \
+  --vms var203.selab.vastdata.com --discover-metrics
+
+./opstat --s3 \
   --vms var203.selab.vastdata.com --discover-metrics
 ```
 
@@ -318,6 +334,25 @@ References: [NFSv3_README.md](NFSv3_README.md), [NFSv41_README.md](NFSv41_README
 
 Reference: [SMB_README.md](SMB_README.md)
 
+### S3 keys
+
+| Key | Action |
+|-----|--------|
+| `c` | cNode drill-down |
+| `b` | Bucket / **view** drill-down |
+| `t` | Tenant drill-down |
+| `i` | VIP drill-down |
+| `x` | Exit drill-down |
+| `Space` | Force refresh |
+| `q` | Quit |
+
+**Panels:** S3 HEALTH & WORKLOAD · LATENCY & THROUGHPUT · S3 OPCODE BREAKDOWN
+(GET / PUT / DELETE / HEAD / LIST / MULTIPART when live).
+
+**Scoping:** `--buckets` and `--tenants` filter drill candidates.
+
+Reference: [S3_README.md](S3_README.md)
+
 ---
 
 ## 7. Running Tests (Optional)
@@ -328,9 +363,13 @@ From the **repository root**:
 cd opstat
 python3 -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
-pip install pytest pytest-mock
-pytest -v  # add tests/ when present
+pip install pytest>=8.0.0
+pytest -v
 ```
+
+The suite under `tests/` covers CLI parsing (including `--s3`), wizard argv
+construction, OpenMetrics `vast.s3.*` export, TUI formatters, `vast_common`
+monitor helpers, and S3/SMB pure helpers. No live VMS is required.
 
 ---
 
@@ -355,4 +394,5 @@ pytest -v  # add tests/ when present
 - [NFSv3_README.md](NFSv3_README.md) - NFS v3 monitoring reference
 - [NFSv41_README.md](NFSv41_README.md) - NFS v4.1 proxy architecture
 - [SMB_README.md](SMB_README.md) - SMB monitoring reference
+- [S3_README.md](S3_README.md) - S3 object storage monitoring reference
 - [NVMe_TCP_README.md](NVMe_TCP_README.md) - block monitoring deep dive

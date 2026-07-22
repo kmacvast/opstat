@@ -2,7 +2,7 @@
 
 Live multi-protocol performance statistics for **VAST Data** clusters.
 
-`opstat` talks to VMS over HTTPS, creates short-lived monitors, polls protocol counters on a refresh loop, and renders a color terminal dashboard. Use it when you need instant visibility into NFS, SMB, or NVMe-oTCP behavior without opening Grafana or building custom REST scripts.
+`opstat` talks to VMS over HTTPS, creates short-lived monitors, polls protocol counters on a refresh loop, and renders a color terminal dashboard. Use it when you need instant visibility into NFS, SMB, S3, or NVMe-oTCP behavior without opening Grafana or building custom REST scripts.
 
 **Version:** 0.1.2 · **Runtime:** Python 3.8+ (stdlib only) · **Author:** KMac (`kmac@vastdata.com`)
 
@@ -16,7 +16,7 @@ Live multi-protocol performance statistics for **VAST Data** clusters.
 
 | Capability | Detail |
 |------------|--------|
-| Protocols | NFS v3, NFS v4.1, SMB/SMB2, NVMe over TCP (block) |
+| Protocols | NFS v3, NFS v4.1, SMB/SMB2, S3 object storage, NVMe over TCP (block) |
 | Live TUI | Health badge, workload mix, ops/s, latency, throughput, I/O size |
 | Drill-down | Keyboard shortcuts for cNode, view, tenant, VIP, host (protocol-dependent) |
 | Capture | CSV append and optional OpenMetrics/OpenTelemetry JSON Lines export |
@@ -30,7 +30,7 @@ Live multi-protocol performance statistics for **VAST Data** clusters.
 │  (CLI/TUI)  │ ◄─────────────── │ monitors │
 └─────────────┘   poll metrics   └──────────┘
        │
-       ├─ nfs_v3.py / nfs_v41.py / smb.py / nvme_tcp.py
+       ├─ nfs_v3.py / nfs_v41.py / smb.py / s3.py / nvme_tcp.py
        ├─ vast_common.py   (auth, monitor lifecycle, signals)
        ├─ tui_layout.py    (column layout helpers)
        └─ openmetrics.py   (optional .jsonl export)
@@ -45,7 +45,7 @@ Live multi-protocol performance statistics for **VAST Data** clusters.
 
 - Lab and support: quick "is the cluster hot right now?" checks
 - Protocol triage: separate data path vs metadata vs session/state overhead
-- Scoped debug: focus on one volume (`--volumes`) or SMB client (`--clients`)
+- Scoped debug: focus on one volume (`--volumes`), SMB client (`--clients`), or S3 bucket/tenant (`--buckets` / `--tenants`)
 - Telemetry capture: `--csv` for spreadsheets, `--export-openmetrics` for pipelines
 - Remote access: SSH/Teleport tunnels with `--vms localhost --vms-port <local>`
 
@@ -116,6 +116,7 @@ process environment and can seed host/user from `~/.vastconf`.
 | NFS v4.1 | `--nfs --version=4.1` | Implemented | [NFSv41_README.md](NFSv41_README.md) |
 | NVMe-oTCP | `--block --nvme-over-tcp` | Implemented | [NVMe_TCP_README.md](NVMe_TCP_README.md) |
 | SMB | `--smb` | Implemented | [SMB_README.md](SMB_README.md) |
+| S3 | `--s3` | Implemented | [S3_README.md](S3_README.md) |
 | NFS v4.2 | `--nfs --version=4.2` | Planned | |
 
 Rules:
@@ -123,6 +124,7 @@ Rules:
 - `--version` is **required** with `--nfs` (aliases: `3`→`3.0`, `4`→`4.1`).
 - `--block` **requires** `--nvme-over-tcp`.
 - `--client` / `--clients` only with `--smb`.
+- `--bucket` / `--buckets` and `--tenant` / `--tenants` only with `--s3`.
 - `--volume` / `--volumes` only meaningful with NVMe-oTCP.
 
 ### CLI reference
@@ -155,6 +157,8 @@ Run `./opstat --help` for the authoritative list. Summary:
 |--------|----------|-------------|
 | `--volume NAME` / `--volumes A,B` | NVMe-oTCP | Scope READ/WRITE to named volumes |
 | `--client IP` / `--clients A,B` | SMB | Scope insights / session context |
+| `--bucket NAME` / `--buckets A,B` | S3 | Scope bucket/view drill candidates |
+| `--tenant NAME` / `--tenants A,B` | S3 | Scope tenant drill candidates |
 
 #### Export and diagnostics
 
@@ -187,7 +191,7 @@ sample:2026-07-07T17:15:33Z   vast-os-release-5.4.3-sp4
 
 | Field | Meaning |
 |-------|---------|
-| Protocol label | Active engine (NFS v3 / NFS v4.1 / SMB / NVMe-oTCP) |
+| Protocol label | Active engine (NFS v3 / NFS v4.1 / SMB / S3 / NVMe-oTCP) |
 | Target | Cluster name, or scoped volume / client / drill object |
 | `sample:` | UTC timestamp of the last successful poll |
 | `vast-os-release-...` | Cluster OS version (best-effort; omitted if unavailable) |
@@ -230,6 +234,12 @@ sample:2026-07-07T17:15:33Z   vast-os-release-5.4.3-sp4
 2. **PERFORMANCE INSIGHTS** - top opcode, hot client/share, deltas
 3. **SMB2 OPCODE WORKFLOW** - only currently active opcodes ([SMB_OPCODES.md](SMB_OPCODES.md))
 
+**S3** ([details](S3_README.md))
+
+1. **S3 HEALTH & WORKLOAD** - ops, latency, BW, GET/PUT/metadata mix
+2. **LATENCY & THROUGHPUT** - GET / PUT data path with size and latency
+3. **S3 OPCODE BREAKDOWN** - GET, PUT, DELETE, HEAD, LIST, MULTIPART when live
+
 ### OpenMetrics lines
 
 With `--export-openmetrics`, each refresh appends gauges such as:
@@ -241,7 +251,7 @@ With `--export-openmetrics`, each refresh appends gauges such as:
 | `vast.<proto>.throughput` | bytes/s | Bandwidth |
 | `vast.<proto>.io_size` | bytes | Average I/O size |
 
-`<proto>` is `nfs3`, `nfs41`, `smb`, or `nvme_tcp`. Attributes tag `cluster`, `vms`,
+`<proto>` is `nfs3`, `nfs41`, `smb`, `s3`, or `nvme_tcp`. Attributes tag `cluster`, `vms`,
 `operation`, `category`, and drill scope.
 
 ---
@@ -290,6 +300,15 @@ Expected: block dashboard limited to named volumes for data-path stats; invalid 
 ```
 
 Expected: SMB TUI with client-scoped insights; no ANSI color.
+
+### S3 with bucket scope
+
+```bash
+./opstat --s3 --vms vms.example.com \
+  --buckets app-data,logs --user admin
+```
+
+Expected: S3 TUI; bucket drill (`b`) limited to named buckets/views.
 
 ### SSH tunnel to a remote lab
 
@@ -374,6 +393,7 @@ pyinstaller \
   --hidden-import nfs_v41 \
   --hidden-import nvme_tcp \
   --hidden-import smb \
+  --hidden-import s3 \
   --hidden-import wizard \
   --hidden-import vast_common \
   --hidden-import vast_api_log \
@@ -392,13 +412,14 @@ the GitHub Release automatically.
 
 ## Protocol feature notes
 
-| Area | NFS v3 | NFS v4.1 | NVMe-oTCP | SMB |
-|------|--------|----------|-----------|-----|
-| Cluster scope | yes | yes | yes | yes |
-| Volume scope | | | `--volumes` | |
-| Client scope | | | | `--clients` |
-| Drill-down | cNode / view / tenant | cNode / view / tenant | cNode / VIP / host | view / tenant / cNode |
-| OpenMetrics | yes | yes | yes | yes |
+| Area | NFS v3 | NFS v4.1 | NVMe-oTCP | SMB | S3 |
+|------|--------|----------|-----------|-----|-----|
+| Cluster scope | yes | yes | yes | yes | yes |
+| Volume scope | | | `--volumes` | | |
+| Client scope | | | | `--clients` | |
+| Bucket / tenant scope | | | | | `--buckets` / `--tenants` |
+| Drill-down | cNode / view / tenant | cNode / view / tenant | cNode / VIP / host | view / tenant / cNode | cNode / bucket / tenant / VIP |
+| OpenMetrics | yes | yes | yes | yes | yes |
 
 ---
 
@@ -408,7 +429,7 @@ the GitHub Release automatically.
 - HTTPS reachability to VMS (default port 443)
 - No third-party runtime packages ([requirements.txt](requirements.txt))
 
-Optional for development: `pytest`, `pytest-mock`, `pyinstaller`.
+Optional for development: `pytest`, `pyinstaller`.
 
 ---
 
@@ -420,9 +441,11 @@ nfs_v3.py              # NFS v3 engine
 nfs_v41.py             # NFS v4.1 engine
 nvme_tcp.py            # NVMe-oTCP engine
 smb.py                 # SMB engine
+s3.py                  # S3 object storage engine
 wizard.py              # Interactive launcher
 vast_common.py         # Shared VMS helpers
 openmetrics.py         # JSON Lines exporter
+S3_README.md           # S3 protocol reference
 scripts/               # PyInstaller build helpers
 releases/              # Local / published binary staging
 .github/workflows/     # Tag-triggered multi-OS releases

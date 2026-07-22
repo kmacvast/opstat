@@ -28,6 +28,7 @@ HIDDEN_IMPORTS = [
     "nfs_v41",
     "nvme_tcp",
     "smb",
+    "s3",
     "wizard",
     "vast_common",
     "vast_api_log",
