@@ -40,10 +40,8 @@
 #
 ################################################################################
 
-import base64
 import csv
 import io
-import getpass
 import os
 import re
 import shutil
@@ -243,22 +241,9 @@ def init_config(args):
 
     ARGS = args
 
-    password = args.password
-    if not password:
-        password = os.environ.get("VAST_PASSWORD")
-    if not password:
-        try:
-            password = getpass.getpass(
-                f"Password for {args.user}@{args.vms}: "
-            )
-        except KeyboardInterrupt:
-            print()
-            sys.exit(1)
-
     VMS = args.vms
     PORT = args.port
     USER = args.user
-    PASSWORD = password
     SAMPLE_AVERAGE = args.sample_average
     REFRESH_SECONDS = args.refresh
     CSV_FILE = args.csv
@@ -267,13 +252,9 @@ def init_config(args):
     SAMPLE_AVERAGE_MODE = SAMPLE_AVERAGE is not None
 
     BASE_URL = f"https://{VMS}/api" if PORT == 443 else f"https://{VMS}:{PORT}/api"
-    AUTH = base64.b64encode(f"{USER}:{PASSWORD}".encode()).decode()
-    HEADERS = {
-        "Authorization": f"Basic {AUTH}",
-        "Accept":        "application/json",
-        "Content-Type":  "application/json",
-        "User-Agent":    f"opstat/nfs-v3/{VERSION}",
-    }
+    HEADERS, AUTH, PASSWORD = vast_common.resolve_auth(
+        USER, VMS, args.password, f"opstat/nfs-v3/{VERSION}",
+    )
     vast_common.configure_connection(BASE_URL, HEADERS, SSL_CTX)
 
     log_path = vast_api_log.configure(

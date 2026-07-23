@@ -132,6 +132,44 @@ def test_delete_monitor_ignores_404():
     assert not any(mid == 88 for mid, _ in vast_common.failed_deletes())
 
 
+def test_resolve_auth_token_wins_without_password_prompt(monkeypatch):
+    monkeypatch.setenv("VAST_TOKEN", "tok123")
+    monkeypatch.setenv("VAST_PASSWORD", "should-be-ignored")
+    monkeypatch.setattr(
+        "vast_common.getpass.getpass",
+        lambda *_a, **_k: pytest.fail("token users must never be prompted"),
+    )
+    headers, auth, password = vast_common.resolve_auth("admin", "vms1", None, "opstat/test/1")
+    assert headers["Authorization"] == "Bearer tok123"
+    assert headers["User-Agent"] == "opstat/test/1"
+    assert auth is None and password is None
+
+
+def test_resolve_auth_basic_from_env_password(monkeypatch):
+    monkeypatch.delenv("VAST_TOKEN", raising=False)
+    monkeypatch.setenv("VAST_PASSWORD", "sekrit")
+    headers, auth, password = vast_common.resolve_auth("admin", "vms1", None, "opstat/test/1")
+    import base64
+    assert headers["Authorization"] == "Basic " + base64.b64encode(b"admin:sekrit").decode()
+    assert password == "sekrit"
+    assert auth is not None
+
+
+def test_resolve_auth_cli_password_beats_env(monkeypatch):
+    monkeypatch.delenv("VAST_TOKEN", raising=False)
+    monkeypatch.setenv("VAST_PASSWORD", "env-pw")
+    _headers, _auth, password = vast_common.resolve_auth("admin", "vms1", "cli-pw", "ua")
+    assert password == "cli-pw"
+
+
+def test_resolve_auth_prompts_as_last_resort(monkeypatch):
+    monkeypatch.delenv("VAST_TOKEN", raising=False)
+    monkeypatch.delenv("VAST_PASSWORD", raising=False)
+    monkeypatch.setattr("vast_common.getpass.getpass", lambda *_a, **_k: "typed-pw")
+    _headers, _auth, password = vast_common.resolve_auth("admin", "vms1", None, "ua")
+    assert password == "typed-pw"
+
+
 def test_guarded_poll_success_calls_fetch_then_render():
     calls = []
     ok = vast_common.guarded_poll(lambda: calls.append("fetch"), lambda: calls.append("render"))

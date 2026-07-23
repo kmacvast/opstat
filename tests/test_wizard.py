@@ -31,8 +31,8 @@ def test_should_launch_rules():
         ("smb", None, True),
         ("s3", None, True),
         ("nfs", "4.1", True),
-        ("nfs", "3.0", False),
-        ("block", None, False),
+        ("nfs", "3.0", True),
+        ("block", None, True),
     ],
 )
 def test_supports_token(key, version, expected):

@@ -7,6 +7,8 @@ each protocol engine: VMS monitor teardown tracking, signal/atexit wiring
 """
 
 import atexit
+import base64
+import getpass
 import json
 import os
 import re
@@ -71,6 +73,41 @@ def request(method, path, payload=None):
         elapsed_ms = (time.monotonic() - started) * 1000
         vast_api_log.log_call(method, url, payload, None, None, e, elapsed_ms)
         raise RuntimeError(f"{method} {url} failed: {e}") from e
+
+
+# ---------------------------------------------------------------------------
+# Authentication
+# ---------------------------------------------------------------------------
+def resolve_auth(user, vms, cli_password, user_agent):
+    """Resolve VMS auth headers once, identically for every engine.
+
+    VAST_TOKEN (Bearer) wins and is checked before any password acquisition,
+    so token users are never prompted for a password that would be ignored.
+    Otherwise: --password, then VAST_PASSWORD, then an interactive prompt.
+
+    Returns (headers, basic_auth_b64, password); the last two are None in
+    token mode.
+    """
+    token = os.environ.get("VAST_TOKEN")
+    if token:
+        headers = {"Authorization": f"Bearer {token}"}
+        auth = password = None
+    else:
+        password = cli_password or os.environ.get("VAST_PASSWORD")
+        if not password:
+            try:
+                password = getpass.getpass(f"Password for {user}@{vms}: ")
+            except KeyboardInterrupt:
+                print()
+                raise SystemExit(1)
+        auth = base64.b64encode(f"{user}:{password}".encode()).decode()
+        headers = {"Authorization": f"Basic {auth}"}
+    headers.update({
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": user_agent,
+    })
+    return headers, auth, password
 
 
 def resolve_object_name(obj, fields):

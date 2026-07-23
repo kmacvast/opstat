@@ -21,9 +21,7 @@
 #   q      - Quit
 ################################################################################
 
-import base64
 import csv
-import getpass
 import io
 import json
 import os
@@ -282,22 +280,13 @@ def init_config(args):
     VMS = args.vms
     PORT = args.port
     USER = args.user
-    password = args.password or os.environ.get("VAST_PASSWORD")
-    if not password:
-        password = getpass.getpass(f"Password for {USER}@{VMS}: ")
-    PASSWORD = password
     REFRESH_SECONDS = args.refresh
     SAMPLE_AVERAGE_MODE = bool(args.sample_average)
     API_TIME_FRAME = args.sample_average or DEFAULT_API_TIME_FRAME
     BASE_URL = f"https://{VMS}/api" if PORT == 443 else f"https://{VMS}:{PORT}/api"
-    token = os.environ.get("VAST_TOKEN")
-    if token:
-        AUTH = None
-        HEADERS = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    else:
-        AUTH = base64.b64encode(f"{USER}:{PASSWORD}".encode()).decode()
-        HEADERS = {"Authorization": f"Basic {AUTH}", "Content-Type": "application/json"}
-    HEADERS["User-Agent"] = f"opstat/smb/{VERSION}"
+    HEADERS, AUTH, PASSWORD = vast_common.resolve_auth(
+        USER, VMS, args.password, f"opstat/smb/{VERSION}",
+    )
     vast_common.configure_connection(BASE_URL, HEADERS, SSL_CTX)
     log_path = vast_api_log.configure(
         getattr(args, "log_api_calls", False), "smb", VMS, PORT,
