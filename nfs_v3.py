@@ -551,6 +551,16 @@ def _is_batch_drill_mode(mode=None):
     return mode in ("view", "tenant")
 
 
+def _normalize_object_id(value):
+    """Coerce VMS object_id values for reliable batch-monitor slicing."""
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return value
+
+
 def _slice_result_for_object(result, object_id):
     """Return a monitor query payload containing only one object_id's samples."""
     if not isinstance(result, dict):
@@ -559,9 +569,10 @@ def _slice_result_for_object(result, object_id):
     oid_idx = prop_idx.get("object_id")
     if oid_idx is None:
         return result
+    want = _normalize_object_id(object_id)
     filtered = [
         row for row in data
-        if len(row) > oid_idx and row[oid_idx] == object_id
+        if len(row) > oid_idx and _normalize_object_id(row[oid_idx]) == want
     ]
     return {"prop_list": prop_list, "data": filtered}
 
