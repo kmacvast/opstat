@@ -1808,6 +1808,13 @@ def _render_help_bar(width):
     print(c("  ", _DIM) + legend, flush=True)
 
 
+def poll_tick():
+    """One refresh poll: cluster monitors plus the active drill, if any."""
+    fetch_monitor_query()
+    if DRILL_MODE:
+        fetch_drill_query()
+
+
 def render_screen():
     """Compose the whole frame into a buffer, then flush it in one write."""
     buf = io.StringIO()
@@ -1970,10 +1977,7 @@ def main():
                 render_screen()
             continue
         if now >= next_refresh_time:
-            fetch_monitor_query()
-            if DRILL_MODE:
-                fetch_drill_query()
-            render_screen()
+            vast_common.guarded_poll(poll_tick, render_screen)
             next_refresh_time = time.time() + REFRESH_SECONDS
             continue
         time.sleep(0.05)

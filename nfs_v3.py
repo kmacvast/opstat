@@ -1923,6 +1923,13 @@ def _render_drill_panel(width):
 # render_screen
 # ---------------------------------------------------------------------------
 
+def poll_tick():
+    """One refresh poll: headline monitors plus the active drill, if any."""
+    fetch_monitor_query()
+    if DRILL_MODE:
+        fetch_drill_query()
+
+
 def render_screen():
     """Compose the whole frame into a buffer, then flush it in one write."""
     buf = io.StringIO()
@@ -2155,10 +2162,9 @@ def main():
             elif "x" in ch:
                 exit_drill_mode()
             elif " " in chars:
-                fetch_monitor_query()
-                if DRILL_MODE:
-                    fetch_drill_query()
+                vast_common.guarded_poll(poll_tick, render_screen)
                 next_refresh_time = time.time() + REFRESH_SECONDS
+                refresh_needed = False  # guarded_poll already rendered
             else:
                 refresh_needed = False
 
@@ -2167,10 +2173,7 @@ def main():
             continue
 
         if now >= next_refresh_time:
-            fetch_monitor_query()
-            if DRILL_MODE:
-                fetch_drill_query()
-            render_screen()
+            vast_common.guarded_poll(poll_tick, render_screen)
             next_refresh_time = time.time() + REFRESH_SECONDS
             continue
 

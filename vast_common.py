@@ -250,8 +250,10 @@ def failed_deletes():
 
 def reset_registry():
     """Clear registry + failure log (used between sessions and in tests)."""
+    global _POLL_FAILURES
     _CREATED_MONITORS.clear()
     _FAILED_DELETES.clear()
+    _POLL_FAILURES = 0
 
 
 # ---------------------------------------------------------------------------
@@ -310,6 +312,58 @@ def flush_frame(text):
     """
     framed = "\033[K\n".join(text.split("\n"))
     sys.stdout.write("\033[H" + framed + "\033[K\033[J")
+    sys.stdout.flush()
+
+
+# ---------------------------------------------------------------------------
+# Poll-failure tolerance
+# ---------------------------------------------------------------------------
+# A transient VMS/network error (blip, VMS restart, expired session) must not
+# kill a long-running dashboard. Give up only after this many consecutive
+# failed refresh ticks; at the default 5s refresh this is ~2.5 minutes.
+MAX_CONSECUTIVE_POLL_FAILURES = 30
+_POLL_FAILURES = 0
+
+
+def guarded_poll(fetch_fn, render_fn):
+    """Run one poll+render tick, tolerating transient failures.
+
+    On failure: redraws the last good data via *render_fn* (engine renderers
+    compose from module state, which a failed fetch leaves untouched), writes
+    a one-line retry notice below the frame (the next successful redraw's
+    ``\\033[J`` clears it), and returns False. Re-raises only after
+    MAX_CONSECUTIVE_POLL_FAILURES consecutive failures, so callers' existing
+    error paths still report a persistent outage. Returns True on success.
+    """
+    global _POLL_FAILURES
+    try:
+        fetch_fn()
+        render_fn()
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception as exc:
+        _POLL_FAILURES += 1
+        if _POLL_FAILURES >= MAX_CONSECUTIVE_POLL_FAILURES:
+            raise
+        try:
+            render_fn()
+        except Exception:
+            pass
+        _write_poll_error(exc, _POLL_FAILURES)
+        return False
+    _POLL_FAILURES = 0
+    return True
+
+
+def _write_poll_error(exc, failures):
+    """Show a single yellow retry line below the current frame."""
+    msg = str(exc).replace("\n", " ")
+    if len(msg) > 140:
+        msg = msg[:137] + "..."
+    sys.stdout.write(
+        f"\n\033[K\033[33mpoll failed ({failures}/{MAX_CONSECUTIVE_POLL_FAILURES}), "
+        f"retrying in next cycle: {msg}\033[0m"
+    )
     sys.stdout.flush()
 
 

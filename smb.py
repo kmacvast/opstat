@@ -2172,6 +2172,22 @@ def _export_openmetrics():
     )
 
 
+def poll_tick():
+    """One refresh poll: drill view when active, else the headline monitors."""
+    if DRILL_MODE:
+        fetch_drill_query()
+    else:
+        fetch_monitor_query()
+
+
+def manual_refresh():
+    """Space-bar refresh: also force the auxiliary monitors in cluster view."""
+    if DRILL_MODE:
+        fetch_drill_query()
+    else:
+        fetch_monitor_query(force_aux=True)
+
+
 def render_screen():
     """Compose the whole frame into a buffer, then flush it in one write."""
     buf = io.StringIO()
@@ -2471,20 +2487,14 @@ def main():
             elif "x" in chars.lower():
                 exit_drill_mode()
             elif " " in chars:
-                if DRILL_MODE:
-                    fetch_drill_query()
-                else:
-                    fetch_monitor_query(force_aux=True)
+                vast_common.guarded_poll(manual_refresh, render_screen)
                 next_refresh = time.time() + REFRESH_SECONDS
+                continue
             render_screen()
             continue
 
         if time.time() >= next_refresh:
-            if DRILL_MODE:
-                fetch_drill_query()
-            else:
-                fetch_monitor_query()
-            render_screen()
+            vast_common.guarded_poll(poll_tick, render_screen)
             next_refresh = time.time() + REFRESH_SECONDS
             continue
         time.sleep(0.05)

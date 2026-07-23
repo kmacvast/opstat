@@ -130,3 +130,66 @@ def test_delete_monitor_ignores_404():
 
     vast_common.delete_monitor(missing, 88)
     assert not any(mid == 88 for mid, _ in vast_common.failed_deletes())
+
+
+def test_guarded_poll_success_calls_fetch_then_render():
+    calls = []
+    ok = vast_common.guarded_poll(lambda: calls.append("fetch"), lambda: calls.append("render"))
+    assert ok is True
+    assert calls == ["fetch", "render"]
+
+
+def test_guarded_poll_tolerates_transient_failure(capsys):
+    renders = []
+
+    def boom():
+        raise RuntimeError("HTTP 502: VMS restarting")
+
+    ok = vast_common.guarded_poll(boom, lambda: renders.append("render"))
+    assert ok is False
+    assert renders == ["render"]  # last good data redrawn
+    out = capsys.readouterr().out
+    assert "poll failed (1/" in out
+    assert "HTTP 502" in out
+
+
+def test_guarded_poll_success_resets_failure_count(capsys):
+    def boom():
+        raise RuntimeError("blip")
+
+    vast_common.guarded_poll(boom, lambda: None)
+    vast_common.guarded_poll(boom, lambda: None)
+    assert "poll failed (2/" in capsys.readouterr().out
+    # A successful tick restarts the count: the next failure reports 1 again.
+    vast_common.guarded_poll(lambda: None, lambda: None)
+    vast_common.guarded_poll(boom, lambda: None)
+    assert "poll failed (1/" in capsys.readouterr().out
+
+
+def test_guarded_poll_raises_after_max_consecutive_failures(capsys):
+    def boom():
+        raise RuntimeError("persistent outage")
+
+    for _ in range(vast_common.MAX_CONSECUTIVE_POLL_FAILURES - 1):
+        assert vast_common.guarded_poll(boom, lambda: None) is False
+    with pytest.raises(RuntimeError, match="persistent outage"):
+        vast_common.guarded_poll(boom, lambda: None)
+
+
+def test_guarded_poll_propagates_keyboard_interrupt():
+    def interrupted():
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        vast_common.guarded_poll(interrupted, lambda: None)
+
+
+def test_guarded_poll_survives_render_failure_in_error_path(capsys):
+    def boom():
+        raise RuntimeError("fetch down")
+
+    def bad_render():
+        raise ValueError("render broken")
+
+    assert vast_common.guarded_poll(boom, bad_render) is False
+    assert "fetch down" in capsys.readouterr().out
