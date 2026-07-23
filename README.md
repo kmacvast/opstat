@@ -73,8 +73,7 @@ New to Python on this machine? Step-by-step OS setup: **[SETUP.md](SETUP.md)**.
 ### Option B: Standalone binaries (no Python install)
 
 Pre-built single-file executables are published on
-[GitHub Releases](https://github.com/kmacvast/opstat/releases) and can also be
-placed under [`releases/`](releases/).
+[GitHub Releases](https://github.com/kmacvast/opstat/releases).
 
 | Platform | Artifact name (typical) |
 |----------|-------------------------|
@@ -83,12 +82,12 @@ placed under [`releases/`](releases/).
 | Windows x86_64 | `opstat-windows-x86_64.exe` |
 
 ```bash
-# Linux / macOS
-chmod +x ./releases/opstat-linux-x86_64
-./releases/opstat-linux-x86_64 --nfs --version=3.0 --vms <HOST> --user admin
+# Linux / macOS (after downloading from GitHub Releases)
+chmod +x ./opstat-linux-x86_64
+./opstat-linux-x86_64 --nfs --version=3.0 --vms <HOST> --user admin
 
 # Windows (PowerShell)
-.\releases\opstat-windows-x86_64.exe --smb --vms <HOST> --user admin
+.\opstat-windows-x86_64.exe --smb --vms <HOST> --user admin
 ```
 
 Build your own locally: see [Building stand-alone binaries](#building-stand-alone-binaries) below.
@@ -448,7 +447,7 @@ vast_common.py         # Shared VMS helpers
 openmetrics.py         # JSON Lines exporter
 S3_README.md           # S3 protocol reference
 scripts/               # PyInstaller build helpers
-releases/              # Local / published binary staging
+releases/              # Local binary build staging (not committed)
 .github/workflows/     # Tag-triggered multi-OS releases
 ```
 
