@@ -100,9 +100,134 @@ def test_delete_monitor_records_non_404():
     assert any(mid == 77 for mid, _detail in fails)
 
 
+def test_strip_escape_sequences_drops_arrow_keys():
+    # Arrow keys must not satisfy engine substring checks like `"c" in chars`.
+    assert vast_common.strip_escape_sequences("\x1b[C") == ""   # right arrow
+    assert vast_common.strip_escape_sequences("\x1b[B") == ""   # down arrow
+    assert vast_common.strip_escape_sequences("\x1b[A\x1b[D") == ""
+    assert "c" not in vast_common.strip_escape_sequences("\x1b[C").lower()
+
+
+def test_strip_escape_sequences_keeps_plain_keys():
+    assert vast_common.strip_escape_sequences("q") == "q"
+    assert vast_common.strip_escape_sequences("\x03") == "\x03"  # Ctrl-C
+    assert vast_common.strip_escape_sequences(" c") == " c"
+    assert vast_common.strip_escape_sequences("\x1b[Cq\x1b[B") == "q"
+
+
+def test_strip_escape_sequences_handles_extended_and_partial():
+    assert vast_common.strip_escape_sequences("\x1b[1;5C") == ""  # Ctrl+right
+    assert vast_common.strip_escape_sequences("\x1bOP") == ""     # F1 (SS3)
+    assert vast_common.strip_escape_sequences("\x1b[15~") == ""   # F5
+    assert vast_common.strip_escape_sequences("\x1bb") == ""      # Alt-b chord
+    assert vast_common.strip_escape_sequences("\x1b[") == ""      # truncated CSI
+    assert vast_common.strip_escape_sequences("\x1b") == ""       # lone ESC
+
+
 def test_delete_monitor_ignores_404():
     def missing(_method, _path, _payload=None):
         raise RuntimeError("HTTP 404: gone")
 
     vast_common.delete_monitor(missing, 88)
     assert not any(mid == 88 for mid, _ in vast_common.failed_deletes())
+
+
+def test_resolve_auth_token_wins_without_password_prompt(monkeypatch):
+    monkeypatch.setenv("VAST_TOKEN", "tok123")
+    monkeypatch.setenv("VAST_PASSWORD", "should-be-ignored")
+    monkeypatch.setattr(
+        "vast_common.getpass.getpass",
+        lambda *_a, **_k: pytest.fail("token users must never be prompted"),
+    )
+    headers, auth, password = vast_common.resolve_auth("admin", "vms1", None, "opstat/test/1")
+    assert headers["Authorization"] == "Bearer tok123"
+    assert headers["User-Agent"] == "opstat/test/1"
+    assert auth is None and password is None
+
+
+def test_resolve_auth_basic_from_env_password(monkeypatch):
+    monkeypatch.delenv("VAST_TOKEN", raising=False)
+    monkeypatch.setenv("VAST_PASSWORD", "sekrit")
+    headers, auth, password = vast_common.resolve_auth("admin", "vms1", None, "opstat/test/1")
+    import base64
+    assert headers["Authorization"] == "Basic " + base64.b64encode(b"admin:sekrit").decode()
+    assert password == "sekrit"
+    assert auth is not None
+
+
+def test_resolve_auth_cli_password_beats_env(monkeypatch):
+    monkeypatch.delenv("VAST_TOKEN", raising=False)
+    monkeypatch.setenv("VAST_PASSWORD", "env-pw")
+    _headers, _auth, password = vast_common.resolve_auth("admin", "vms1", "cli-pw", "ua")
+    assert password == "cli-pw"
+
+
+def test_resolve_auth_prompts_as_last_resort(monkeypatch):
+    monkeypatch.delenv("VAST_TOKEN", raising=False)
+    monkeypatch.delenv("VAST_PASSWORD", raising=False)
+    monkeypatch.setattr("vast_common.getpass.getpass", lambda *_a, **_k: "typed-pw")
+    _headers, _auth, password = vast_common.resolve_auth("admin", "vms1", None, "ua")
+    assert password == "typed-pw"
+
+
+def test_guarded_poll_success_calls_fetch_then_render():
+    calls = []
+    ok = vast_common.guarded_poll(lambda: calls.append("fetch"), lambda: calls.append("render"))
+    assert ok is True
+    assert calls == ["fetch", "render"]
+
+
+def test_guarded_poll_tolerates_transient_failure(capsys):
+    renders = []
+
+    def boom():
+        raise RuntimeError("HTTP 502: VMS restarting")
+
+    ok = vast_common.guarded_poll(boom, lambda: renders.append("render"))
+    assert ok is False
+    assert renders == ["render"]  # last good data redrawn
+    out = capsys.readouterr().out
+    assert "poll failed (1/" in out
+    assert "HTTP 502" in out
+
+
+def test_guarded_poll_success_resets_failure_count(capsys):
+    def boom():
+        raise RuntimeError("blip")
+
+    vast_common.guarded_poll(boom, lambda: None)
+    vast_common.guarded_poll(boom, lambda: None)
+    assert "poll failed (2/" in capsys.readouterr().out
+    # A successful tick restarts the count: the next failure reports 1 again.
+    vast_common.guarded_poll(lambda: None, lambda: None)
+    vast_common.guarded_poll(boom, lambda: None)
+    assert "poll failed (1/" in capsys.readouterr().out
+
+
+def test_guarded_poll_raises_after_max_consecutive_failures(capsys):
+    def boom():
+        raise RuntimeError("persistent outage")
+
+    for _ in range(vast_common.MAX_CONSECUTIVE_POLL_FAILURES - 1):
+        assert vast_common.guarded_poll(boom, lambda: None) is False
+    with pytest.raises(RuntimeError, match="persistent outage"):
+        vast_common.guarded_poll(boom, lambda: None)
+
+
+def test_guarded_poll_propagates_keyboard_interrupt():
+    def interrupted():
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        vast_common.guarded_poll(interrupted, lambda: None)
+
+
+def test_guarded_poll_survives_render_failure_in_error_path(capsys):
+    def boom():
+        raise RuntimeError("fetch down")
+
+    def bad_render():
+        raise ValueError("render broken")
+
+    assert vast_common.guarded_poll(boom, bad_render) is False
+    assert "fetch down" in capsys.readouterr().out

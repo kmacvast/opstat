@@ -7,8 +7,11 @@ each protocol engine: VMS monitor teardown tracking, signal/atexit wiring
 """
 
 import atexit
+import base64
+import getpass
 import json
 import os
+import re
 import select
 import signal
 import sys
@@ -70,6 +73,41 @@ def request(method, path, payload=None):
         elapsed_ms = (time.monotonic() - started) * 1000
         vast_api_log.log_call(method, url, payload, None, None, e, elapsed_ms)
         raise RuntimeError(f"{method} {url} failed: {e}") from e
+
+
+# ---------------------------------------------------------------------------
+# Authentication
+# ---------------------------------------------------------------------------
+def resolve_auth(user, vms, cli_password, user_agent):
+    """Resolve VMS auth headers once, identically for every engine.
+
+    VAST_TOKEN (Bearer) wins and is checked before any password acquisition,
+    so token users are never prompted for a password that would be ignored.
+    Otherwise: --password, then VAST_PASSWORD, then an interactive prompt.
+
+    Returns (headers, basic_auth_b64, password); the last two are None in
+    token mode.
+    """
+    token = os.environ.get("VAST_TOKEN")
+    if token:
+        headers = {"Authorization": f"Bearer {token}"}
+        auth = password = None
+    else:
+        password = cli_password or os.environ.get("VAST_PASSWORD")
+        if not password:
+            try:
+                password = getpass.getpass(f"Password for {user}@{vms}: ")
+            except KeyboardInterrupt:
+                print()
+                raise SystemExit(1)
+        auth = base64.b64encode(f"{user}:{password}".encode()).decode()
+        headers = {"Authorization": f"Basic {auth}"}
+    headers.update({
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": user_agent,
+    })
+    return headers, auth, password
 
 
 def resolve_object_name(obj, fields):
@@ -249,8 +287,10 @@ def failed_deletes():
 
 def reset_registry():
     """Clear registry + failure log (used between sessions and in tests)."""
+    global _POLL_FAILURES
     _CREATED_MONITORS.clear()
     _FAILED_DELETES.clear()
+    _POLL_FAILURES = 0
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +353,58 @@ def flush_frame(text):
 
 
 # ---------------------------------------------------------------------------
+# Poll-failure tolerance
+# ---------------------------------------------------------------------------
+# A transient VMS/network error (blip, VMS restart, expired session) must not
+# kill a long-running dashboard. Give up only after this many consecutive
+# failed refresh ticks; at the default 5s refresh this is ~2.5 minutes.
+MAX_CONSECUTIVE_POLL_FAILURES = 30
+_POLL_FAILURES = 0
+
+
+def guarded_poll(fetch_fn, render_fn):
+    """Run one poll+render tick, tolerating transient failures.
+
+    On failure: redraws the last good data via *render_fn* (engine renderers
+    compose from module state, which a failed fetch leaves untouched), writes
+    a one-line retry notice below the frame (the next successful redraw's
+    ``\\033[J`` clears it), and returns False. Re-raises only after
+    MAX_CONSECUTIVE_POLL_FAILURES consecutive failures, so callers' existing
+    error paths still report a persistent outage. Returns True on success.
+    """
+    global _POLL_FAILURES
+    try:
+        fetch_fn()
+        render_fn()
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception as exc:
+        _POLL_FAILURES += 1
+        if _POLL_FAILURES >= MAX_CONSECUTIVE_POLL_FAILURES:
+            raise
+        try:
+            render_fn()
+        except Exception:
+            pass
+        _write_poll_error(exc, _POLL_FAILURES)
+        return False
+    _POLL_FAILURES = 0
+    return True
+
+
+def _write_poll_error(exc, failures):
+    """Show a single yellow retry line below the current frame."""
+    msg = str(exc).replace("\n", " ")
+    if len(msg) > 140:
+        msg = msg[:137] + "..."
+    sys.stdout.write(
+        f"\n\033[K\033[33mpoll failed ({failures}/{MAX_CONSECUTIVE_POLL_FAILURES}), "
+        f"retrying in next cycle: {msg}\033[0m"
+    )
+    sys.stdout.flush()
+
+
+# ---------------------------------------------------------------------------
 # Terminal / keyboard I/O (cbreak-mode single-key polling)
 # ---------------------------------------------------------------------------
 _TERM_ORIGINAL = None
@@ -349,22 +441,52 @@ def keyboard_enabled():
     return _TERM_ENABLED
 
 
+# ESC-initiated terminal input: CSI (arrows, Home/End, F5+), SS3 (F1-F4), and
+# Alt-modified chords. The trailing alternatives also swallow a sequence cut
+# off at the end of a read so its tail bytes cannot masquerade as plain keys.
+_ESC_SEQ_RE = re.compile(
+    r"\x1b(?:\[[0-9;:<=>?]*[ -/]*[@-~]?|O.?|[^\[O])?"
+)
+
+
+def strip_escape_sequences(text):
+    """Drop ANSI escape sequences, returning only plain keypresses.
+
+    Engines bind printable keys (plus Ctrl-C) via substring checks, so without
+    this the final byte of e.g. right-arrow (``ESC [ C``) would satisfy
+    ``"c" in chars`` and trigger a drill-mode switch — a data-altering VMS
+    monitor create — from a stray arrow key.
+    """
+    return _ESC_SEQ_RE.sub("", text)
+
+
 def check_keypress():
-    """Return any buffered keypresses (non-blocking), or '' when none/inactive."""
+    """Return any buffered plain keypresses (non-blocking), or '' when none/inactive.
+
+    Drains everything currently buffered in one call so a multi-byte escape
+    sequence is never split across polls, then strips escape sequences.
+    """
     if not _TERM_ENABLED:
         return ""
     fd = sys.stdin.fileno()
-    try:
-        readable, _w, _e = select.select([fd], [], [], 0)
-    except Exception:
+    chunks = []
+    while True:
+        try:
+            readable, _w, _e = select.select([fd], [], [], 0)
+        except Exception:
+            break
+        if not readable:
+            break
+        try:
+            data = os.read(fd, 1024)
+        except Exception:
+            break
+        if not data:
+            break
+        chunks.append(data)
+    if not chunks:
         return ""
-    if not readable:
-        return ""
-    try:
-        data = os.read(fd, 32)
-    except Exception:
-        return ""
-    return data.decode(errors="ignore") if data else ""
+    return strip_escape_sequences(b"".join(chunks).decode(errors="ignore"))
 
 
 def clear_screen():

@@ -10,10 +10,8 @@
 # Author:      KMac
 ################################################################################
 
-import base64
 import csv
 import io
-import getpass
 import os
 import re
 import shutil
@@ -204,31 +202,18 @@ def init_config(args):
     global VOLUME_NAMES, VOLUME_IDS, VOLUME_SCOPED, SCOPE_LABEL
 
     ARGS = args
-    password = args.password or os.environ.get("VAST_PASSWORD")
-    if not password:
-        try:
-            password = getpass.getpass(f"Password for {args.user}@{args.vms}: ")
-        except KeyboardInterrupt:
-            print()
-            sys.exit(1)
-
     VMS = args.vms
     PORT = args.port
     USER = args.user
-    PASSWORD = password
     SAMPLE_AVERAGE = args.sample_average
     REFRESH_SECONDS = args.refresh
     CSV_FILE = args.csv
     API_TIME_FRAME = SAMPLE_AVERAGE or DEFAULT_API_TIME_FRAME
     SAMPLE_AVERAGE_MODE = SAMPLE_AVERAGE is not None
     BASE_URL = f"https://{VMS}/api" if PORT == 443 else f"https://{VMS}:{PORT}/api"
-    AUTH = base64.b64encode(f"{USER}:{PASSWORD}".encode()).decode()
-    HEADERS = {
-        "Authorization": f"Basic {AUTH}",
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "User-Agent": f"opstat/nvme-tcp/{VERSION}",
-    }
+    HEADERS, AUTH, PASSWORD = vast_common.resolve_auth(
+        USER, VMS, args.password, f"opstat/nvme-tcp/{VERSION}",
+    )
     vast_common.configure_connection(BASE_URL, HEADERS, SSL_CTX)
     log_path = vast_api_log.configure(
         getattr(args, "log_api_calls", False), "nvme-tcp", VMS, PORT,
@@ -1808,6 +1793,13 @@ def _render_help_bar(width):
     print(c("  ", _DIM) + legend, flush=True)
 
 
+def poll_tick():
+    """One refresh poll: cluster monitors plus the active drill, if any."""
+    fetch_monitor_query()
+    if DRILL_MODE:
+        fetch_drill_query()
+
+
 def render_screen():
     """Compose the whole frame into a buffer, then flush it in one write."""
     buf = io.StringIO()
@@ -1970,10 +1962,7 @@ def main():
                 render_screen()
             continue
         if now >= next_refresh_time:
-            fetch_monitor_query()
-            if DRILL_MODE:
-                fetch_drill_query()
-            render_screen()
+            vast_common.guarded_poll(poll_tick, render_screen)
             next_refresh_time = time.time() + REFRESH_SECONDS
             continue
         time.sleep(0.05)

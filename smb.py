@@ -21,9 +21,7 @@
 #   q      - Quit
 ################################################################################
 
-import base64
 import csv
-import getpass
 import io
 import json
 import os
@@ -282,22 +280,13 @@ def init_config(args):
     VMS = args.vms
     PORT = args.port
     USER = args.user
-    password = args.password or os.environ.get("VAST_PASSWORD")
-    if not password:
-        password = getpass.getpass(f"Password for {USER}@{VMS}: ")
-    PASSWORD = password
     REFRESH_SECONDS = args.refresh
     SAMPLE_AVERAGE_MODE = bool(args.sample_average)
     API_TIME_FRAME = args.sample_average or DEFAULT_API_TIME_FRAME
     BASE_URL = f"https://{VMS}/api" if PORT == 443 else f"https://{VMS}:{PORT}/api"
-    token = os.environ.get("VAST_TOKEN")
-    if token:
-        AUTH = None
-        HEADERS = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    else:
-        AUTH = base64.b64encode(f"{USER}:{PASSWORD}".encode()).decode()
-        HEADERS = {"Authorization": f"Basic {AUTH}", "Content-Type": "application/json"}
-    HEADERS["User-Agent"] = f"opstat/smb/{VERSION}"
+    HEADERS, AUTH, PASSWORD = vast_common.resolve_auth(
+        USER, VMS, args.password, f"opstat/smb/{VERSION}",
+    )
     vast_common.configure_connection(BASE_URL, HEADERS, SSL_CTX)
     log_path = vast_api_log.configure(
         getattr(args, "log_api_calls", False), "smb", VMS, PORT,
@@ -2172,6 +2161,22 @@ def _export_openmetrics():
     )
 
 
+def poll_tick():
+    """One refresh poll: drill view when active, else the headline monitors."""
+    if DRILL_MODE:
+        fetch_drill_query()
+    else:
+        fetch_monitor_query()
+
+
+def manual_refresh():
+    """Space-bar refresh: also force the auxiliary monitors in cluster view."""
+    if DRILL_MODE:
+        fetch_drill_query()
+    else:
+        fetch_monitor_query(force_aux=True)
+
+
 def render_screen():
     """Compose the whole frame into a buffer, then flush it in one write."""
     buf = io.StringIO()
@@ -2471,20 +2476,14 @@ def main():
             elif "x" in chars.lower():
                 exit_drill_mode()
             elif " " in chars:
-                if DRILL_MODE:
-                    fetch_drill_query()
-                else:
-                    fetch_monitor_query(force_aux=True)
+                vast_common.guarded_poll(manual_refresh, render_screen)
                 next_refresh = time.time() + REFRESH_SECONDS
+                continue
             render_screen()
             continue
 
         if time.time() >= next_refresh:
-            if DRILL_MODE:
-                fetch_drill_query()
-            else:
-                fetch_monitor_query()
-            render_screen()
+            vast_common.guarded_poll(poll_tick, render_screen)
             next_refresh = time.time() + REFRESH_SECONDS
             continue
         time.sleep(0.05)

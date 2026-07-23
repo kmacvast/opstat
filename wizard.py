@@ -83,11 +83,8 @@ def should_launch(argv_source, stdin_isatty, stdout_isatty):
 
 
 def _supports_token(protocol_key, version):
-    """VAST_TOKEN auth is wired for SMB, S3, and NFS v4.1 engines today."""
-    return (
-        protocol_key in ("smb", "s3")
-        or (protocol_key == "nfs" and version == "4.1")
-    )
+    """Every engine resolves VAST_TOKEN (Bearer) auth via vast_common."""
+    return True
 
 
 class _Prompt:
