@@ -436,11 +436,6 @@ def restore_terminal():
     _TERM_ENABLED = False
 
 
-def keyboard_enabled():
-    """Return True when cbreak keyboard polling is active."""
-    return _TERM_ENABLED
-
-
 # ESC-initiated terminal input: CSI (arrows, Home/End, F5+), SS3 (F1-F4), and
 # Alt-modified chords. The trailing alternatives also swallow a sequence cut
 # off at the end of a read so its tail bytes cannot masquerade as plain keys.
