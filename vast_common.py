@@ -9,6 +9,7 @@ each protocol engine: VMS monitor teardown tracking, signal/atexit wiring
 import atexit
 import json
 import os
+import re
 import select
 import signal
 import sys
@@ -349,22 +350,52 @@ def keyboard_enabled():
     return _TERM_ENABLED
 
 
+# ESC-initiated terminal input: CSI (arrows, Home/End, F5+), SS3 (F1-F4), and
+# Alt-modified chords. The trailing alternatives also swallow a sequence cut
+# off at the end of a read so its tail bytes cannot masquerade as plain keys.
+_ESC_SEQ_RE = re.compile(
+    r"\x1b(?:\[[0-9;:<=>?]*[ -/]*[@-~]?|O.?|[^\[O])?"
+)
+
+
+def strip_escape_sequences(text):
+    """Drop ANSI escape sequences, returning only plain keypresses.
+
+    Engines bind printable keys (plus Ctrl-C) via substring checks, so without
+    this the final byte of e.g. right-arrow (``ESC [ C``) would satisfy
+    ``"c" in chars`` and trigger a drill-mode switch — a data-altering VMS
+    monitor create — from a stray arrow key.
+    """
+    return _ESC_SEQ_RE.sub("", text)
+
+
 def check_keypress():
-    """Return any buffered keypresses (non-blocking), or '' when none/inactive."""
+    """Return any buffered plain keypresses (non-blocking), or '' when none/inactive.
+
+    Drains everything currently buffered in one call so a multi-byte escape
+    sequence is never split across polls, then strips escape sequences.
+    """
     if not _TERM_ENABLED:
         return ""
     fd = sys.stdin.fileno()
-    try:
-        readable, _w, _e = select.select([fd], [], [], 0)
-    except Exception:
+    chunks = []
+    while True:
+        try:
+            readable, _w, _e = select.select([fd], [], [], 0)
+        except Exception:
+            break
+        if not readable:
+            break
+        try:
+            data = os.read(fd, 1024)
+        except Exception:
+            break
+        if not data:
+            break
+        chunks.append(data)
+    if not chunks:
         return ""
-    if not readable:
-        return ""
-    try:
-        data = os.read(fd, 32)
-    except Exception:
-        return ""
-    return data.decode(errors="ignore") if data else ""
+    return strip_escape_sequences(b"".join(chunks).decode(errors="ignore"))
 
 
 def clear_screen():

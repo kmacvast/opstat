@@ -100,6 +100,30 @@ def test_delete_monitor_records_non_404():
     assert any(mid == 77 for mid, _detail in fails)
 
 
+def test_strip_escape_sequences_drops_arrow_keys():
+    # Arrow keys must not satisfy engine substring checks like `"c" in chars`.
+    assert vast_common.strip_escape_sequences("\x1b[C") == ""   # right arrow
+    assert vast_common.strip_escape_sequences("\x1b[B") == ""   # down arrow
+    assert vast_common.strip_escape_sequences("\x1b[A\x1b[D") == ""
+    assert "c" not in vast_common.strip_escape_sequences("\x1b[C").lower()
+
+
+def test_strip_escape_sequences_keeps_plain_keys():
+    assert vast_common.strip_escape_sequences("q") == "q"
+    assert vast_common.strip_escape_sequences("\x03") == "\x03"  # Ctrl-C
+    assert vast_common.strip_escape_sequences(" c") == " c"
+    assert vast_common.strip_escape_sequences("\x1b[Cq\x1b[B") == "q"
+
+
+def test_strip_escape_sequences_handles_extended_and_partial():
+    assert vast_common.strip_escape_sequences("\x1b[1;5C") == ""  # Ctrl+right
+    assert vast_common.strip_escape_sequences("\x1bOP") == ""     # F1 (SS3)
+    assert vast_common.strip_escape_sequences("\x1b[15~") == ""   # F5
+    assert vast_common.strip_escape_sequences("\x1bb") == ""      # Alt-b chord
+    assert vast_common.strip_escape_sequences("\x1b[") == ""      # truncated CSI
+    assert vast_common.strip_escape_sequences("\x1b") == ""       # lone ESC
+
+
 def test_delete_monitor_ignores_404():
     def missing(_method, _path, _payload=None):
         raise RuntimeError("HTTP 404: gone")
