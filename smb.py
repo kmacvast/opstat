@@ -864,10 +864,6 @@ def build_rows_from_results(headline_result):
     }, sample
 
 
-def _opcode_cmd_map():
-    return {cmd: label for label, _cat, cmd in SMB2_OPCODES}
-
-
 def _build_opcode_rows_from_smbmetrics(result):
     """Native per-command rows when VMS exports SmbMetrics."""
     if not result:

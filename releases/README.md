@@ -1,6 +1,8 @@
-# Pre-built opstat binaries (v0.1.2)
+# opstat binaries
 
-Standalone PyInstaller builds from the GitHub Actions release workflow.
+Standalone PyInstaller builds are published on
+[GitHub Releases](https://github.com/kmacvast/opstat/releases) by the release
+workflow (`.github/workflows/release.yml`) on every version tag.
 
 | File | Platform |
 |------|----------|
@@ -15,4 +17,5 @@ chmod +x opstat-linux-x86_64   # Linux / macOS
 ./opstat-linux-x86_64 --help
 ```
 
-Also available on [GitHub Releases](https://github.com/kmacvast/opstat/releases).
+This directory is only a local staging area for `scripts/build_opstat.py`;
+binaries are not committed to the repository.

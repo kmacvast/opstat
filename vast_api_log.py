@@ -4,7 +4,6 @@
 import atexit
 import json
 import os
-import time
 from datetime import datetime
 
 _LOG_ENABLED = False

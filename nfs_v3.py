@@ -371,12 +371,6 @@ def box_row(content, width):
     return f"{border} {content}{' ' * pad} {border}"
 
 
-def box_blank(width):
-    return box_row("", width)
-
-
-# ── Status indicators ────────────────────────────────────────────────────────
-
 def badge(text, color_code):
     """Colored status badge: [ TEXT ]"""
     return c(f"[ {text} ]", color_code)
@@ -614,10 +608,6 @@ check_keypress = vast_common.check_keypress
 
 def fmt(value, width=12, precision=2):
     return format_fixed_number(value, width, precision)
-
-
-def fmt_blank(width=12):
-    return pad_display("", width, ">")
 
 
 def fmt_size(value, width=12):

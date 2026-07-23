@@ -259,11 +259,6 @@ def metric_names_for_op(op_key):
     raise KeyError(op_key)
 
 
-def scoped_metric_fqn(fqn):
-    """Legacy helper - prefer active_ops() for scope-aware metric selection."""
-    return fqn
-
-
 def active_ops():
     """Return OPS rows with metric FQNs for cluster or volume monitor scope."""
     rows = []
@@ -483,50 +478,6 @@ def build_ops_monitor_groups(cluster_scope_only=False, ops_rows=None):
     return groups
 
 
-def build_ops_prop_list():
-    """Flat prop list for discovery output."""
-    props = []
-    for group in build_ops_monitor_groups():
-        for prop in group:
-            if prop not in props:
-                props.append(prop)
-    return props
-
-
-def merge_monitor_query_results(results):
-    """Merge multiple monitor query payloads into one synthetic result dict."""
-    metric_names = []
-    seen = set()
-    for result in results:
-        if not isinstance(result, dict):
-            continue
-        for name in result.get("prop_list", []):
-            if name in ("timestamp", "object_id") or name in seen:
-                continue
-            seen.add(name)
-            metric_names.append(name)
-
-    rows_by_ts = {}
-    for result in results:
-        if not isinstance(result, dict):
-            continue
-        prop_list = result.get("prop_list", [])
-        prop_idx = {name: idx for idx, name in enumerate(prop_list)}
-        for row in result.get("data", []):
-            if not row:
-                continue
-            ts = row[0]
-            bucket = rows_by_ts.setdefault(ts, {})
-            for name in metric_names:
-                idx = prop_idx.get(name)
-                if idx is not None and idx < len(row):
-                    bucket[name] = row[idx]
-
-    prop_list = ["timestamp", *metric_names]
-    data = [[ts, *[rows_by_ts[ts].get(name) for name in metric_names]] for ts in sorted(rows_by_ts, reverse=True)]
-    return {"prop_list": prop_list, "data": data}
-
-
 def query_ops_monitors(monitor_ids):
     """Query each BlockMetrics monitor separately (do not merge time series)."""
     return [api_request("GET", f"/monitors/{monitor_id}/query/") for monitor_id in monitor_ids]
@@ -630,11 +581,6 @@ def build_ops_rows_from_monitor_results(
     if not DELTA_READY and not SAMPLE_AVERAGE_MODE and not VOLUME_SCOPED:
         selected_sample = f"{selected_sample} (warming up - need 2nd sample)"
     return rows, selected_sample
-
-
-def build_ops_rows_from_monitor_results_average(monitor_results, scope="cluster", poll_time=None):
-    """Rolling-average variant using per-monitor time series."""
-    return build_ops_rows_from_monitor_results(monitor_results, scope=scope, poll_time=poll_time)
 
 
 def compute_data_io_iops(rows):
@@ -914,58 +860,6 @@ def select_latest_complete_row(data, prop_idx, prop_list):
     return best_row, best_row[0] if best_row else "-"
 
 
-def build_ops_rows_from_single_sample(result):
-    _prop_list, data, prop_idx = _result_parts(result)
-    if not data:
-        return [], "-"
-    selected_row, selected_sample = select_latest_complete_row(data, prop_idx, _prop_list)
-    rows = []
-    for key, label, category, ops_fqn, avg_fqn in OPS:
-        rows.append({
-            "key": key,
-            "label": label,
-            "category": category,
-            "ops_sec": metric_value_from_row(selected_row, prop_idx, ops_fqn),
-            "avg_us": metric_value_from_row(selected_row, prop_idx, avg_fqn),
-            "sample": selected_sample,
-            "bw_mbs": None,
-            "avg_io_bytes": None,
-        })
-    return rows, selected_sample
-
-
-def build_ops_rows_from_sample_average(result):
-    _prop_list, data, prop_idx = _result_parts(result)
-    if not data:
-        return [], "-"
-    newest_sample = data[0][0] if data and data[0] else "-"
-    rows = []
-    for key, label, category, ops_fqn, avg_fqn in OPS:
-        ops_idx = prop_idx.get(ops_fqn)
-        avg_idx = prop_idx.get(avg_fqn)
-        ops_values = []
-        latency_components = []
-        for row in data:
-            sample_time = row[0] if row else newest_sample
-            ops = as_float(row[ops_idx]) if ops_idx is not None and ops_idx < len(row) else None
-            avg = as_float(row[avg_idx]) if avg_idx is not None and avg_idx < len(row) else None
-            if ops is not None:
-                ops_values.append(ops)
-            if ops is not None and ops > 0 and avg is not None:
-                latency_components.append((ops, avg, sample_time))
-        rows.append({
-            "key": key,
-            "label": label,
-            "category": category,
-            "ops_sec": _list_avg(ops_values),
-            "avg_us": _weighted_avg([(r, a) for r, a, _ in latency_components]),
-            "sample": latency_components[0][2] if latency_components else newest_sample,
-            "bw_mbs": None,
-            "avg_io_bytes": None,
-        })
-    return rows, f"rolling average over {API_TIME_FRAME}"
-
-
 def extract_proto_from_single_sample(result):
     _prop_list, data, prop_idx = _result_parts(result)
     if not data:
@@ -1150,12 +1044,6 @@ def cluster_delta_summary(deltas):
         sum(bw_deltas) / 1024 if bw_deltas else None,
         lat_deltas,
     )
-
-
-def compute_total_throughput_mbs(rows):
-    valid = [as_float(r.get("bw_mbs")) for r in rows if r["label"] in IO_LABELS]
-    valid = [v for v in valid if v is not None]
-    return sum(valid) if valid else None
 
 
 def compute_deltas(current_rows, prev_rows):
@@ -1716,11 +1604,6 @@ def _render_insights_panel(rows, width):
         print(box_row(c("Data Consumer    ", _DIM) + c("-", _DIM), width))
 
     print(box_bottom(width))
-
-
-def _render_header_block(rows, width):
-    """Legacy alias - health panel replaces the old header block."""
-    _render_health_panel(rows, width)
 
 
 def _render_operations_table(rows, width):

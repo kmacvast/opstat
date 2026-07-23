@@ -217,12 +217,8 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# Local PyInstaller build scratch (binaries committed under releases/ for public download)
-# Ignore accidental local names; keep CI artifact names trackable.
-releases/opstat
-releases/opstat.exe
-!releases/opstat-linux-*
-!releases/opstat-macos-*
-!releases/opstat-windows-*
+# Local PyInstaller build staging. Binaries are published via GitHub Releases
+# by the release workflow and are never committed to the repository.
+releases/*
 !releases/README.md
 !releases/.gitkeep
