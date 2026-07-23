@@ -166,38 +166,16 @@ class _Prompt:
 def _load_config(config_loader):
     """Return a ~/.vastconf dict or None. Best-effort; never raises.
 
-    When *config_loader* is explicitly injected (tests), it is used directly and
-    the on-disk existence check is skipped so behavior is deterministic. In
-    production (loader None) we require the file to exist before importing the
-    shared loader.
+    Only an explicitly injected *config_loader* is used (tests, or a future
+    packaged loader). There is currently no production loader: the previous
+    implementation imported ``vast.common.utils`` from a monorepo layout that
+    does not exist in this repository, so it always returned None. TODO:
+    either vendor a ~/.vastconf parser or drop the feature from the wizard.
     """
-    path = os.path.expanduser("~/.vastconf")
-    if config_loader is not None:
-        try:
-            return config_loader(path)
-        except Exception:
-            return None
-    if not os.path.exists(path):
-        return None
-    loader = _default_config_loader()
-    if loader is None:
+    if config_loader is None:
         return None
     try:
-        return loader(path)
-    except Exception:
-        return None
-
-
-def _default_config_loader():
-    """Import the shared loader, adding the repo root to sys.path if needed."""
-    repo_root = os.path.abspath(
-        os.path.join(os.path.dirname(__file__), "..", "..")
-    )
-    if repo_root not in sys.path:
-        sys.path.insert(0, repo_root)
-    try:
-        from vast.common.utils import load_vast_config
-        return load_vast_config
+        return config_loader(os.path.expanduser("~/.vastconf"))
     except Exception:
         return None
 
