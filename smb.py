@@ -702,6 +702,40 @@ def try_create_smb_command_monitor():
         delete_monitor(monitor_id)
 
 
+def create_headline_monitors():
+    """Create the headline + per-opcode monitors, merged into one when possible.
+
+    The headline monitor already mixes ProtoMetrics and NfsMetrics props; the
+    SmbMetrics per-opcode props ride along in the same monitor on clusters
+    that accept them, halving the per-refresh query count. The merged monitor
+    doubles as the SmbMetrics export probe: presence of SmbMetrics props in
+    the probe query's prop_list decides SMB_PER_COMMAND_EXPORTED exactly like
+    the standalone probe did. On create failure the engine falls back to the
+    historical split monitors.
+    """
+    global HEADLINE_MONITOR_ID, SMB_COMMAND_MONITOR_ID, SMB_PER_COMMAND_EXPORTED
+    headline_props = build_headline_monitor_props()
+    command_props = smb_command_props()
+    SMB_PER_COMMAND_EXPORTED = False
+    SMB_COMMAND_MONITOR_ID = None
+    merged_id = None
+    try:
+        merged_id = create_monitor("headline_cmds", headline_props + command_props)
+        result = api_request("GET", f"/monitors/{merged_id}/query/")
+        returned = set(result.get("prop_list", []) or []) if isinstance(result, dict) else set()
+        if any(p in returned for p in headline_props):
+            HEADLINE_MONITOR_ID = merged_id
+            if any(p.startswith("SmbMetrics,") for p in returned):
+                SMB_COMMAND_MONITOR_ID = merged_id
+                SMB_PER_COMMAND_EXPORTED = True
+            return
+        delete_monitor(merged_id)
+    except RuntimeError:
+        delete_monitor(merged_id)
+    HEADLINE_MONITOR_ID = create_monitor("headline", headline_props)
+    try_create_smb_command_monitor()
+
+
 def delete_monitor(monitor_id):
     vast_common.delete_monitor(api_request, monitor_id)
 
@@ -2116,10 +2150,13 @@ def fetch_monitor_query(*, force_aux=False):
     LAST_ROWS, LAST_SAMPLE = build_rows_from_results(result)
     smb_result = None
     if SMB_COMMAND_MONITOR_ID:
-        try:
-            smb_result = api_request("GET", f"/monitors/{SMB_COMMAND_MONITOR_ID}/query/")
-        except RuntimeError:
-            smb_result = None
+        if SMB_COMMAND_MONITOR_ID == HEADLINE_MONITOR_ID:
+            smb_result = result  # merged monitor: opcode props share the query
+        else:
+            try:
+                smb_result = api_request("GET", f"/monitors/{SMB_COMMAND_MONITOR_ID}/query/")
+            except RuntimeError:
+                smb_result = None
     LAST_ROWS["opcodes"] = build_opcode_workflow_rows(
         LAST_ROWS["data"], LAST_ROWS["metadata"], LAST_ROWS["session"],
         LAST_ROWS["meta"], smb_result,
@@ -2450,8 +2487,7 @@ def main():
     setup_keyboard()
     CLUSTER_ID, CLUSTER_NAME = get_current_cluster()
     _capture_cluster_os()
-    HEADLINE_MONITOR_ID = create_monitor("headline", build_headline_monitor_props())
-    try_create_smb_command_monitor()
+    create_headline_monitors()
     ensure_csv_file()
 
     fetch_monitor_query()

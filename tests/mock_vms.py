@@ -105,6 +105,9 @@ class _State:
         # When True, POST /monitors/ rejects prop_lists that mix metric
         # families (text before the first comma), for fallback-path testing.
         self.reject_mixed_families = False
+        # Prop-name prefixes that make POST /monitors/ fail outright, for
+        # engines whose fallback path reacts to a rejected create.
+        self.reject_prop_prefixes = ()
         self.latency_s = 0.0
         self.t0 = time.time()
 
@@ -233,6 +236,10 @@ class _Handler(BaseHTTPRequestHandler):
             families = {str(p).split(",", 1)[0] for p in payload.get("prop_list") or []}
             if len(families) > 1:
                 return self._error(400, "cannot mix metric families in one monitor")
+        if self.state.reject_prop_prefixes:
+            for p in payload.get("prop_list") or []:
+                if str(p).startswith(tuple(self.state.reject_prop_prefixes)):
+                    return self._error(400, f"unsupported metric: {p}")
         with self.state.lock:
             monitor_id = self.state.next_monitor_id
             self.state.next_monitor_id += 1

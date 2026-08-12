@@ -648,6 +648,41 @@ def try_create_s3_metrics_monitor():
         delete_monitor(monitor_id)
 
 
+def create_headline_monitors():
+    """Create the headline + S3Metrics monitors, merged into one when possible.
+
+    One S3Common cluster monitor carries the headline and S3Metrics props
+    together, halving the per-refresh query count; the probe query's returned
+    prop_list decides S3_METRICS_EXPORTED exactly like the standalone probe
+    did. Clusters that reject the merged prop list (or that only export the
+    legacy S3 ProtoMetrics family) fall back to the historical split path.
+    """
+    global HEADLINE_MONITOR_ID, S3_METRICS_MONITOR_ID, S3_METRICS_EXPORTED
+    global METRICS_SOURCE, _PROTO_ACTIVE
+    headline_props = build_headline_monitor_props(_PROTO_S3_COMMON)
+    metrics_props = build_s3_metrics_props()
+    S3_METRICS_EXPORTED = False
+    S3_METRICS_MONITOR_ID = None
+    merged_id = None
+    try:
+        merged_id = create_monitor("headline_s3m", headline_props + metrics_props)
+        result = api_request("GET", f"/monitors/{merged_id}/query/")
+        returned = set(result.get("prop_list", []) or []) if isinstance(result, dict) else set()
+        if any(p in returned for p in headline_props):
+            _PROTO_ACTIVE = _PROTO_S3_COMMON
+            METRICS_SOURCE = "S3Common"
+            HEADLINE_MONITOR_ID = merged_id
+            if any(str(p).startswith("S3Metrics,") for p in returned):
+                S3_METRICS_MONITOR_ID = merged_id
+                S3_METRICS_EXPORTED = True
+            return
+        delete_monitor(merged_id)
+    except RuntimeError:
+        delete_monitor(merged_id)
+    HEADLINE_MONITOR_ID = create_headline_monitor()
+    try_create_s3_metrics_monitor()
+
+
 def delete_monitor(monitor_id):
     vast_common.delete_monitor(api_request, monitor_id)
 
@@ -2039,10 +2074,13 @@ def fetch_monitor_query():
     LAST_ROWS, LAST_SAMPLE = build_rows_from_results(result)
     s3_result = None
     if S3_METRICS_MONITOR_ID:
-        try:
-            s3_result = api_request("GET", f"/monitors/{S3_METRICS_MONITOR_ID}/query/")
-        except RuntimeError:
-            s3_result = None
+        if S3_METRICS_MONITOR_ID == HEADLINE_MONITOR_ID:
+            s3_result = result  # merged monitor: S3Metrics props share the query
+        else:
+            try:
+                s3_result = api_request("GET", f"/monitors/{S3_METRICS_MONITOR_ID}/query/")
+            except RuntimeError:
+                s3_result = None
     LAST_ROWS["opcodes"] = build_opcode_breakdown_rows(
         LAST_ROWS["data"], LAST_ROWS["metadata"], LAST_ROWS["meta"], s3_result,
     )
@@ -2328,8 +2366,7 @@ def main():
     setup_keyboard()
     CLUSTER_ID, CLUSTER_NAME = get_current_cluster()
     _capture_cluster_os()
-    HEADLINE_MONITOR_ID = create_headline_monitor()
-    try_create_s3_metrics_monitor()
+    create_headline_monitors()
     ensure_csv_file()
 
     fetch_monitor_query()

@@ -298,6 +298,107 @@ def test_nfs_v41_merges_without_state_when_state_unsupported(vms, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# SMB / S3: merged headline + probe monitor
+# ---------------------------------------------------------------------------
+def test_smb_merged_monitor_single_query_per_refresh(vms, monkeypatch, reset_smb_globals):
+    import smb
+
+    monkeypatch.setenv("VAST_TOKEN", "test-token")
+    smb.init_config(_engine_args(vms, clients=None))
+    smb.CLUSTER_ID, smb.CLUSTER_NAME = smb.get_current_cluster()
+    smb.create_headline_monitors()
+    assert smb.HEADLINE_MONITOR_ID is not None
+    assert smb.SMB_COMMAND_MONITOR_ID == smb.HEADLINE_MONITOR_ID
+    assert smb.SMB_PER_COMMAND_EXPORTED is True
+
+    vms.reset_calls()
+    smb.fetch_monitor_query()
+    counts = vms.counts()
+    assert counts.get("GET /api/monitors/{id}/query/") == 1
+    assert smb.LAST_ROWS.get("data")
+
+    smb.cleanup()
+    assert vms.live_monitors() == {}
+    smb._CLEANED_UP = False
+
+
+def test_smb_falls_back_to_split_monitors(vms, monkeypatch, reset_smb_globals):
+    """Clusters that 400 on SmbMetrics props in a monitor: the merged create
+    fails, the split headline succeeds, and the command probe disables
+    per-opcode rows gracefully."""
+    import smb
+
+    vms.state.reject_prop_prefixes = ("SmbMetrics,",)
+    monkeypatch.setenv("VAST_TOKEN", "test-token")
+    smb.init_config(_engine_args(vms, clients=None))
+    smb.CLUSTER_ID, smb.CLUSTER_NAME = smb.get_current_cluster()
+    smb.create_headline_monitors()
+    assert smb.HEADLINE_MONITOR_ID is not None
+    assert smb.SMB_COMMAND_MONITOR_ID is None
+    assert smb.SMB_PER_COMMAND_EXPORTED is False
+
+    vms.reset_calls()
+    smb.fetch_monitor_query()
+    assert vms.counts().get("GET /api/monitors/{id}/query/") == 1
+    smb.cleanup()
+    assert vms.live_monitors() == {}
+    smb._CLEANED_UP = False
+
+
+def test_smb_probe_disabled_when_smbmetrics_not_exported(vms, monkeypatch, reset_smb_globals):
+    import smb
+
+    vms.state.unsupported_prop_prefixes = ("SmbMetrics,",)
+    monkeypatch.setenv("VAST_TOKEN", "test-token")
+    smb.init_config(_engine_args(vms, clients=None))
+    smb.CLUSTER_ID, smb.CLUSTER_NAME = smb.get_current_cluster()
+    smb.create_headline_monitors()
+    assert smb.HEADLINE_MONITOR_ID is not None
+    assert smb.SMB_COMMAND_MONITOR_ID is None
+    assert smb.SMB_PER_COMMAND_EXPORTED is False
+    smb.cleanup()
+    smb._CLEANED_UP = False
+
+
+def test_s3_merged_monitor_single_query_per_refresh(vms, monkeypatch, reset_s3_globals):
+    import s3
+
+    monkeypatch.setenv("VAST_TOKEN", "test-token")
+    s3.init_config(_engine_args(vms, buckets=None, tenants=None))
+    s3.CLUSTER_ID, s3.CLUSTER_NAME = s3.get_current_cluster()
+    s3.create_headline_monitors()
+    assert s3.HEADLINE_MONITOR_ID is not None
+    assert s3.S3_METRICS_MONITOR_ID == s3.HEADLINE_MONITOR_ID
+    assert s3.S3_METRICS_EXPORTED is True
+    assert s3.METRICS_SOURCE == "S3Common"
+
+    vms.reset_calls()
+    s3.fetch_monitor_query()
+    counts = vms.counts()
+    assert counts.get("GET /api/monitors/{id}/query/") == 1
+    assert s3.LAST_ROWS.get("data")
+
+    s3.cleanup()
+    assert vms.live_monitors() == {}
+    s3._CLEANED_UP = False
+
+
+def test_s3_falls_back_when_s3metrics_not_exported(vms, monkeypatch, reset_s3_globals):
+    import s3
+
+    vms.state.unsupported_prop_prefixes = ("S3Metrics,",)
+    monkeypatch.setenv("VAST_TOKEN", "test-token")
+    s3.init_config(_engine_args(vms, buckets=None, tenants=None))
+    s3.CLUSTER_ID, s3.CLUSTER_NAME = s3.get_current_cluster()
+    s3.create_headline_monitors()
+    assert s3.HEADLINE_MONITOR_ID is not None
+    assert s3.S3_METRICS_MONITOR_ID is None
+    assert s3.S3_METRICS_EXPORTED is False
+    s3.cleanup()
+    s3._CLEANED_UP = False
+
+
+# ---------------------------------------------------------------------------
 # Main-loop wait helper
 # ---------------------------------------------------------------------------
 def test_wait_for_input_sleeps_off_tty(monkeypatch):
