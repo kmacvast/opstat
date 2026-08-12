@@ -72,7 +72,10 @@ A combined footer shows cluster totals and keyboard shortcut hints.
 
 ## Telemetry Processing
 
-NFS v3 uses **two cluster monitors** per session (RPC + bandwidth). The module
+NFS v3 uses **one merged cluster monitor** per session carrying both the RPC
+(`NfsMetrics`) and bandwidth (`ProtoMetrics`) properties, validated with a probe
+query at startup; clusters that reject the mixed prop list automatically fall
+back to the historical **two split monitors** (RPC + bandwidth). The module
 normalizes VMS monitor payloads into true real-time telemetry:
 
 ### Cluster dashboard (primary path)
@@ -234,7 +237,7 @@ opstat  (--nfs --version=3.0)
     ▼
 nfs_v3.run()
     ├── get_current_cluster()
-    ├── create_monitor("rpc") + create_monitor("bw")
+    ├── create_headline_monitors()   (merged rpc+bw; split fallback)
     │
     └── loop every REFRESH_SECONDS
             ├── fetch_monitor_query()

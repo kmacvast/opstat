@@ -123,16 +123,23 @@ Monitor: `META` (`build_meta_monitor_props()`).
 ```
 opstat --nfs --version=4.1
         └── nfs_v41.run()
-                ├── DATA monitor        NFS4Common rd/wr IOPS, bw, latency
-                ├── SUPPLEMENT monitor  NfsMetrics proxy rows (GETATTR…REMOVE)
-                ├── STATE monitor       native OPEN/CLOSE/LOCK/UNLOCK/session (if exported)
-                ├── BW monitor          NFSCommon throughput fallback
-                ├── META monitor        md_iops session workload profile
+                ├── HEADLINE monitor    merged DATA + SUPPLEMENT + BW + META (+ STATE)
+                │       (split fallback: one monitor per group on clusters
+                │        that reject the merged prop list)
+                │         ├── DATA        NFS4Common rd/wr IOPS, bw, latency
+                │         ├── SUPPLEMENT  NfsMetrics proxy rows (GETATTR…REMOVE)
+                │         ├── STATE       native OPEN/CLOSE/LOCK/UNLOCK/session (if exported)
+                │         ├── BW          NFSCommon throughput fallback
+                │         └── META        md_iops session workload profile
                 └── drill monitors      per cnode / view / tenant (optional)
 ```
 
-Each monitor is a separate `POST /api/monitors/` because VMS restricts mixed metric
-categories. Query results are merged client-side before rendering.
+The five prop groups are created as **one merged monitor** (a single
+`POST /api/monitors/` and a single query per refresh) — the same mixed-family
+prop list the drill-down monitors have always used. The merged monitor is
+validated with a probe query at startup; if the cluster rejects it or omits a
+prop family, the engine falls back to one monitor per group and merges query
+results client-side, exactly as before.
 
 Drill-down endpoints are path-relative to `BASE_URL` (`/cnodes/`, `/views/`,
 `/tenants/`) - never `/api/api/...`.
