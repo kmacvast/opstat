@@ -9,15 +9,16 @@ each protocol engine: VMS monitor teardown tracking, signal/atexit wiring
 import atexit
 import base64
 import getpass
+import http.client
 import json
 import os
 import re
 import select
 import signal
 import sys
+import threading
 import time
-import urllib.error
-import urllib.request
+import urllib.parse
 
 try:
     import termios
@@ -32,47 +33,103 @@ import vast_api_log
 # ---------------------------------------------------------------------------
 # REST transport
 # ---------------------------------------------------------------------------
+# A single persistent HTTPS connection with keep-alive. The previous
+# urllib-based transport opened (and TLS-handshook) a brand-new TCP connection
+# for every API call, which dominated per-call latency and multiplied load on
+# the VMS. Engines are single-threaded, but the connection is guarded by a
+# lock so future background pollers cannot interleave requests.
 _BASE_URL = None
+_HOST = None
+_PORT = None
+_BASE_PATH = ""
 _HEADERS = None
 _SSL_CTX = None
 _TIMEOUT = 60
+_CONN = None
+_CONN_LOCK = threading.Lock()
 
 
 def configure_connection(base_url, headers, ssl_ctx, timeout=60):
     """Store the VMS connection context used by :func:`request`."""
-    global _BASE_URL, _HEADERS, _SSL_CTX, _TIMEOUT
+    global _BASE_URL, _HOST, _PORT, _BASE_PATH, _HEADERS, _SSL_CTX, _TIMEOUT
     _BASE_URL = base_url
+    parsed = urllib.parse.urlsplit(base_url)
+    _HOST = parsed.hostname
+    _PORT = parsed.port or 443
+    _BASE_PATH = parsed.path.rstrip("/")
     _HEADERS = headers
     _SSL_CTX = ssl_ctx
     _TIMEOUT = timeout
+    close_connection()
+
+
+def _get_connection():
+    """Return the persistent HTTPS connection, creating it on first use."""
+    global _CONN
+    if _CONN is None:
+        _CONN = http.client.HTTPSConnection(
+            _HOST, _PORT, timeout=_TIMEOUT, context=_SSL_CTX,
+        )
+    return _CONN
+
+
+def close_connection():
+    """Drop the persistent connection (reconnects lazily on next request)."""
+    global _CONN
+    if _CONN is not None:
+        try:
+            _CONN.close()
+        except Exception:
+            pass
+        _CONN = None
+
+
+def _send_once(method, path, data):
+    """One request/response on the persistent connection. Returns (status, body)."""
+    conn = _get_connection()
+    conn.request(method, f"{_BASE_PATH}{path}", body=data, headers=_HEADERS)
+    resp = conn.getresponse()
+    body = resp.read().decode(errors="replace")
+    return resp.status, body
 
 
 def request(method, path, payload=None):
     """Issue an authenticated VMS REST request; log every call via vast_api_log.
 
-    Raises RuntimeError on any HTTP or transport error (never leaks the raw
-    urllib exception type to callers).
+    Reuses one keep-alive connection across calls; a request that fails on a
+    previously-used connection (e.g. the server idled it out between refresh
+    ticks) is retried once on a fresh connection. Raises RuntimeError on any
+    HTTP or transport error (never leaks the raw http.client exception type).
     """
     url = f"{_BASE_URL}{path}"
     data = json.dumps(payload).encode() if payload is not None else None
-    req = urllib.request.Request(url, data=data, headers=_HEADERS, method=method)
     started = time.monotonic()
-    try:
-        with urllib.request.urlopen(req, context=_SSL_CTX, timeout=_TIMEOUT) as resp:
-            body = resp.read().decode()
+    with _CONN_LOCK:
+        try:
+            reused = _CONN is not None
+            try:
+                status, body = _send_once(method, path, data)
+            except (http.client.HTTPException, ConnectionError, BrokenPipeError, OSError):
+                # Stale keep-alive socket: retry exactly once on a new
+                # connection, but only if the failed attempt was on a reused
+                # one (a fresh-connection failure is a real outage).
+                if not reused:
+                    raise
+                close_connection()
+                status, body = _send_once(method, path, data)
+        except Exception as e:
+            close_connection()
             elapsed_ms = (time.monotonic() - started) * 1000
-            vast_api_log.log_call(method, url, payload, resp.status, body, None, elapsed_ms)
-            return json.loads(body) if body else None
-    except urllib.error.HTTPError as e:
-        body = e.read().decode(errors="replace")
-        elapsed_ms = (time.monotonic() - started) * 1000
-        err = f"HTTP {e.code}: {body}"
-        vast_api_log.log_call(method, url, payload, e.code, body, err, elapsed_ms)
-        raise RuntimeError(f"{method} {url} failed: {err}") from e
-    except Exception as e:
-        elapsed_ms = (time.monotonic() - started) * 1000
-        vast_api_log.log_call(method, url, payload, None, None, e, elapsed_ms)
-        raise RuntimeError(f"{method} {url} failed: {e}") from e
+            vast_api_log.log_call(method, url, payload, None, None, e, elapsed_ms)
+            raise RuntimeError(f"{method} {url} failed: {e}") from e
+
+    elapsed_ms = (time.monotonic() - started) * 1000
+    if status >= 400:
+        err = f"HTTP {status}: {body}"
+        vast_api_log.log_call(method, url, payload, status, body, err, elapsed_ms)
+        raise RuntimeError(f"{method} {url} failed: {err}")
+    vast_api_log.log_call(method, url, payload, status, body, None, elapsed_ms)
+    return json.loads(body) if body else None
 
 
 # ---------------------------------------------------------------------------
@@ -138,17 +195,24 @@ def normalize_list_response(data):
     return []
 
 
+# Cached local-cluster record from the most recent get_current_cluster()
+# call, so the follow-up OS-version lookup does not repeat GET /clusters/.
+_LAST_CLUSTER_RECORD = None
+
+
 def get_current_cluster(request_fn):
     """Return (cluster_id, cluster_name) for the active/local cluster.
 
     Read-only. ``request_fn`` is the engine's ``api_request`` so unit tests that
     patch it continue to intercept the call.
     """
+    global _LAST_CLUSTER_RECORD
     data = request_fn("GET", "/clusters/")
     clusters = normalize_list_response(data)
     if not clusters:
         raise RuntimeError(f"No clusters returned from /clusters/: {data}")
     cluster = select_local_cluster(clusters)
+    _LAST_CLUSTER_RECORD = cluster
     cluster_id = cluster.get("id")
     cluster_name = (
         cluster.get("name") or cluster.get("cluster_name")
@@ -180,9 +244,14 @@ def os_release_from_cluster(cluster):
 def get_current_cluster_os(request_fn):
     """Best-effort local-cluster VAST OS version string, or None.
 
-    Read-only and defensive: the OS label is a cosmetic header adornment, so any
-    failure (network, missing field) degrades to None rather than raising.
+    Reuses the cluster record cached by the immediately-preceding
+    :func:`get_current_cluster` call (every engine calls them back to back),
+    so the second GET /clusters/ round trip is skipped. Read-only and
+    defensive: the OS label is a cosmetic header adornment, so any failure
+    (network, missing field) degrades to None rather than raising.
     """
+    if _LAST_CLUSTER_RECORD is not None:
+        return os_release_from_cluster(_LAST_CLUSTER_RECORD)
     try:
         data = request_fn("GET", "/clusters/")
         cluster = select_local_cluster(normalize_list_response(data))
@@ -287,10 +356,12 @@ def failed_deletes():
 
 def reset_registry():
     """Clear registry + failure log (used between sessions and in tests)."""
-    global _POLL_FAILURES
+    global _POLL_FAILURES, _LAST_CLUSTER_RECORD
     _CREATED_MONITORS.clear()
     _FAILED_DELETES.clear()
     _POLL_FAILURES = 0
+    _LAST_CLUSTER_RECORD = None
+    close_connection()
 
 
 # ---------------------------------------------------------------------------
@@ -482,6 +553,29 @@ def check_keypress():
     if not chunks:
         return ""
     return strip_escape_sequences(b"".join(chunks).decode(errors="ignore"))
+
+
+def wait_for_input(timeout):
+    """Block until stdin has data or *timeout* seconds elapse; True on input.
+
+    Replaces the engines' previous ``time.sleep(0.05)`` spin loop: keys wake
+    the loop instantly instead of after up to 50 ms, and an idle dashboard
+    makes zero wakeups between refresh ticks instead of twenty per second.
+    Falls back to a plain sleep when keyboard polling is inactive (piped
+    stdin, non-POSIX). Signal handlers still run during the wait: SIGINT and
+    SIGTERM raise out of ``select`` via the engines' handlers.
+    """
+    if timeout <= 0:
+        return False
+    if not _TERM_ENABLED:
+        time.sleep(timeout)
+        return False
+    try:
+        readable, _w, _e = select.select([sys.stdin.fileno()], [], [], timeout)
+        return bool(readable)
+    except Exception:
+        time.sleep(min(timeout, 0.05))
+        return False
 
 
 def clear_screen():
