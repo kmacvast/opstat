@@ -2358,11 +2358,12 @@ def main():
             render_screen()
             continue
 
-        if time.time() >= next_refresh:
+        now = time.time()
+        if now >= next_refresh:
             vast_common.guarded_poll(poll_tick, render_screen)
             next_refresh = time.time() + REFRESH_SECONDS
             continue
-        time.sleep(0.05)
+        vast_common.wait_for_input(next_refresh - now)
     return 0
 
 

@@ -788,7 +788,11 @@ def _cleanup_drill_monitors():
 
 
 def enter_drill_mode(mode):
-    global DRILL_MODE, DRILL_OBJECTS, DRILL_ERROR, LAST_DRILL_ROWS
+    # DRILL_MONITORS must be declared global here: without it the assignment
+    # below created a function-local list, so the module-level registry stayed
+    # empty, fetch_drill_query never queried anything, and the drill panel sat
+    # on "Waiting for data…" forever while the created monitors leaked.
+    global DRILL_MODE, DRILL_OBJECTS, DRILL_MONITORS, DRILL_ERROR, LAST_DRILL_ROWS
 
     cfg = _DRILL_CFG.get(mode)
     if not cfg:
@@ -909,13 +913,17 @@ def _render_drill_panel(width):
 def fetch_monitor_query():
     global LAST_ROWS, LAST_SAMPLE
     data_result = api_request("GET", f"/monitors/{DATA_MONITOR_ID}/query/")
-    supplement_result = api_request("GET", f"/monitors/{SUPPLEMENT_MONITOR_ID}/query/")
-    bw_result = api_request("GET", f"/monitors/{BW_MONITOR_ID}/query/")
-    meta_result = api_request("GET", f"/monitors/{META_MONITOR_ID}/query/")
-    state_result = (
-        api_request("GET", f"/monitors/{STATE_MONITOR_ID}/query/")
-        if STATE_MONITOR_ID else None
-    )
+
+    def _result_for(monitor_id):
+        """Reuse the merged-headline query when the ids collapse to one monitor."""
+        if monitor_id == DATA_MONITOR_ID:
+            return data_result
+        return api_request("GET", f"/monitors/{monitor_id}/query/")
+
+    supplement_result = _result_for(SUPPLEMENT_MONITOR_ID)
+    bw_result = _result_for(BW_MONITOR_ID)
+    meta_result = _result_for(META_MONITOR_ID)
+    state_result = _result_for(STATE_MONITOR_ID) if STATE_MONITOR_ID else None
     LAST_ROWS, LAST_SAMPLE = build_rows_from_results(
         data_result, supplement_result, bw_result, meta_result, state_result,
     )
@@ -1098,7 +1106,7 @@ def signal_handler(_signum, _frame):
     sys.exit(0)
 
 
-def _init_state_monitor():
+def _init_state_monitor(candidates=None):
     """Create the state/locking/session monitor from whatever the cluster exports.
 
     Uses the metric catalog to trim candidates, then verifies by creating the
@@ -1106,7 +1114,8 @@ def _init_state_monitor():
     proxy panel is shown instead - never breaking the dashboard.
     """
     global STATE_MONITOR_ID, STATE_OPS_AVAILABLE
-    candidates = probe_available_state_ops()
+    if candidates is None:
+        candidates = probe_available_state_ops()
     if candidates is None:            # catalog unreadable - try the full set
         candidates = STATE_PANEL_OPS
     if not candidates:
@@ -1118,6 +1127,70 @@ def _init_state_monitor():
     except RuntimeError:
         STATE_MONITOR_ID = None
         STATE_OPS_AVAILABLE = []
+
+
+def create_headline_monitors():
+    """Create the headline monitors, merged into a single monitor when possible.
+
+    The five headline prop groups (data, supplement, bw, meta, state) are all
+    cluster-scope monitors; this engine's own drill-down already carries the
+    first four groups in one monitor per object, so a merged headline monitor
+    uses a VMS capability the engine relies on today. Merging drops the
+    per-refresh query count from 5 to 1. The merged monitor is validated with
+    one probe query; on create failure or missing prop families the engine
+    falls back to the historical five split monitors.
+    """
+    global DATA_MONITOR_ID, SUPPLEMENT_MONITOR_ID, BW_MONITOR_ID, META_MONITOR_ID
+    global STATE_MONITOR_ID, STATE_OPS_AVAILABLE
+
+    data_props = build_data_monitor_props()
+    supplement_props = build_supplement_monitor_props()
+    bw_props = build_bw_monitor_props()
+    meta_props = build_meta_monitor_props()
+    core_groups = (data_props, supplement_props, bw_props, meta_props)
+
+    state_candidates = probe_available_state_ops()
+    trial_candidates = STATE_PANEL_OPS if state_candidates is None else state_candidates
+    state_props = (
+        build_state_monitor_props(trial_candidates) if trial_candidates else []
+    )
+
+    # Try merged including state props, then merged without them (state
+    # metrics are the most build-dependent), then the classic split layout.
+    for attempt_state_props, attempt_candidates in (
+        (state_props, trial_candidates),
+        ([], []),
+    ):
+        merged_props = [p for group in core_groups for p in group] + attempt_state_props
+        merged_id = None
+        try:
+            merged_id = create_monitor("headline", merged_props)
+            result = api_request("GET", f"/monitors/{merged_id}/query/")
+            returned = (
+                set(result.get("prop_list", []) or [])
+                if isinstance(result, dict) else set()
+            )
+            if all(any(p in returned for p in group) for group in core_groups):
+                DATA_MONITOR_ID = SUPPLEMENT_MONITOR_ID = merged_id
+                BW_MONITOR_ID = META_MONITOR_ID = merged_id
+                if attempt_state_props and any(p in returned for p in attempt_state_props):
+                    STATE_MONITOR_ID = merged_id
+                    STATE_OPS_AVAILABLE = attempt_candidates
+                else:
+                    STATE_MONITOR_ID = None
+                    STATE_OPS_AVAILABLE = []
+                return
+            delete_monitor(merged_id)
+        except RuntimeError:
+            delete_monitor(merged_id)
+        if not attempt_state_props:
+            break
+
+    DATA_MONITOR_ID = create_monitor("data", data_props)
+    SUPPLEMENT_MONITOR_ID = create_monitor("supplement", supplement_props)
+    BW_MONITOR_ID = create_monitor("bw", bw_props)
+    META_MONITOR_ID = create_monitor("meta", meta_props)
+    _init_state_monitor(candidates=state_candidates)
 
 
 def main():
@@ -1134,11 +1207,7 @@ def main():
     setup_keyboard()
     CLUSTER_ID, CLUSTER_NAME = get_current_cluster()
     _capture_cluster_os()
-    DATA_MONITOR_ID = create_monitor("data", build_data_monitor_props())
-    SUPPLEMENT_MONITOR_ID = create_monitor("supplement", build_supplement_monitor_props())
-    BW_MONITOR_ID = create_monitor("bw", build_bw_monitor_props())
-    META_MONITOR_ID = create_monitor("meta", build_meta_monitor_props())
-    _init_state_monitor()
+    create_headline_monitors()
 
     fetch_monitor_query()
     render_screen()
@@ -1179,11 +1248,12 @@ def main():
             render_screen()
             continue
 
-        if time.time() >= next_refresh:
+        now = time.time()
+        if now >= next_refresh:
             vast_common.guarded_poll(poll_tick, render_screen)
             next_refresh = time.time() + REFRESH_SECONDS
             continue
-        time.sleep(0.05)
+        vast_common.wait_for_input(next_refresh - now)
     return 0
 
 

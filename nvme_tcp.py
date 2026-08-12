@@ -1848,7 +1848,7 @@ def main():
             vast_common.guarded_poll(poll_tick, render_screen)
             next_refresh_time = time.time() + REFRESH_SECONDS
             continue
-        time.sleep(0.05)
+        vast_common.wait_for_input(next_refresh_time - now)
     return 0
 
 

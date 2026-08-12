@@ -214,6 +214,23 @@ RUN_STARTED_AT = None
 RUN_STATS = {}
 
 
+# Dedupe window for run-stat accumulation. Only recently-returned samples can
+# reappear across polls (the newest VMS sample repeats until a new one lands),
+# so a small bounded window dedupes correctly without growing forever the way
+# the previous unbounded sets did on long-running dashboards.
+_MAX_SEEN_SAMPLE_IDS = 512
+
+
+def _remember_sample(seen, sample_id):
+    """Insertion-ordered bounded membership: True when *sample_id* is new."""
+    if sample_id in seen:
+        return False
+    seen[sample_id] = None
+    if len(seen) > _MAX_SEEN_SAMPLE_IDS:
+        seen.pop(next(iter(seen)))
+    return True
+
+
 def _fresh_run_stats():
     return {
         label: {
@@ -221,10 +238,10 @@ def _fresh_run_stats():
             "max_us":           None,
             "weighted_sum_us":  0.0,
             "weight":           0.0,
-            "seen_sample_ids":  set(),
+            "seen_sample_ids":  {},
             "bw_min_gbs":       None,
             "bw_max_gbs":       None,
-            "bw_seen_sample_ids": set(),
+            "bw_seen_sample_ids": {},
         }
         for _op, label in OPS
     }
@@ -567,6 +584,36 @@ def create_monitor(name_suffix, prop_list):
 
 def delete_monitor(monitor_id):
     vast_common.delete_monitor(api_request, monitor_id)
+
+
+def create_headline_monitors():
+    """Create the RPC + BW headline monitors, merged into one when possible.
+
+    A single cluster monitor can carry NfsMetrics and ProtoMetrics props
+    together (the SMB engine's production headline monitor mixes exactly these
+    families), which halves the per-refresh query count. The merged monitor is
+    validated with one probe query; if the create fails or either family is
+    missing from the returned prop_list, fall back to the historical split
+    monitors so behavior on older/stricter VMS builds is unchanged.
+    """
+    global RPC_MONITOR_ID, BW_MONITOR_ID
+    rpc_props = build_rpc_prop_list()
+    bw_props = build_bw_prop_list()
+    merged_id = None
+    try:
+        merged_id = create_monitor("rpcbw", rpc_props + bw_props)
+        result = api_request("GET", f"/monitors/{merged_id}/query/")
+        returned = set(result.get("prop_list", []) or []) if isinstance(result, dict) else set()
+        if (any(p in returned for p in rpc_props)
+                and any(p in returned for p in bw_props)):
+            RPC_MONITOR_ID = merged_id
+            BW_MONITOR_ID = merged_id
+            return
+        delete_monitor(merged_id)
+    except RuntimeError:
+        delete_monitor(merged_id)
+    RPC_MONITOR_ID = create_monitor("rpc", rpc_props)
+    BW_MONITOR_ID = create_monitor("bw", bw_props)
 
 
 # ---------------------------------------------------------------------------
@@ -918,16 +965,14 @@ def update_run_stats(rows):
         stat    = RUN_STATS[label]
         if avg_us is not None and ops_sec is not None and ops_sec > 0:
             sample_id = f"lat:{sample}:{avg_us}:{ops_sec}"
-            if sample_id not in stat["seen_sample_ids"]:
-                stat["seen_sample_ids"].add(sample_id)
+            if _remember_sample(stat["seen_sample_ids"], sample_id):
                 _update_bound(stat, "min_us", "max_us", avg_us)
                 stat["weighted_sum_us"] += avg_us * ops_sec
                 stat["weight"]          += ops_sec
         bw_gbs = as_float(r.get("bw_gbs"))
         if label in IO_LABELS and bw_gbs is not None:
             sample_id = f"bw:{sample}:{bw_gbs}"
-            if sample_id not in stat["bw_seen_sample_ids"]:
-                stat["bw_seen_sample_ids"].add(sample_id)
+            if _remember_sample(stat["bw_seen_sample_ids"], sample_id):
                 _update_bound(stat, "bw_min_gbs", "bw_max_gbs", bw_gbs)
 
 
@@ -1089,7 +1134,11 @@ def fetch_monitor_query():
     PREV_ROWS = LAST_ROWS  # snapshot before updating
 
     rpc_result = api_request("GET", f"/monitors/{RPC_MONITOR_ID}/query/")
-    bw_result  = api_request("GET", f"/monitors/{BW_MONITOR_ID}/query/")
+    # Merged headline monitor: one query carries both RPC and BW props.
+    bw_result = (
+        rpc_result if BW_MONITOR_ID == RPC_MONITOR_ID
+        else api_request("GET", f"/monitors/{BW_MONITOR_ID}/query/")
+    )
 
     rows, sample = build_rows_from_results(rpc_result, bw_result)
     update_run_stats(rows)
@@ -2107,8 +2156,7 @@ def main():
     CLUSTER_ID, CLUSTER_NAME = get_current_cluster()
     _capture_cluster_os()
 
-    RPC_MONITOR_ID = create_monitor("rpc", build_rpc_prop_list())
-    BW_MONITOR_ID  = create_monitor("bw",  build_bw_prop_list())
+    create_headline_monitors()
 
     fetch_monitor_query()
     render_screen()
@@ -2159,7 +2207,7 @@ def main():
             next_refresh_time = time.time() + REFRESH_SECONDS
             continue
 
-        time.sleep(0.05)
+        vast_common.wait_for_input(next_refresh_time - now)
 
     return 0
 
