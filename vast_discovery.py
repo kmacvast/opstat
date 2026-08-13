@@ -19,6 +19,7 @@ monitors for queryability tests create and delete them themselves.
 
 import json
 import re
+import time
 
 # Candidate locations for the cluster's OpenAPI definition. VAST builds have
 # moved this around, and the Swagger UI itself lives outside /api.
@@ -334,3 +335,106 @@ def candidate_block(*, api_path, source, scope, provides, read_only,
         f"  Caveats:             {caveats}",
         "",
     ]
+
+
+# ---------------------------------------------------------------------------
+# Timed scraping and counter-delta interrogation
+# ---------------------------------------------------------------------------
+def scrape_timed(request_text_fn, path):
+    """GET an exporter path; return (body, elapsed_seconds, byte_count)."""
+    started = time.monotonic()
+    try:
+        body = request_text_fn("GET", path)
+    except RuntimeError as exc:
+        return None, time.monotonic() - started, 0, str(exc)[:90]
+    return body, time.monotonic() - started, len(body or ""), ""
+
+
+def sample_values(text, prefix=""):
+    """Return {(metric, frozenset(label items)): float} for one scrape.
+
+    Keyed by metric *and* labels so per-cNode series stay distinct.
+    """
+    out = {}
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = _PROM_SAMPLE.match(line)
+        if not m:
+            continue
+        name = m.group(1)
+        if prefix and not name.startswith(prefix):
+            continue
+        try:
+            value = float(m.group(4))
+        except (TypeError, ValueError):
+            continue
+        labels = frozenset(_PROM_LABEL.findall(m.group(3) or ""))
+        out[(name, labels)] = value
+    return out
+
+
+def counter_deltas(first, second, elapsed):
+    """Compare two scrapes; return per-series delta and derived rate.
+
+    Establishes empirically whether an exporter gauge behaves as a cumulative
+    counter (delta >= 0 and generally growing) or as an instantaneous value.
+    """
+    rows = []
+    for key, later in second.items():
+        if key not in first:
+            continue
+        earlier = first[key]
+        delta = later - earlier
+        rows.append({
+            "metric": key[0],
+            "labels": dict(key[1]),
+            "first": earlier,
+            "second": later,
+            "delta": delta,
+            "per_sec": (delta / elapsed) if elapsed > 0 else None,
+        })
+    return rows
+
+
+def summarize_counter_behavior(rows):
+    """Classify a set of delta rows: cumulative, static, or resetting."""
+    if not rows:
+        return "no comparable series"
+    deltas = [r["delta"] for r in rows]
+    grew = sum(1 for d in deltas if d > 0)
+    shrank = sum(1 for d in deltas if d < 0)
+    if shrank:
+        return f"non-monotonic ({shrank} of {len(deltas)} series decreased)"
+    if grew:
+        return f"cumulative ({grew} of {len(deltas)} series grew)"
+    return "static over this interval (no activity, or not a counter)"
+
+
+def derive_latency(count_delta, sum_delta):
+    """Mean latency per operation from paired count/sum deltas, or None."""
+    if not count_delta or count_delta <= 0 or sum_delta is None:
+        return None
+    return sum_delta / count_delta
+
+
+def infer_time_unit(derived, reference_us):
+    """Guess the unit of *derived* by comparing it to a known-microsecond value.
+
+    Returns (unit_guess, ratio) or (None, None) when no comparison is
+    possible. The guess is reported as evidence, never used to scale a
+    displayed number without confirmation.
+    """
+    if not derived or not reference_us or reference_us <= 0:
+        return None, None
+    ratio = derived / reference_us
+    for unit, low, high in (
+        ("nanoseconds", 500.0, 2000.0),
+        ("microseconds", 0.2, 5.0),
+        ("milliseconds", 0.0002, 0.005),
+        ("seconds", 2e-7, 5e-6),
+    ):
+        if low <= ratio <= high:
+            return unit, ratio
+    return "indeterminate", ratio

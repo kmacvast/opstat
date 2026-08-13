@@ -210,6 +210,10 @@ vast_cluster_nfs_iops{cluster="mock-cluster",protocol="NFS3"} 88.0
 # TYPE vast_cluster_nfs_client_count gauge
 vast_cluster_nfs_client_count{cluster="mock-cluster"} 17
 """,
+    "/api/prometheusmetrics/all": """# HELP vast_collector_errors_total Multiprocess metric
+# TYPE vast_collector_errors_total counter
+vast_collector_errors_total 0
+""",
     "/api/prometheusmetrics/views": """# HELP vast_view_logical_capacity View Logical Capacity
 # TYPE vast_view_logical_capacity gauge
 vast_view_logical_capacity{cluster="mock-cluster",name="v317",path="/view/317",protocols="['NFS4', 'SMB']",tenant_name="tenant-4"} 1024
@@ -234,6 +238,51 @@ vast_user_view_iops{cluster="mock-cluster",path="/view/317",protocol="NFS4",tena
 vast_vip_view_iops{cluster="mock-cluster",path="/view/317",protocol="NFS4",tenant="tenant-4",vip="10.1.0.1",vippool="nfs-pool"} 41.0
 """,
 }
+
+
+# NFSv4 operations VAST OS 5.5.0.1 exposes through the Prometheus exporter's
+# Nfs4Metrics family (cluster and cNode scope). Latency sums are microseconds.
+NFS4_EXPORTER_OPS = (
+    "access", "close", "commit", "create", "create_session",
+    "destroy_clientid", "destroy_session", "exchange_id", "free_stateid",
+    "getattr", "getfh", "lookup", "lookupp", "open", "putfh", "putpubfh",
+    "putrootfh", "read", "readdir", "reclaim_complete", "remove",
+    "restorefh", "savefh", "secinfo", "secinfo_no_name", "sequence",
+    "setattr", "test_stateid", "write",
+)
+_NFS4_CNODES = ((1, "cnode-01"), (2, "cnode-02"), (3, "cnode-03"))
+
+
+def _nfs4_exposition(elapsed):
+    """Cumulative count/sum gauges that grow with elapsed time.
+
+    Mirrors the real exporter: gauges by TYPE, but monotonically increasing,
+    so a client must difference two scrapes to obtain a rate.
+    """
+    out = []
+    for idx, op in enumerate(NFS4_EXPORTER_OPS):
+        rate = 5.0 + idx * 1.5              # operations per second
+        latency_us = 200.0 + idx * 37.0     # mean microseconds per operation
+        count = 1_000_000 + rate * elapsed
+        total = count * latency_us
+        base = f"vast_cluster_metrics_Nfs4Metrics_nfs4_{op}_req_latency"
+        out.append(f"# TYPE {base}_count gauge")
+        out.append(f'{base}_count{{cluster="mock-cluster"}} {count:.0f}')
+        out.append(f"# TYPE {base}_sum gauge")
+        out.append(f'{base}_sum{{cluster="mock-cluster"}} {total:.0f}')
+        for cnode_id, hostname in _NFS4_CNODES:
+            cbase = f"vast_cnode_metrics_Nfs4Metrics_nfs4_{op}_req_latency"
+            ccount = count / len(_NFS4_CNODES)
+            out.append(
+                f'{cbase}_count{{cluster="mock-cluster",cnode_id="{cnode_id}",'
+                f'hostname="{hostname}"}} {ccount:.0f}')
+            out.append(
+                f'{cbase}_sum{{cluster="mock-cluster",cnode_id="{cnode_id}",'
+                f'hostname="{hostname}"}} {ccount * latency_us:.0f}')
+    out.append("# HELP vast_cluster_metrics_Nfs4Metrics_nfs4_open_connections_cnt Open NFSv4 connections")
+    out.append("# TYPE vast_cluster_metrics_Nfs4Metrics_nfs4_open_connections_cnt gauge")
+    out.append('vast_cluster_metrics_Nfs4Metrics_nfs4_open_connections_cnt{cluster="mock-cluster"} 42')
+    return "\n".join(out) + "\n"
 
 
 class _State:
@@ -271,6 +320,11 @@ class _State:
         # Alternative observability surfaces.
         self.openapi_enabled = True
         self.prometheus = dict(PROMETHEUS_BODIES)
+        # Nfs4Metrics rides the broad exporter endpoints, as on a real cluster.
+        self.nfs4_exporter = True
+        self.nfs4_exporter_paths = {"/api/prometheusmetrics/",
+                                    "/api/prometheusmetrics/all"}
+        self.delegations_enabled = True
         self.latency_s = 0.0
         self.t0 = time.time()
 
@@ -391,10 +445,24 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._error(404, "no openapi here")
             return self._send(OPENAPI_SPEC)
 
+        m = re.match(r"^/api/tenants/(\d+)/nfs4_delegs/$", path)
+        if m:
+            if not self.state.delegations_enabled:
+                return self._error(404, "delegation endpoint absent")
+            tid = int(m.group(1))
+            return self._send({"results": [
+                {"client_ip": f"10.9.0.{i}", "path": f"/view/{300 + i}",
+                 "stateid": f"0x{tid:04x}{i:04x}", "deleg_type": "READ",
+                 "tenant_id": tid, "created_at": "2026-08-13T14:00:00Z"}
+                for i in range(2 if tid % 2 == 0 else 0)
+            ]})
+
         if path.startswith("/api/prometheusmetrics"):
             body = self.state.prometheus.get(path)
             if body is None:
                 return self._error(404, "no exporter at this scope")
+            if self.state.nfs4_exporter and path in self.state.nfs4_exporter_paths:
+                body = body + _nfs4_exposition(time.time() - self.state.t0)
             raw = body.encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; version=0.0.4")

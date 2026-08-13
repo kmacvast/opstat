@@ -213,6 +213,17 @@ _MAX_DRILL_OBJECTS = 8
 _DRILL_PROBE_LIMIT = 32
 _DRILL_MIN_QUERY_INTERVAL = 15.0
 
+# Discovery-only: seconds between the two exporter scrapes used to establish
+# whether Nfs4Metrics count/sum behave as cumulative counters.
+_NFS4_PROBE_INTERVAL = float(os.environ.get("OPSTAT_NFS4_PROBE_INTERVAL", "10"))
+_DELEG_PROBE_TENANTS = 6
+# Representative operations spanning session, state, namespace and data paths.
+_NFS4_PROBE_OPS = (
+    "sequence", "exchange_id", "create_session", "destroy_session",
+    "reclaim_complete", "open", "close", "free_stateid", "test_stateid",
+    "read", "write", "commit", "getattr", "lookup",
+)
+
 # Shared ranking / batching / throttle machinery; built in init_config.
 DRILL = None
 
@@ -1888,7 +1899,158 @@ def discover_metrics():
         emit(f"  {block['api_path']}  ->  {block['queried']}")
     emit()
 
-    emit("[ 14. Summary ]")
+    # -- 15. Nfs4Metrics interrogation --------------------------------------
+    emit("[ 15. Nfs4Metrics (Prometheus) interrogation ]")
+    nfs4_paths = [p for p, metrics in responders
+                  if any("Nfs4Metrics" in n for n in metrics)]
+    if not nfs4_paths:
+        emit("  no exporter path carries Nfs4Metrics")
+    else:
+        # Prefer the narrowest endpoint that still carries the family: the
+        # dashboard must not scrape /all on a refresh interval.
+        sized = []
+        for path in nfs4_paths:
+            body, elapsed, size, err = vast_discovery.scrape_timed(
+                vast_common.request_text, path)
+            n4 = sum(1 for n in vast_discovery.parse_prometheus(body or "")
+                     if "Nfs4Metrics" in n)
+            sized.append((size, path, elapsed, n4, err))
+            emit(f"  {path:<40} {size:>8} bytes  {elapsed * 1000:>6.0f} ms"
+                 f"  {n4} Nfs4Metrics")
+        sized = [s for s in sized if s[0] > 0]
+        if sized:
+            best_size, best_path, _e, _n, _err = min(sized)
+            emit(f"  narrowest endpoint carrying Nfs4Metrics: {best_path}"
+                 f" ({best_size} bytes)")
+
+            # Two scrapes separated in time settle count/sum semantics.
+            first_body, _t1, _s1, _e1 = vast_discovery.scrape_timed(
+                vast_common.request_text, best_path)
+            t0 = time.monotonic()
+            time.sleep(_NFS4_PROBE_INTERVAL)
+            second_body, _t2, _s2, _e2 = vast_discovery.scrape_timed(
+                vast_common.request_text, best_path)
+            elapsed = time.monotonic() - t0
+            first = vast_discovery.sample_values(first_body)
+            second = vast_discovery.sample_values(second_body)
+            n4_first = {k: v for k, v in first.items() if "Nfs4Metrics" in k[0]}
+            n4_second = {k: v for k, v in second.items() if "Nfs4Metrics" in k[0]}
+            rows = vast_discovery.counter_deltas(n4_first, n4_second, elapsed)
+            emit(f"  two scrapes {elapsed:.1f}s apart, {len(rows)} comparable series")
+            emit(f"  behavior: {vast_discovery.summarize_counter_behavior(rows)}")
+
+            by_metric = {(r["metric"], frozenset(r["labels"].items())): r
+                         for r in rows}
+            emit("  per-operation (cluster scope):")
+            emit(f"    {'operation':<18}{'dcount':>10}{'ops/s':>10}"
+                 f"{'dsum':>14}{'derived lat':>13}")
+            derived_read = None
+            for op in _NFS4_PROBE_OPS:
+                base = f"vast_cluster_metrics_Nfs4Metrics_nfs4_{op}_req_latency"
+                cnt = next((r for k, r in by_metric.items()
+                            if k[0] == base + "_count"), None)
+                tot = next((r for k, r in by_metric.items()
+                            if k[0] == base + "_sum"), None)
+                if cnt is None:
+                    emit(f"    {op:<18}{'not present':>10}")
+                    continue
+                lat = vast_discovery.derive_latency(
+                    cnt["delta"], tot["delta"] if tot else None)
+                if op == "read":
+                    derived_read = lat
+                emit(f"    {op:<18}{cnt['delta']:>10.0f}{cnt['per_sec']:>10.2f}"
+                     f"{(tot['delta'] if tot else 0):>14.0f}"
+                     f"{(f'{lat:.1f}' if lat else '-'):>13}")
+                lines.append(f"        {base}: first={cnt['first']} "
+                             f"second={cnt['second']} delta={cnt['delta']}")
+
+            # Units: compare a derived latency against NFS4Common's
+            # read_latency__avg, which the existing dashboard already reads in
+            # microseconds.
+            reference = None
+            monitor_id = None
+            try:
+                monitor_id = create_monitor("unitref", build_data_monitor_props())
+                probe = api_request("GET", f"/monitors/{monitor_id}/query/")
+                values, _sample = _latest_row(probe, build_data_monitor_props())
+                reference = as_float(values.get(f"{_NFS4},read_latency__avg"))
+            except RuntimeError:
+                reference = None
+            finally:
+                if monitor_id is not None:
+                    delete_monitor(monitor_id)
+            unit, ratio = vast_discovery.infer_time_unit(derived_read, reference)
+            emit(f"  NFS4Common read_latency__avg (known microseconds): "
+                 f"{reference if reference is not None else 'unavailable'}")
+            emit(f"  Nfs4Metrics derived read latency: "
+                 f"{f'{derived_read:.1f}' if derived_read else 'unavailable'}")
+            emit(f"  latency-unit inference: {unit or 'not determinable'}"
+                 + (f" (ratio {ratio:.4g})" if ratio else ""))
+
+            cnode_series = {k for k in n4_second if "cnode_metrics" in k[0]}
+            emit(f"  cNode-scope Nfs4Metrics series: {len(cnode_series)}")
+            for key in sorted(cnode_series)[:6]:
+                lines.append(f"        {key[0]} {dict(key[1])}")
+    emit()
+
+    # -- 16. Client/view attribution cardinality ----------------------------
+    emit("[ 16. host_view / user_view / vip_view attribution ]")
+    for path in ("/prometheusmetrics/host_view", "/prometheusmetrics/user_view",
+                 "/prometheusmetrics/vip_view"):
+        body, elapsed, size, err = vast_discovery.scrape_timed(
+            vast_common.request_text, path)
+        if not body:
+            emit(f"  {path:<38} {err or 'no response'}")
+            continue
+        samples = vast_discovery.sample_values(body)
+        protocols = {}
+        for (_name, labels), _v in samples.items():
+            proto = dict(labels).get("protocol", "(none)")
+            protocols[proto] = protocols.get(proto, 0) + 1
+        emit(f"  {path:<38} {size:>7} bytes  {elapsed * 1000:>5.0f} ms  "
+             f"{len(samples)} series")
+        for proto, count in sorted(protocols.items(), key=lambda kv: -kv[1]):
+            emit(f"      protocol={proto:<12} {count} series")
+        lines.append(f"    {path} label vocabulary:")
+        for label in ("protocol", "ip", "path", "tenant", "username", "vip", "vippool"):
+            values = sorted({dict(l).get(label) for _n, l in samples
+                             if dict(l).get(label)})[:10]
+            if values:
+                lines.append(f"        {label}: {values}")
+    emit()
+
+    # -- 17. NFSv4 delegations (read-only) ----------------------------------
+    emit("[ 17. NFSv4 delegation REST endpoint ]")
+    try:
+        tenants = normalize_list_response(api_request("GET", "/tenants/"))
+    except RuntimeError as exc:
+        tenants = []
+        emit(f"  /tenants/ unavailable: {str(exc)[:60]}")
+    probed = 0
+    for tenant in tenants:
+        if probed >= _DELEG_PROBE_TENANTS:
+            break
+        tid = tenant.get("id")
+        if tid is None:
+            continue
+        probed += 1
+        # GET only. The sibling DELETE endpoint is never called.
+        info = vast_discovery.probe_readonly(
+            api_request, f"/tenants/{tid}/nfs4_delegs/")
+        name = tenant.get("name", tid)
+        if info["ok"]:
+            emit(f"  tenant {str(name)[:20]:<22} {info['count']:>4} delegation(s)")
+            if info["fields"]:
+                lines.append(f"        tenant {name} fields: "
+                             f"{', '.join(info['fields'])}")
+        else:
+            emit(f"  tenant {str(name)[:20]:<22} {_short_error(info['detail'])}")
+            lines.append(f"        tenant {name} -> {info['detail']}")
+    if not probed:
+        emit("  no tenants available to probe")
+    emit()
+
+    emit("[ 18. Summary ]")
     populated = [label for group, ops in DISCOVERY_OP_GROUPS for op, label in ops
                  if any(p in supported_set for p in op_name_candidates(op))]
     if populated:

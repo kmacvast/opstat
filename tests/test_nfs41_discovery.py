@@ -358,13 +358,14 @@ def test_block_metrics_never_leak_into_the_v41_concept_report():
 # ---------------------------------------------------------------------------
 # The --discover-metrics report
 # ---------------------------------------------------------------------------
-def _run_discovery(vms):
+def _run_discovery(vms, probe_interval="1"):
     return subprocess.run(
         [sys.executable, "opstat", "--nfs", "--version=4.1",
          "--vms", "127.0.0.1", "--vms-port", str(vms.port),
          "--discover-metrics", "--no-color"],
         capture_output=True, text=True, timeout=180,
-        env={"VAST_TOKEN": "test-token", "PATH": "/usr/bin:/bin"},
+        env={"VAST_TOKEN": "test-token", "PATH": "/usr/bin:/bin",
+             "OPSTAT_NFS4_PROBE_INTERVAL": probe_interval},
     )
 
 
@@ -382,7 +383,10 @@ def test_discovery_reports_every_section_and_leaks_nothing(vms):
                     "11. Client/host/user activity sources",
                     "12. Top-N / analytics capabilities",
                     "13. Candidate supporting data for NFSv4.1",
-                    "14. Summary"):
+                    "15. Nfs4Metrics (Prometheus) interrogation",
+                    "16. host_view / user_view / vip_view attribution",
+                    "17. NFSv4 delegation REST endpoint",
+                    "18. Summary"):
         assert section in out, f"missing section {section}"
     assert "Full report written to" in out
     assert vms.live_monitors() == {}, "discovery leaked monitors"
@@ -598,3 +602,118 @@ def test_candidate_block_renders_every_required_field():
                   "Read-only:", "Successfully queried:", "Potential opstat use:",
                   "Caveats:"):
         assert field in block
+
+
+# ---------------------------------------------------------------------------
+# Nfs4Metrics: the family the monitor API does not expose
+# ---------------------------------------------------------------------------
+def test_counter_delta_maths_derives_rate_and_latency():
+    import vast_discovery
+
+    first = {("m_count", frozenset({("cluster", "c")}.items() if False else
+                                   [("cluster", "c")])): 1000.0,
+             ("m_sum", frozenset([("cluster", "c")])): 500000.0}
+    second = {("m_count", frozenset([("cluster", "c")])): 1100.0,
+              ("m_sum", frozenset([("cluster", "c")])): 560000.0}
+    rows = vast_discovery.counter_deltas(first, second, elapsed=10.0)
+    by_name = {r["metric"]: r for r in rows}
+    assert by_name["m_count"]["delta"] == 100.0
+    assert by_name["m_count"]["per_sec"] == pytest.approx(10.0)
+    latency = vast_discovery.derive_latency(
+        by_name["m_count"]["delta"], by_name["m_sum"]["delta"])
+    assert latency == pytest.approx(600.0)
+
+
+def test_counter_behavior_classification():
+    import vast_discovery
+
+    assert "cumulative" in vast_discovery.summarize_counter_behavior(
+        [{"delta": 5.0}, {"delta": 2.0}])
+    assert "non-monotonic" in vast_discovery.summarize_counter_behavior(
+        [{"delta": 5.0}, {"delta": -1.0}])
+    assert "static" in vast_discovery.summarize_counter_behavior([{"delta": 0.0}])
+    assert "no comparable" in vast_discovery.summarize_counter_behavior([])
+
+
+def test_latency_unit_inference_against_a_known_reference():
+    import vast_discovery
+
+    # Reference is microseconds; a derived value of the same magnitude is µs.
+    assert vast_discovery.infer_time_unit(2000.0, 2000.0)[0] == "microseconds"
+    assert vast_discovery.infer_time_unit(2_000_000.0, 2000.0)[0] == "nanoseconds"
+    assert vast_discovery.infer_time_unit(2.0, 2000.0)[0] == "milliseconds"
+    assert vast_discovery.infer_time_unit(None, 2000.0)[0] is None
+
+
+def test_sample_values_keys_by_metric_and_labels():
+    import vast_discovery
+
+    body = (
+        '# TYPE m gauge\n'
+        'm{cnode_id="1",hostname="a"} 10\n'
+        'm{cnode_id="2",hostname="b"} 20\n'
+    )
+    samples = vast_discovery.sample_values(body)
+    assert len(samples) == 2, "per-cNode series collapsed into one key"
+    assert set(samples.values()) == {10.0, 20.0}
+
+
+def test_discovery_finds_nfs4metrics_and_proves_counter_semantics(vms, monkeypatch):
+    monkeypatch.setenv("OPSTAT_NFS4_PROBE_INTERVAL", "1")
+    out = _run_discovery(vms).stdout
+    assert "15. Nfs4Metrics (Prometheus) interrogation" in out
+    assert "Nfs4Metrics" in out
+    assert "behavior: cumulative" in out, "counter semantics not established"
+    # Session and state operations the monitor API never exposed.
+    for op in ("sequence", "exchange_id", "create_session", "open",
+               "close", "free_stateid", "test_stateid"):
+        assert op in out, f"{op} missing from the per-operation table"
+    assert "latency-unit inference:" in out
+
+
+def test_discovery_reports_nfs4_cnode_scope(vms, monkeypatch):
+    monkeypatch.setenv("OPSTAT_NFS4_PROBE_INTERVAL", "1")
+    out = _run_discovery(vms).stdout
+    assert "cNode-scope Nfs4Metrics series:" in out
+    count = int(out.split("cNode-scope Nfs4Metrics series:")[1].split("\n")[0])
+    assert count > 0, "no per-cNode NFSv4 series found"
+
+
+def test_discovery_prefers_the_narrowest_endpoint_carrying_nfs4metrics(vms, monkeypatch):
+    monkeypatch.setenv("OPSTAT_NFS4_PROBE_INTERVAL", "1")
+    out = _run_discovery(vms).stdout
+    assert "narrowest endpoint carrying Nfs4Metrics:" in out
+    # /all is the widest endpoint and must not be the chosen one when a
+    # narrower path carries the same family.
+    chosen = out.split("narrowest endpoint carrying Nfs4Metrics:")[1].split()[0]
+    assert not chosen.endswith("/all"), f"chose the widest endpoint: {chosen}"
+
+
+def test_attribution_reports_protocol_values_and_cardinality(vms, monkeypatch):
+    monkeypatch.setenv("OPSTAT_NFS4_PROBE_INTERVAL", "1")
+    out = _run_discovery(vms).stdout
+    assert "16. host_view / user_view / vip_view attribution" in out
+    assert "protocol=NFS4" in out, "NFS4 attribution not established"
+    assert "series" in out
+
+
+def test_delegation_endpoint_probed_read_only(vms, monkeypatch):
+    monkeypatch.setenv("OPSTAT_NFS4_PROBE_INTERVAL", "1")
+    result = _run_discovery(vms)
+    assert "17. NFSv4 delegation REST endpoint" in result.stdout
+    assert "delegation(s)" in result.stdout
+    # The sibling DELETE endpoint must never be called.
+    deletes = [p for _t, m, p, _s in vms.calls()
+               if m == "DELETE" and "nfs4_deleg" in p]
+    assert deletes == [], f"discovery called a delete endpoint: {deletes}"
+
+
+def test_discovery_handles_a_cluster_without_nfs4metrics(vms, monkeypatch):
+    vms.state.nfs4_exporter = False
+    vms.state.delegations_enabled = False
+    monkeypatch.setenv("OPSTAT_NFS4_PROBE_INTERVAL", "1")
+    result = _run_discovery(vms)
+    assert result.returncode == 0, result.stderr[-1500:]
+    assert "no exporter path carries Nfs4Metrics" in result.stdout
+    assert "18. Summary" in result.stdout
+    assert vms.live_monitors() == {}
