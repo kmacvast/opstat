@@ -466,6 +466,64 @@ def test_prometheus_parser_reads_help_type_and_labels():
     assert metrics["vast_total_bytes"]["type"] == "counter"
 
 
+def test_prometheus_parser_handles_commas_inside_label_values():
+    """Regression: VAST emits protocols="['NFS4', 'SMB']". Splitting the label
+    block on commas shredded that into bogus label names such as "'SMB'" and
+    made the real label set unreadable."""
+    import vast_discovery
+
+    body = (
+        "# HELP vast_view_logical_capacity View Logical Capacity\n"
+        "# TYPE vast_view_logical_capacity gauge\n"
+        'vast_view_logical_capacity{cluster="c",path="/v",'
+        "protocols=\"['NFS4', 'SMB']\",tenant_name=\"t\"} 1024\n"
+    )
+    meta = vast_discovery.parse_prometheus(body)["vast_view_logical_capacity"]
+    assert meta["labels"] == {"cluster", "path", "protocols", "tenant_name"}
+    assert meta["label_values"]["protocols"] == {"['NFS4', 'SMB']"}
+
+
+def test_prometheus_parser_records_label_values_for_attribution():
+    """A protocol label is only useful once we know it carries NFS values."""
+    import vast_discovery
+
+    body = (
+        "# TYPE vast_host_view_iops gauge\n"
+        'vast_host_view_iops{ip="10.9.0.1",protocol="NFS4",path="/a"} 44.2\n'
+        'vast_host_view_iops{ip="10.9.0.2",protocol="SMB",path="/b"} 3.0\n'
+    )
+    meta = vast_discovery.parse_prometheus(body)["vast_host_view_iops"]
+    assert meta["label_values"]["protocol"] == {"NFS4", "SMB"}
+    assert meta["label_values"]["ip"] == {"10.9.0.1", "10.9.0.2"}
+    assert meta["samples"] == 2
+
+
+def test_prometheus_label_values_are_capped():
+    import vast_discovery
+
+    body = "# TYPE m gauge\n" + "".join(
+        f'm{{ip="10.0.0.{i}"}} 1\n' for i in range(50))
+    meta = vast_discovery.parse_prometheus(body)["m"]
+    assert len(meta["label_values"]["ip"]) <= vast_discovery._MAX_LABEL_VALUES
+    assert meta["samples"] == 50
+
+
+def test_topn_envelope_is_described_by_its_contents():
+    """Regression: /monitors/topn/ wraps results in {data,next,previous,
+    timestamp}; reporting those four envelope keys made every top-N probe look
+    like one record and hid whether it returned anything at all."""
+    import vast_discovery
+
+    payload = {
+        "data": {"client": {"iops": [{"title": "10.0.0.1", "value": 5.0},
+                                     {"title": "10.0.0.2", "value": 3.0}]}},
+        "next": None, "previous": None, "timestamp": "2026-08-13T00:00:00Z",
+    }
+    count, fields = vast_discovery.describe_payload(payload)
+    assert count == 2, "envelope reported instead of contents"
+    assert "client.title" in fields and "client.value" in fields
+
+
 def test_prometheus_parser_tolerates_junk():
     import vast_discovery
 

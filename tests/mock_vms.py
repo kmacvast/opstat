@@ -190,6 +190,9 @@ OPENAPI_SPEC = {
         "/metrics/": {"get": {"summary": "Metric catalog"}},
         "/prometheusmetrics/": {"get": {"summary": "Prometheus exporter, cluster scope"}},
         "/prometheusmetrics/views": {"get": {"summary": "Prometheus exporter, per view"}},
+        "/prometheusmetrics/host_view": {"get": {"summary": "Prometheus exporter, per client host"}},
+        "/prometheusmetrics/user_view": {"get": {"summary": "Prometheus exporter, per user"}},
+        "/prometheusmetrics/vip_view": {"get": {"summary": "Prometheus exporter, per VIP"}},
         "/prometheusmetrics/tenants": {"get": {"summary": "Prometheus exporter, per tenant"}},
         "/clusters/list_nfs_client_connections/": {
             "get": {"summary": "Active NFS client connections"}},
@@ -207,10 +210,28 @@ vast_cluster_nfs_iops{cluster="mock-cluster",protocol="NFS3"} 88.0
 # TYPE vast_cluster_nfs_client_count gauge
 vast_cluster_nfs_client_count{cluster="mock-cluster"} 17
 """,
-    "/api/prometheusmetrics/views": """# HELP vast_view_nfs_iops Per-view NFS operations per second
-# TYPE vast_view_nfs_iops gauge
-vast_view_nfs_iops{view="/view/317",tenant="tenant-4"} 44.2
-vast_view_nfs_iops{view="/view/288",tenant="tenant-1"} 12.0
+    "/api/prometheusmetrics/views": """# HELP vast_view_logical_capacity View Logical Capacity
+# TYPE vast_view_logical_capacity gauge
+vast_view_logical_capacity{cluster="mock-cluster",name="v317",path="/view/317",protocols="['NFS4', 'SMB']",tenant_name="tenant-4"} 1024
+vast_view_logical_capacity{cluster="mock-cluster",name="v288",path="/view/288",protocols="['S3']",tenant_name="tenant-1"} 2048
+""",
+    # Per-client attribution, the shape VAST OS 5.5.0.1 actually serves.
+    "/api/prometheusmetrics/host_view": """# HELP vast_host_view_iops VMS host-view iops
+# TYPE vast_host_view_iops gauge
+vast_host_view_iops{alias="",bucket="",cluster="mock-cluster",ip="10.9.0.1",path="/view/317",protocol="NFS4",share="",tenant="tenant-4"} 44.2
+vast_host_view_iops{alias="",bucket="",cluster="mock-cluster",ip="10.9.0.2",path="/view/288",protocol="NFS4",share="",tenant="tenant-1"} 12.0
+vast_host_view_iops{alias="",bucket="",cluster="mock-cluster",ip="10.9.0.3",path="/share/a",protocol="SMB",share="a",tenant="tenant-0"} 3.0
+# HELP vast_host_view_read_latency VMS host-view read_latency
+# TYPE vast_host_view_read_latency gauge
+vast_host_view_read_latency{alias="",bucket="",cluster="mock-cluster",ip="10.9.0.1",path="/view/317",protocol="NFS4",share="",tenant="tenant-4"} 812.0
+""",
+    "/api/prometheusmetrics/user_view": """# HELP vast_user_view_iops VMS user-view iops
+# TYPE vast_user_view_iops gauge
+vast_user_view_iops{cluster="mock-cluster",path="/view/317",protocol="NFS4",tenant="tenant-4",uid="1001",username="alice"} 30.1
+""",
+    "/api/prometheusmetrics/vip_view": """# HELP vast_vip_view_iops VMS vip-view iops
+# TYPE vast_vip_view_iops gauge
+vast_vip_view_iops{cluster="mock-cluster",path="/view/317",protocol="NFS4",tenant="tenant-4",vip="10.1.0.1",vippool="nfs-pool"} 41.0
 """,
 }
 

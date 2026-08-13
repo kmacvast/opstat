@@ -152,20 +152,34 @@ def prometheus_candidates(spec):
 
 _PROM_HELP = re.compile(r"^#\s*HELP\s+(\S+)\s*(.*)$")
 _PROM_TYPE = re.compile(r"^#\s*TYPE\s+(\S+)\s+(\S+)")
-_PROM_SAMPLE = re.compile(r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{[^}]*\})?\s+")
+_PROM_SAMPLE = re.compile(r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{(.*)\})?\s+(\S+)\s*$")
+# Label pairs are name="value" where the value may itself contain commas and
+# escaped quotes - VAST emits protocols="['NFS4', 'SMB']". Splitting the label
+# block on commas therefore shredded such values into nonsense label names.
+_PROM_LABEL = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:[^"\\]|\\.)*)"')
+
+# Per metric, retain at most this many distinct values per label so a
+# high-cardinality label (client IP, view path) cannot bloat the report.
+_MAX_LABEL_VALUES = 12
 
 
 def parse_prometheus(text):
-    """Parse an exposition-format body into {metric: {help, type, labels, samples}}.
+    """Parse an exposition-format body into per-metric metadata.
 
+    Returns {metric: {help, type, labels, label_values, samples}} where
+    ``label_values`` maps each label name to a bounded set of observed values.
     The ``# HELP`` text is the authoritative description of what a metric
-    means - better evidence than inferring semantics from a metric name.
+    means, and the label values establish what the series can actually be
+    attributed to - a ``protocol`` label is only useful once we know it
+    carries values like NFS4.
     """
     metrics = {}
 
     def entry(name):
-        return metrics.setdefault(
-            name, {"help": "", "type": "", "labels": set(), "samples": 0})
+        return metrics.setdefault(name, {
+            "help": "", "type": "", "labels": set(),
+            "label_values": {}, "samples": 0,
+        })
 
     for line in (text or "").splitlines():
         line = line.strip()
@@ -185,11 +199,11 @@ def parse_prometheus(text):
             continue
         record = entry(m.group(1))
         record["samples"] += 1
-        if m.group(2):
-            for pair in m.group(2).strip("{}").split(","):
-                key = pair.split("=", 1)[0].strip()
-                if key:
-                    record["labels"].add(key)
+        for key, value in _PROM_LABEL.findall(m.group(3) or ""):
+            record["labels"].add(key)
+            seen = record["label_values"].setdefault(key, set())
+            if len(seen) < _MAX_LABEL_VALUES:
+                seen.add(value)
     return metrics
 
 
@@ -216,13 +230,24 @@ def probe_prometheus(request_text_fn, spec, limit=40):
 # Read-only REST resource probing
 # ---------------------------------------------------------------------------
 def describe_payload(payload, sample_fields=12):
-    """Summarize a REST response: record count and the field names available."""
+    """Summarize a REST response: record count and the field names available.
+
+    Descends through paging envelopes. ``/monitors/topn/`` wraps its results
+    in ``{data, next, previous, timestamp}`` where ``data`` is a dict keyed by
+    dimension, so reporting the envelope's own keys made every top-N probe
+    look like a single record with four fields - availability mistaken for
+    content.
+    """
     records = payload
     if isinstance(payload, dict):
         for key in ("results", "data", "objects", "items"):
-            if isinstance(payload.get(key), list):
-                records = payload[key]
+            inner = payload.get(key)
+            if isinstance(inner, list):
+                records = inner
                 break
+            if isinstance(inner, dict):
+                # Dimension-keyed payload: describe the nested structure.
+                return _describe_nested(inner, sample_fields)
         else:
             records = [payload]
     if not isinstance(records, list):
@@ -232,6 +257,27 @@ def describe_payload(payload, sample_fields=12):
         if isinstance(record, dict):
             fields |= set(record)
     return len(records), sorted(fields)[:sample_fields]
+
+
+def _describe_nested(block, sample_fields):
+    """Count leaf rows in a dimension-keyed payload and sample their fields."""
+    total, fields = 0, set()
+    for dimension, value in block.items():
+        rows = value
+        if isinstance(value, dict):
+            for metric_rows in value.values():
+                if isinstance(metric_rows, list):
+                    total += len(metric_rows)
+                    for row in metric_rows[:3]:
+                        if isinstance(row, dict):
+                            fields |= {f"{dimension}.{k}" for k in row}
+            continue
+        if isinstance(rows, list):
+            total += len(rows)
+            for row in rows[:3]:
+                if isinstance(row, dict):
+                    fields |= {f"{dimension}.{k}" for k in row}
+    return total, sorted(fields)[:sample_fields]
 
 
 def probe_readonly(request_fn, path):

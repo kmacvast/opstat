@@ -1765,14 +1765,37 @@ def discover_metrics():
                                                "view", "tenant", "user", "vip")):
                 nfs_prom[(path, name)] = meta
     emit(f"  NFS/protocol-relevant exporter metrics: {len(nfs_prom)}")
+
+    # Attribution is what matters: a per-client series is only useful for an
+    # NFS dashboard if its protocol label actually carries an NFS value. Show
+    # the observed values, not merely that the label exists.
+    attribution = {}
+    for path, metrics in responders:
+        for name, meta in metrics.items():
+            for label in ("protocol", "protocols"):
+                for value in meta["label_values"].get(label, ()):
+                    attribution.setdefault(value, set()).add(name)
+    if attribution:
+        emit("  protocol label values observed (metric count):")
+        for value, names in sorted(attribution.items()):
+            emit(f"    {value:<28} {len(names)} metric(s)")
+    else:
+        emit("  no protocol/protocols label values observed")
+
+    def _describe(name, meta):
+        values = "; ".join(
+            f"{k}={sorted(v)[:4]}" for k, v in sorted(meta["label_values"].items())
+        )
+        return (f"        {name} [{meta['type'] or '?'}] series={meta['samples']}"
+                f" :: {meta['help']}\n            labels: {values}")
+
     for (path, name), meta in sorted(nfs_prom.items()):
-        lines.append(f"        {path} {name} [{meta['type'] or '?'}]"
-                     f" labels={sorted(meta['labels'])} :: {meta['help']}")
+        lines.append(f"    {path}")
+        lines.append(_describe(name, meta))
     for path, metrics in responders:
         lines.append(f"    -- all metrics from {path} --")
         for name, meta in sorted(metrics.items()):
-            lines.append(f"        {name} [{meta['type'] or '?'}]"
-                         f" labels={sorted(meta['labels'])} :: {meta['help']}")
+            lines.append(_describe(name, meta))
     emit()
 
     # -- 10. NFS-related REST resources -------------------------------------
