@@ -230,7 +230,7 @@ def probe_prometheus(request_text_fn, spec, limit=40):
 # ---------------------------------------------------------------------------
 # Read-only REST resource probing
 # ---------------------------------------------------------------------------
-def describe_payload(payload, sample_fields=12):
+def describe_payload(payload, sample_fields=40):
     """Summarize a REST response: record count and the field names available.
 
     Descends through paging envelopes. ``/monitors/topn/`` wraps its results
@@ -260,7 +260,7 @@ def describe_payload(payload, sample_fields=12):
     return len(records), sorted(fields)[:sample_fields]
 
 
-def _describe_nested(block, sample_fields):
+def _describe_nested(block, sample_fields=40):
     """Count leaf rows in a dimension-keyed payload and sample their fields."""
     total, fields = 0, set()
     for dimension, value in block.items():
@@ -289,7 +289,9 @@ def probe_readonly(request_fn, path):
     try:
         payload = request_fn("GET", path)
     except RuntimeError as exc:
-        return {"path": path, "ok": False, "detail": str(exc)[:110],
+        # Keep the whole message: a validation error names the parameter the
+        # endpoint wants, and truncating it hid exactly that.
+        return {"path": path, "ok": False, "detail": str(exc),
                 "count": 0, "fields": []}
     count, fields = describe_payload(payload)
     return {"path": path, "ok": True, "detail": "", "count": count,
@@ -399,7 +401,14 @@ def counter_deltas(first, second, elapsed):
 
 
 def summarize_counter_behavior(rows):
-    """Classify a set of delta rows: cumulative, static, or resetting."""
+    """Classify delta rows as cumulative, idle-cumulative, static or resetting.
+
+    A zero delta alone is ambiguous, so magnitude decides the idle case: an
+    instantaneous rate reads ~0 on an idle cluster, whereas a lifetime
+    counter holds a large value. On a real cluster
+    ``nfs4_sequence_req_latency_count`` sat at 12,941,555 across both
+    scrapes - unchanged, but unmistakably a cumulative total.
+    """
     if not rows:
         return "no comparable series"
     deltas = [r["delta"] for r in rows]
@@ -409,7 +418,29 @@ def summarize_counter_behavior(rows):
         return f"non-monotonic ({shrank} of {len(deltas)} series decreased)"
     if grew:
         return f"cumulative ({grew} of {len(deltas)} series grew)"
-    return "static over this interval (no activity, or not a counter)"
+    large = [r for r in rows
+             if abs(r.get("second", r.get("first", 0.0))) >= _COUNTER_MAGNITUDE]
+    if large:
+        return (f"idle but cumulative ({len(large)} of {len(rows)} series hold "
+                f"values >= {_COUNTER_MAGNITUDE:,.0f}; a rate would read ~0). "
+                f"Re-run under load to measure rates.")
+    return "static and near zero over this interval (idle, or not a counter)"
+
+
+# A series holding at least this value while unchanged is a lifetime total,
+# not an instantaneous rate.
+_COUNTER_MAGNITUDE = 1000.0
+
+
+def lifetime_mean(count_value, sum_value):
+    """Mean per-operation value from lifetime totals.
+
+    Works on an idle cluster, where deltas are zero but the accumulated
+    totals still encode the long-run average - enough to reason about units.
+    """
+    if not count_value or count_value <= 0 or sum_value is None:
+        return None
+    return sum_value / count_value
 
 
 def derive_latency(count_delta, sum_delta):

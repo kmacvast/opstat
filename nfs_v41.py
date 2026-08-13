@@ -1819,9 +1819,11 @@ def discover_metrics():
     if endpoints:
         for path, methods, _summary in endpoints:
             low = path.lower()
-            if "GET" in methods and "{" not in path and any(
-                    k in low for k in ("nfs", "client", "session", "connection",
-                                       "export", "protocol")):
+            if ("GET" in methods and "{" not in path
+                    and "prometheus" not in low      # exporter is not JSON
+                    and any(k in low for k in ("nfs", "client", "session",
+                                               "connection", "export",
+                                               "protocol"))):
                 rest_candidates.append(path if path.startswith("/") else "/" + path)
     seen_rest = []
     for path in rest_candidates:
@@ -1943,8 +1945,8 @@ def discover_metrics():
                          for r in rows}
             emit("  per-operation (cluster scope):")
             emit(f"    {'operation':<18}{'dcount':>10}{'ops/s':>10}"
-                 f"{'dsum':>14}{'derived lat':>13}")
-            derived_read = None
+                 f"{'dsum':>14}{'derived lat':>13}{'lifetime lat':>14}")
+            derived_read = lifetime_read = None
             for op in _NFS4_PROBE_OPS:
                 base = f"vast_cluster_metrics_Nfs4Metrics_nfs4_{op}_req_latency"
                 cnt = next((r for k, r in by_metric.items()
@@ -1956,13 +1958,22 @@ def discover_metrics():
                     continue
                 lat = vast_discovery.derive_latency(
                     cnt["delta"], tot["delta"] if tot else None)
+                lifetime = vast_discovery.lifetime_mean(
+                    cnt["second"], tot["second"] if tot else None)
                 if op == "read":
                     derived_read = lat
+                    lifetime_read = lifetime
                 emit(f"    {op:<18}{cnt['delta']:>10.0f}{cnt['per_sec']:>10.2f}"
                      f"{(tot['delta'] if tot else 0):>14.0f}"
-                     f"{(f'{lat:.1f}' if lat else '-'):>13}")
-                lines.append(f"        {base}: first={cnt['first']} "
-                             f"second={cnt['second']} delta={cnt['delta']}")
+                     f"{(f'{lat:.1f}' if lat else '-'):>13}"
+                     f"{(f'{lifetime:.1f}' if lifetime else '-'):>14}")
+                lines.append(
+                    f"        {base}_count: first={cnt['first']} "
+                    f"second={cnt['second']} delta={cnt['delta']}")
+                if tot:
+                    lines.append(
+                        f"        {base}_sum:   first={tot['first']} "
+                        f"second={tot['second']} delta={tot['delta']}")
 
             # Units: compare a derived latency against NFS4Common's
             # read_latency__avg, which the existing dashboard already reads in
@@ -1979,13 +1990,20 @@ def discover_metrics():
             finally:
                 if monitor_id is not None:
                     delete_monitor(monitor_id)
-            unit, ratio = vast_discovery.infer_time_unit(derived_read, reference)
+            # An idle window yields no delta-derived latency, but the
+            # lifetime totals still carry a long-run mean usable for units.
+            basis = derived_read if derived_read else lifetime_read
+            basis_label = "delta-derived" if derived_read else "lifetime mean"
+            unit, ratio = vast_discovery.infer_time_unit(basis, reference)
             emit(f"  NFS4Common read_latency__avg (known microseconds): "
                  f"{reference if reference is not None else 'unavailable'}")
-            emit(f"  Nfs4Metrics derived read latency: "
-                 f"{f'{derived_read:.1f}' if derived_read else 'unavailable'}")
+            emit(f"  Nfs4Metrics read latency ({basis_label}): "
+                 f"{f'{basis:.1f}' if basis else 'unavailable'}")
             emit(f"  latency-unit inference: {unit or 'not determinable'}"
                  + (f" (ratio {ratio:.4g})" if ratio else ""))
+            if reference is None:
+                emit("  NOTE: the reference is null when the cluster is idle; "
+                     "re-run under NFSv4.1 load to prove units.")
 
             cnode_series = {k for k in n4_second if "cnode_metrics" in k[0]}
             emit(f"  cNode-scope Nfs4Metrics series: {len(cnode_series)}")

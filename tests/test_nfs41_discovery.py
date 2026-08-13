@@ -717,3 +717,79 @@ def test_discovery_handles_a_cluster_without_nfs4metrics(vms, monkeypatch):
     assert "no exporter path carries Nfs4Metrics" in result.stdout
     assert "18. Summary" in result.stdout
     assert vms.live_monitors() == {}
+
+
+# ---------------------------------------------------------------------------
+# Idle-cluster interrogation: the state var204 was actually in
+# ---------------------------------------------------------------------------
+def test_idle_counters_are_still_recognised_as_cumulative():
+    """A zero delta is ambiguous; magnitude is not. The real cluster held
+    nfs4_sequence_req_latency_count at 12,941,555 across both scrapes - an
+    instantaneous rate would have read ~0."""
+    import vast_discovery
+
+    idle_counter = [{"delta": 0.0, "first": 12941555.0, "second": 12941555.0}]
+    verdict = vast_discovery.summarize_counter_behavior(idle_counter)
+    assert "idle but cumulative" in verdict
+    assert "Re-run under load" in verdict
+
+    idle_rate = [{"delta": 0.0, "first": 0.0, "second": 0.0}]
+    assert "near zero" in vast_discovery.summarize_counter_behavior(idle_rate)
+
+
+def test_lifetime_mean_works_when_deltas_are_zero():
+    import vast_discovery
+
+    # 12.9M SEQUENCE ops totalling 14.5e9 microseconds -> ~1125 us each.
+    assert vast_discovery.lifetime_mean(12941555.0, 14_559_249_375.0) == pytest.approx(
+        1125.0, rel=1e-3)
+    assert vast_discovery.lifetime_mean(0.0, 5.0) is None
+    assert vast_discovery.lifetime_mean(10.0, None) is None
+
+
+def test_probe_readonly_keeps_the_whole_error_message():
+    """Truncating at 110 chars hid which parameter an endpoint wanted."""
+    import vast_discovery
+
+    long_detail = "HTTP 400: " + ("x" * 400)
+
+    def boom(_method, _path, payload=None):
+        raise RuntimeError(long_detail)
+
+    info = vast_discovery.probe_readonly(boom, "/tenants/1/nfs4_delegs/")
+    assert info["ok"] is False
+    assert info["detail"].endswith("x" * 20), "error detail was truncated"
+
+
+def test_nested_payload_reports_every_dimension():
+    """Top-N returns several dimensions; a 12-field cap hid the later ones."""
+    import vast_discovery
+
+    payload = {"data": {
+        dim: {"iops": [{"title": f"{dim}-1", "read": 1, "write": 2,
+                        "total": 3, "scan": 0}]}
+        for dim in ("client", "cnode", "user", "view", "vip")
+    }}
+    _count, fields = vast_discovery.describe_payload(payload)
+    dimensions = {f.split(".")[0] for f in fields}
+    assert dimensions == {"client", "cnode", "user", "view", "vip"}
+
+
+def test_idle_cluster_discovery_reports_lifetime_latency(vms, monkeypatch):
+    """End to end: frozen counters must still yield a units verdict."""
+    import tests.mock_vms as mm
+
+    live = mm._nfs4_exposition
+    monkeypatch.setattr(mm, "_nfs4_exposition", lambda elapsed: live(0.0))
+    out = _run_discovery(vms).stdout
+    assert "idle but cumulative" in out
+    assert "lifetime mean" in out
+    assert "latency-unit inference: microseconds" in out
+
+
+def test_exporter_paths_are_not_probed_as_json(vms):
+    """Prometheus endpoints serve text/plain; probing them with the JSON
+    client produced a bare 'Expecting value' in the REST section."""
+    out = _run_discovery(vms).stdout
+    rest_section = out.split("[ 10.")[1].split("[ 11.")[0]
+    assert "prometheus" not in rest_section.lower()
