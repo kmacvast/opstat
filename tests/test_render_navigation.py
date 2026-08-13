@@ -18,7 +18,7 @@ import pytest
 import tui_layout
 
 
-def render_frame(module, columns=120, lines=40):
+def render_frame(module, columns=200, lines=40):
     """Capture one composed frame from an engine's _render_frame()."""
     real_size = __import__("shutil").get_terminal_size
     buf, real_stdout = io.StringIO(), sys.stdout
@@ -73,6 +73,9 @@ def v41(monkeypatch):
 
 
 ALL_MODES = [None, "view", "cnode", "tenant"]
+# Exporter-backed drills render through a different path and must keep the
+# same footer.
+EXPORTER_MODES = ["native", "client"]
 
 
 @pytest.mark.parametrize("mode", ALL_MODES)
@@ -87,6 +90,7 @@ def test_navigation_footer_present_in_every_mode(v41, mode):
 @pytest.mark.parametrize("key,label", [
     ("q", "Quit"), ("o", "Ops"), ("l", "Lat"), ("n", "Name"),
     ("c", "cNode"), ("v", "View"), ("t", "Tenant"),
+    ("4", "Native v4"), ("h", "v4 Clients"),
     ("x", "Exit drill"), ("space", "Refresh"),
 ])
 def test_every_control_is_listed_in_every_mode(v41, mode, key, label):
@@ -108,7 +112,7 @@ def test_footer_is_the_last_rendered_line(v41, mode):
 
 
 @pytest.mark.parametrize("mode", ALL_MODES)
-@pytest.mark.parametrize("columns", [200, 120, 100, 80, 60, 40, 24, 10])
+@pytest.mark.parametrize("columns", [240, 200, 140, 120, 100, 80, 60, 40, 24, 10])
 def test_narrow_terminals_never_drop_the_footer_entirely(v41, mode, columns):
     """Truncation may shorten the control list but must never erase it."""
     v41.DRILL_MODE = mode
@@ -118,7 +122,7 @@ def test_narrow_terminals_never_drop_the_footer_entirely(v41, mode, columns):
     )
 
 
-@pytest.mark.parametrize("columns", [200, 120, 80, 40, 24, 10])
+@pytest.mark.parametrize("columns", [240, 200, 140, 120, 80, 40, 24, 10])
 def test_frame_never_exceeds_the_terminal_width(v41, columns):
     v41.DRILL_MODE = "view"
     for line in render_frame(v41, columns=columns).split("\n"):
@@ -180,3 +184,53 @@ def test_other_engines_keep_controls_visible_in_drill_mode(engine_name, expected
         module.LAST_DRILL_ROWS = []
     for token in expected:
         assert token in frame, f"{engine_name} drill frame lost {token!r}"
+
+
+
+# ---------------------------------------------------------------------------
+# Exporter-backed drills (native NFSv4 / client attribution)
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("mode", EXPORTER_MODES)
+def test_footer_present_in_exporter_drill_modes(v41, mode):
+    v41.EXPORTER_MODE = mode
+    try:
+        frame = render_frame(v41)
+    finally:
+        v41.EXPORTER_MODE = None
+    assert "[q] Quit" in frame
+    assert "[x] Exit drill" in frame
+    assert "[4] Native v4" in frame
+    assert "[h] v4 Clients" in frame
+
+
+@pytest.mark.parametrize("mode", EXPORTER_MODES)
+def test_footer_is_last_line_in_exporter_drill_modes(v41, mode):
+    v41.EXPORTER_MODE = mode
+    try:
+        lines = [l for l in render_frame(v41).split("\n") if l.strip()]
+    finally:
+        v41.EXPORTER_MODE = None
+    assert "[q] Quit" in lines[-1]
+
+
+def test_scraping_status_is_visible_before_the_blocking_scrape(v41):
+    """A real scrape costs seconds; the user must see progress, not a hang."""
+    v41.EXPORTER_MODE = "native"
+    v41.EXPORTER_STATUS = "Scraping native NFSv4 telemetry, stand by..."
+    try:
+        frame = render_frame(v41)
+    finally:
+        v41.EXPORTER_MODE = v41.EXPORTER_STATUS = None
+    assert "Scraping native NFSv4 telemetry" in frame
+    assert "[q] Quit" in frame, "footer lost while showing the status frame"
+
+
+@pytest.mark.parametrize("mode", EXPORTER_MODES)
+@pytest.mark.parametrize("columns", [240, 140, 120, 80, 40, 24])
+def test_exporter_drills_never_drop_the_footer(v41, mode, columns):
+    v41.EXPORTER_MODE = mode
+    try:
+        frame = render_frame(v41, columns=columns)
+    finally:
+        v41.EXPORTER_MODE = None
+    assert "[q]" in frame

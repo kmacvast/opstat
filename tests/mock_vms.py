@@ -190,6 +190,7 @@ OPENAPI_SPEC = {
         "/metrics/": {"get": {"summary": "Metric catalog"}},
         "/prometheusmetrics/": {"get": {"summary": "Prometheus exporter, cluster scope"}},
         "/prometheusmetrics/views": {"get": {"summary": "Prometheus exporter, per view"}},
+        "/prometheusmetrics/basic": {"get": {"summary": "Prometheus exporter, basic scope"}},
         "/prometheusmetrics/host_view": {"get": {"summary": "Prometheus exporter, per client host"}},
         "/prometheusmetrics/user_view": {"get": {"summary": "Prometheus exporter, per user"}},
         "/prometheusmetrics/vip_view": {"get": {"summary": "Prometheus exporter, per VIP"}},
@@ -210,6 +211,10 @@ vast_cluster_nfs_iops{cluster="mock-cluster",protocol="NFS3"} 88.0
 # TYPE vast_cluster_nfs_client_count gauge
 vast_cluster_nfs_client_count{cluster="mock-cluster"} 17
 """,
+    "/api/prometheusmetrics/basic": """# HELP vast_collector_errors_total Multiprocess metric
+# TYPE vast_collector_errors_total counter
+vast_collector_errors_total 0
+""",
     "/api/prometheusmetrics/all": """# HELP vast_collector_errors_total Multiprocess metric
 # TYPE vast_collector_errors_total counter
 vast_collector_errors_total 0
@@ -219,16 +224,26 @@ vast_collector_errors_total 0
 vast_view_logical_capacity{cluster="mock-cluster",name="v317",path="/view/317",protocols="['NFS4', 'SMB']",tenant_name="tenant-4"} 1024
 vast_view_logical_capacity{cluster="mock-cluster",name="v288",path="/view/288",protocols="['S3']",tenant_name="tenant-1"} 2048
 """,
-    # Per-client attribution, the shape VAST OS 5.5.0.1 actually serves.
-    "/api/prometheusmetrics/host_view": """# HELP vast_host_view_iops VMS host-view iops
-# TYPE vast_host_view_iops gauge
-vast_host_view_iops{alias="",bucket="",cluster="mock-cluster",ip="10.9.0.1",path="/view/317",protocol="NFS4",share="",tenant="tenant-4"} 44.2
-vast_host_view_iops{alias="",bucket="",cluster="mock-cluster",ip="10.9.0.2",path="/view/288",protocol="NFS4",share="",tenant="tenant-1"} 12.0
-vast_host_view_iops{alias="",bucket="",cluster="mock-cluster",ip="10.9.0.3",path="/share/a",protocol="SMB",share="a",tenant="tenant-0"} 3.0
-# HELP vast_host_view_read_latency VMS host-view read_latency
-# TYPE vast_host_view_read_latency gauge
-vast_host_view_read_latency{alias="",bucket="",cluster="mock-cluster",ip="10.9.0.1",path="/view/317",protocol="NFS4",share="",tenant="tenant-4"} 812.0
-""",
+    # Per-client attribution, the shape VAST OS 5.5.0.1 actually serves:
+    # twelve gauges per client IP x view path x protocol.
+    "/api/prometheusmetrics/host_view": "".join(
+        [f"# HELP vast_host_view_{field} VMS host-view {field}\n"
+         f"# TYPE vast_host_view_{field} gauge\n"
+         + "".join(
+             f'vast_host_view_{field}{{alias="",bucket="",cluster="mock-cluster",'
+             f'ip="{ip}",path="{path}",protocol="{proto}",share="",'
+             f'tenant="{tenant}"}} {value}\n'
+             for ip, path, proto, tenant, value in (
+                 ("10.9.0.1", "/view/317", "NFS4", "tenant-4", base * 1.0),
+                 ("10.9.0.2", "/view/288", "NFS4", "tenant-1", base * 0.27),
+                 ("10.9.0.3", "/share/a", "SMB", "tenant-0", base * 0.07),
+                 ("10.9.0.4", "/view/012", "NFS3", "tenant-2", base * 0.5),
+             ))
+         for field, base in (
+             ("iops", 44.2), ("read_iops", 30.1), ("write_iops", 14.1),
+             ("md_iops", 6.0), ("bw", 1048576.0), ("read_bw", 700000.0),
+             ("write_bw", 348576.0), ("latency", 812.0),
+         )]),
     "/api/prometheusmetrics/user_view": """# HELP vast_user_view_iops VMS user-view iops
 # TYPE vast_user_view_iops gauge
 vast_user_view_iops{cluster="mock-cluster",path="/view/317",protocol="NFS4",tenant="tenant-4",uid="1001",username="alice"} 30.1
@@ -282,6 +297,12 @@ def _nfs4_exposition(elapsed):
     out.append("# HELP vast_cluster_metrics_Nfs4Metrics_nfs4_open_connections_cnt Open NFSv4 connections")
     out.append("# TYPE vast_cluster_metrics_Nfs4Metrics_nfs4_open_connections_cnt gauge")
     out.append('vast_cluster_metrics_Nfs4Metrics_nfs4_open_connections_cnt{cluster="mock-cluster"} 42')
+    # The real exporter publishes the connection gauge per cNode too.
+    for idx, (cnode_id, hostname) in enumerate(_NFS4_CNODES):
+        out.append(
+            'vast_cnode_metrics_Nfs4Metrics_nfs4_open_connections_cnt'
+            f'{{cluster="mock-cluster",cnode_id="{cnode_id}",'
+            f'hostname="{hostname}"}} {12 + idx}')
     return "\n".join(out) + "\n"
 
 
@@ -323,6 +344,7 @@ class _State:
         # Nfs4Metrics rides the broad exporter endpoints, as on a real cluster.
         self.nfs4_exporter = True
         self.nfs4_exporter_paths = {"/api/prometheusmetrics/",
+                                    "/api/prometheusmetrics/basic",
                                     "/api/prometheusmetrics/all"}
         self.delegations_enabled = True
         self.latency_s = 0.0
