@@ -25,6 +25,7 @@
 import io
 import os
 import re
+import urllib.parse
 import shutil
 import ssl
 import sys
@@ -33,6 +34,7 @@ import time
 import openmetrics
 import vast_api_log
 import vast_common
+import vast_discovery
 import vast_drill
 from tui_layout import (
     display_width, join_columns, pad_display, format_fixed_number,
@@ -1474,6 +1476,68 @@ def _render_frame():
     _render_nav_footer(width)
 
 
+def _short_error(detail):
+    """Condense a RuntimeError message to the status and reason."""
+    match = re.search(r"(HTTP \d+)", detail or "")
+    if match:
+        return match.group(1)
+    return (detail or "").split(":")[-1].strip()[:52] or "failed"
+
+
+def _classify_props(props, scope):
+    """Return (prop, cumulative|rate/gauge|..., object_id yes/no) per property.
+
+    Semantics are decided from the returned samples, not the metric name.
+    """
+    out = []
+    if not props:
+        return out
+    monitor_id = None
+    try:
+        monitor_id = create_monitor("classify", list(props))
+        result = api_request("GET", f"/monitors/{monitor_id}/query/")
+        prop_list, data, prop_idx = _result_parts(result)
+        has_oid = "object_id" in prop_idx
+        for prop in props:
+            idx = prop_idx.get(prop)
+            if idx is None:
+                out.append((prop, "not returned", "n/a"))
+                continue
+            values = [row[idx] for row in data if idx < len(row)]
+            out.append((prop, vast_discovery.classify_series(values),
+                        "yes" if has_oid else "no"))
+    except RuntimeError as exc:
+        out.append(("(probe failed)", str(exc)[:60], "n/a"))
+    finally:
+        if monitor_id is not None:
+            delete_monitor(monitor_id)
+    return out
+
+
+def _scope_supports(props, cfg):
+    """Can *props* be monitored at this object scope? Returns a short verdict."""
+    if not props:
+        return "no props to test"
+    monitor_id = None
+    try:
+        objects = normalize_list_response(api_request("GET", cfg["endpoint"]))
+        ids = [o["id"] for o in objects[:2] if "id" in o]
+        if not ids:
+            return "no objects"
+        monitor_id = _create_monitor_raw(
+            "scope_probe", list(props), cfg["object_type"], ids,
+            no_aggregation=cfg.get("no_aggregation", False),
+        )
+        result = api_request("GET", f"/monitors/{monitor_id}/query/")
+        returned = [p for p in (result.get("prop_list") or []) if "," in p]
+        return f"{len(returned)}/{len(props)} props returned"
+    except RuntimeError as exc:
+        return f"rejected: {str(exc)[:52]}"
+    finally:
+        if monitor_id is not None:
+            delete_monitor(monitor_id)
+
+
 def _discovery_report_path():
     safe = "".join(ch if ch.isalnum() or ch in ".-_" else "_" for ch in str(VMS))
     return os.path.join("/tmp", f"opstat-nfs41-discovery-{safe}-{os.getpid()}.txt")
@@ -1641,9 +1705,167 @@ def discover_metrics():
         emit(f"  {family:<20} {len(entries)} name(s) - full list in report file")
         for entry in sorted(entries):
             lines.append(f"        {entry}")
+
+    # NfsSampledMetrics is the family opstat has never read. Establish, from
+    # live queries rather than from the names, whether anything in it is
+    # usable: queryable at all, at which scope, and cumulative vs rate.
+    sampled = sorted(inventory.get("NfsSampledMetrics", []))
+    if sampled:
+        emit(f"  -- NfsSampledMetrics deep probe ({len(sampled)} names) --")
+        ok, bad = probe_prop_support(sampled)
+        emit(f"     queryable at cluster scope: {len(ok)}/{len(sampled)}")
+        for prop in bad:
+            lines.append(f"        NOT QUERYABLE: {prop}")
+        for prop, kind, oid in _classify_props(ok[:48], "cluster"):
+            lines.append(f"        {prop} :: cluster :: {kind} :: object_id={oid}")
+        for scope, cfg in _DRILL_CFG.items():
+            supported = _scope_supports(ok[:24], cfg)
+            emit(f"     queryable at {scope} scope: {supported}")
     emit()
 
-    emit("[ 8. Summary ]")
+    # -- 8. VMS observability API inventory ---------------------------------
+    emit("[ 8. VMS observability API inventory ]")
+    spec_path, spec = vast_discovery.fetch_openapi(vast_common.request_text)
+    endpoints = vast_discovery.openapi_endpoints(spec)
+    if spec is None:
+        emit(f"  OpenAPI definition not retrievable"
+             + (f" (Swagger UI page found at {spec_path})" if spec_path else ""))
+    else:
+        emit(f"  definition: {spec_path}   {len(endpoints)} endpoint(s)")
+        hits = vast_discovery.match_endpoints(endpoints, vast_discovery.REST_KEYWORDS)
+        for keyword in vast_discovery.REST_KEYWORDS:
+            matched = hits.get(keyword, [])
+            if not matched:
+                continue
+            emit(f"    {keyword:<12} {len(matched):>4} endpoint(s)")
+            for path, methods, summary in matched:
+                lines.append(f"        {'/'.join(methods):<18} {path}"
+                             + (f"   {summary}" if summary else ""))
+        lines.append("    -- complete endpoint list --")
+        for path, methods, summary in endpoints:
+            lines.append(f"        {'/'.join(methods):<18} {path}"
+                         + (f"   {summary}" if summary else ""))
+    emit()
+
+    # -- 9. Prometheus / OpenMetrics ----------------------------------------
+    emit("[ 9. Prometheus/OpenMetrics endpoints ]")
+    prom_results = vast_discovery.probe_prometheus(vast_common.request_text, spec)
+    responders = [(p, m) for p, m, _n in prom_results if m]
+    if not prom_results:
+        emit("  no exporter path responded")
+    for path, metrics, note in prom_results:
+        if metrics:
+            emit(f"  {path:<44} {len(metrics)} metric(s)")
+        elif note:
+            emit(f"  {path:<44} {note}")
+    nfs_prom = {}
+    for path, metrics in responders:
+        for name, meta in metrics.items():
+            if any(k in name.lower() for k in ("nfs", "proto", "client", "session",
+                                               "view", "tenant", "user", "vip")):
+                nfs_prom[(path, name)] = meta
+    emit(f"  NFS/protocol-relevant exporter metrics: {len(nfs_prom)}")
+    for (path, name), meta in sorted(nfs_prom.items()):
+        lines.append(f"        {path} {name} [{meta['type'] or '?'}]"
+                     f" labels={sorted(meta['labels'])} :: {meta['help']}")
+    for path, metrics in responders:
+        lines.append(f"    -- all metrics from {path} --")
+        for name, meta in sorted(metrics.items()):
+            lines.append(f"        {name} [{meta['type'] or '?'}]"
+                         f" labels={sorted(meta['labels'])} :: {meta['help']}")
+    emit()
+
+    # -- 10. NFS-related REST resources -------------------------------------
+    emit("[ 10. NFS-related REST resources ]")
+    rest_candidates = [
+        "/views/", "/viewpolicies/", "/nfsexports/", "/vippools/", "/vips/",
+        "/tenants/", "/cnodes/", "/users/", "/quotas/", "/protocols/",
+        "/nfsclients/", "/clients/",
+    ]
+    if endpoints:
+        for path, methods, _summary in endpoints:
+            low = path.lower()
+            if "GET" in methods and "{" not in path and any(
+                    k in low for k in ("nfs", "client", "session", "connection",
+                                       "export", "protocol")):
+                rest_candidates.append(path if path.startswith("/") else "/" + path)
+    seen_rest = []
+    for path in rest_candidates:
+        if path not in seen_rest:
+            seen_rest.append(path)
+    for path in seen_rest[:24]:
+        info = vast_discovery.probe_readonly(api_request, path)
+        if info["ok"]:
+            emit(f"  {path:<34} {info['count']:>4} record(s)")
+            lines.append(f"        fields: {', '.join(info['fields'])}")
+        else:
+            emit(f"  {path:<34} {_short_error(info['detail'])}")
+            lines.append(f"        {path} -> {info['detail']}")
+    emit()
+
+    # -- 11. Client / host / user activity ----------------------------------
+    emit("[ 11. Client/host/user activity sources ]")
+    activity_paths = [
+        ("NFS client connections", "/clusters/list_nfs_client_connections/"),
+        ("SMB client connections", "/clusters/list_smb_client_connections/"),
+        ("open file handles (NFS)", "/openfilehandles/?protocol=NFS&page_size=5"),
+        ("topn by client", "/monitors/topn/?object_type=client&limit=5"),
+        ("topn by user", "/monitors/topn/?object_type=user&limit=5"),
+    ]
+    for label, path in activity_paths:
+        info = vast_discovery.probe_readonly(api_request, path)
+        if info["ok"]:
+            emit(f"  {label:<34} {info['count']:>4} record(s)")
+            lines.append(f"        {path} fields: {', '.join(info['fields'])}")
+        else:
+            emit(f"  {label:<34} {_short_error(info['detail'])}")
+            lines.append(f"        {path} -> {info['detail']}")
+    emit()
+
+    # -- 12. Top-N / analytics ----------------------------------------------
+    emit("[ 12. Top-N / analytics capabilities ]")
+    frame = urllib.parse.quote(API_TIME_FRAME, safe="")
+    for object_type in ("view", "tenant", "cnode", "vip", "user", "client",
+                        "host", "vippool"):
+        path = (f"/monitors/topn/?object_type={object_type}"
+                f"&prop_list={urllib.parse.quote(_data_fqn('iops'), safe=',')}"
+                f"&time_frame={frame}&limit=5")
+        info = vast_discovery.probe_readonly(api_request, path)
+        status = f"{info['count']} record(s)" if info["ok"] else info["detail"][:48]
+        emit(f"  topn object_type={object_type:<10} {status}")
+        if info["ok"]:
+            lines.append(f"        {path}")
+            lines.append(f"        fields: {', '.join(info['fields'])}")
+    emit()
+
+    # -- 13. Candidate supporting data --------------------------------------
+    emit("[ 13. Candidate supporting data for NFSv4.1 ]")
+    prom_note = (f"{len(responders)} exporter path(s), {len(nfs_prom)} relevant metric(s)"
+                 if responders else "no exporter path responded")
+    for block in (
+        dict(api_path="/api/metrics/ + POST /api/monitors/",
+             source="time-series metric catalog", scope="cluster/cnode/view/tenant",
+             provides="NFS4Common aggregates, NfsMetrics namespace ops",
+             read_only="yes (monitors deleted)", queried="yes",
+             opstat_use="current dashboard", caveats="no v4.1 state/session/layout ops"),
+        dict(api_path=spec_path or "not found",
+             source="cluster OpenAPI definition", scope="whole VMS API",
+             provides=f"{len(endpoints)} endpoint inventory",
+             read_only="yes", queried="yes" if spec else "no",
+             opstat_use="locate non-timeseries context",
+             caveats="inventory only, no telemetry itself"),
+        dict(api_path="/api/prometheusmetrics/*",
+             source="Prometheus exporter", scope="varies by endpoint",
+             provides="pre-derived metrics with HELP/TYPE semantics",
+             read_only="yes", queried=prom_note,
+             opstat_use="metrics absent from /metrics/, documented units",
+             caveats="scrape cost; not a monitor time series"),
+    ):
+        lines.extend(vast_discovery.candidate_block(**block))
+        emit(f"  {block['api_path']}  ->  {block['queried']}")
+    emit()
+
+    emit("[ 14. Summary ]")
     populated = [label for group, ops in DISCOVERY_OP_GROUPS for op, label in ops
                  if any(p in supported_set for p in op_name_candidates(op))]
     if populated:

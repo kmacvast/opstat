@@ -174,6 +174,47 @@ def _metric_value(prop, seed, t, object_id=None):
     return round(base * 0.5 * wobble * scale, 3)
 
 
+OPENAPI_SPEC = {
+    "openapi": "3.0.0",
+    "info": {"title": "VAST Management System", "version": "5.5.0.1"},
+    "paths": {
+        "/clusters/": {"get": {"summary": "List clusters"}},
+        "/views/": {"get": {"summary": "List views (NFS/SMB/S3 exports)"}},
+        "/viewpolicies/": {"get": {"summary": "View policies incl. NFS security flavors"}},
+        "/tenants/": {"get": {"summary": "List tenants"}},
+        "/cnodes/": {"get": {"summary": "List cnodes"}},
+        "/vippools/": {"get": {"summary": "VIP pools used by NFS clients"}},
+        "/monitors/": {"get": {"summary": "List monitors"}, "post": {"summary": "Create monitor"}},
+        "/monitors/topn/": {"get": {"summary": "Top-N performers by metric"}},
+        "/monitors/{id}/query/": {"get": {"summary": "Query a monitor"}},
+        "/metrics/": {"get": {"summary": "Metric catalog"}},
+        "/prometheusmetrics/": {"get": {"summary": "Prometheus exporter, cluster scope"}},
+        "/prometheusmetrics/views": {"get": {"summary": "Prometheus exporter, per view"}},
+        "/prometheusmetrics/tenants": {"get": {"summary": "Prometheus exporter, per tenant"}},
+        "/clusters/list_nfs_client_connections/": {
+            "get": {"summary": "Active NFS client connections"}},
+        "/openfilehandles/": {"get": {"summary": "Open file handles by protocol"}},
+    },
+}
+
+# Exposition-format bodies keyed by exporter path.
+PROMETHEUS_BODIES = {
+    "/api/prometheusmetrics/": """# HELP vast_cluster_nfs_iops NFS operations per second, cluster wide
+# TYPE vast_cluster_nfs_iops gauge
+vast_cluster_nfs_iops{cluster="mock-cluster",protocol="NFS4"} 421.5
+vast_cluster_nfs_iops{cluster="mock-cluster",protocol="NFS3"} 88.0
+# HELP vast_cluster_nfs_client_count Distinct NFS clients seen in the last window
+# TYPE vast_cluster_nfs_client_count gauge
+vast_cluster_nfs_client_count{cluster="mock-cluster"} 17
+""",
+    "/api/prometheusmetrics/views": """# HELP vast_view_nfs_iops Per-view NFS operations per second
+# TYPE vast_view_nfs_iops gauge
+vast_view_nfs_iops{view="/view/317",tenant="tenant-4"} 44.2
+vast_view_nfs_iops{view="/view/288",tenant="tenant-1"} 12.0
+""",
+}
+
+
 class _State:
     def __init__(self):
         self.lock = threading.Lock()
@@ -206,6 +247,9 @@ class _State:
         # Metric names /metrics/ advertises. Defaults model a build that
         # exports v4.1 state/session counters but no pNFS/layout telemetry.
         self.catalog = set(DEFAULT_CATALOG)
+        # Alternative observability surfaces.
+        self.openapi_enabled = True
+        self.prometheus = dict(PROMETHEUS_BODIES)
         self.latency_s = 0.0
         self.t0 = time.time()
 
@@ -320,6 +364,41 @@ class _Handler(BaseHTTPRequestHandler):
                 {"client_ip": (query.get("client_ip") or ["?"])[0],
                  "user": "mock", "share": "data"}
             ]})
+
+        if path in ("/api/openapi.json", "/openapi.json"):
+            if not self.state.openapi_enabled:
+                return self._error(404, "no openapi here")
+            return self._send(OPENAPI_SPEC)
+
+        if path.startswith("/api/prometheusmetrics"):
+            body = self.state.prometheus.get(path)
+            if body is None:
+                return self._error(404, "no exporter at this scope")
+            raw = body.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+            return self._record(200)
+
+        if path == "/api/clusters/list_nfs_client_connections/":
+            return self._send({"connections": [
+                {"client_ip": f"10.9.0.{i}", "protocol": "NFS4.1", "view": "/view/317"}
+                for i in range(5)
+            ]})
+
+        if path == "/api/viewpolicies/":
+            return self._send([
+                {"id": 1, "name": "default", "nfs_no_squash": ["*"],
+                 "flavor": "SYS", "nfs_version": "4.1", "protocols": ["NFS4"]},
+            ])
+
+        if path == "/api/vippools/":
+            return self._send([
+                {"id": 1, "name": "nfs-pool", "role": "PROTOCOLS",
+                 "vips": ["10.1.0.1", "10.1.0.2"]},
+            ])
 
         m = re.match(r"^/api/monitors/(\d+)/query/$", path)
         if m:

@@ -86,11 +86,11 @@ def test_stale_connection_retries_once(transport, monkeypatch):
     real_send = vast_common._send_once
     failures = {"n": 0}
 
-    def flaky_send(method, path, data):
+    def flaky_send(method, path, data, base=None):
         if failures["n"] == 0:
             failures["n"] += 1
             raise BrokenPipeError("server idled out the keep-alive socket")
-        return real_send(method, path, data)
+        return real_send(method, path, data, base=base)
 
     monkeypatch.setattr(vast_common, "_send_once", flaky_send)
     result = vast_common.request("GET", "/clusters/")
@@ -101,7 +101,7 @@ def test_stale_connection_retries_once(transport, monkeypatch):
 def test_fresh_connection_failure_is_not_retried(transport, monkeypatch):
     calls = {"n": 0}
 
-    def always_fail(method, path, data):
+    def always_fail(method, path, data, base=None):
         calls["n"] += 1
         raise ConnectionError("VMS unreachable")
 

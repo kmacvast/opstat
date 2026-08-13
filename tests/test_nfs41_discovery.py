@@ -375,7 +375,14 @@ def test_discovery_reports_every_section_and_leaks_nothing(vms):
     for section in ("1. Metric catalog", "2. NFSv4.1 concept scan",
                     "3. NFSv4.1 operation probe", "4. Families in use today",
                     "5. Object scopes", "6. NFS4Common statistical surface",
-                    "7. NFS family inventory", "8. Summary"):
+                    "7. NFS family inventory",
+                    "8. VMS observability API inventory",
+                    "9. Prometheus/OpenMetrics endpoints",
+                    "10. NFS-related REST resources",
+                    "11. Client/host/user activity sources",
+                    "12. Top-N / analytics capabilities",
+                    "13. Candidate supporting data for NFSv4.1",
+                    "14. Summary"):
         assert section in out, f"missing section {section}"
     assert "Full report written to" in out
     assert vms.live_monitors() == {}, "discovery leaked monitors"
@@ -407,3 +414,129 @@ def test_discovery_reports_object_scope_support(vms):
     out = _run_discovery(vms).stdout
     assert "view     /views/" in out
     assert "object_id=yes" in out
+
+
+# ---------------------------------------------------------------------------
+# Alternative observability surfaces
+# ---------------------------------------------------------------------------
+def test_openapi_definition_is_located_and_inventoried(vms):
+    out = _run_discovery(vms).stdout
+    assert "definition: /api/openapi.json" in out
+    assert "endpoint(s)" in out
+
+
+def test_discovery_survives_a_cluster_without_openapi(vms):
+    vms.state.openapi_enabled = False
+    result = _run_discovery(vms)
+    assert result.returncode == 0, result.stderr[-1500:]
+    assert "OpenAPI definition not retrievable" in result.stdout
+    assert "9. Prometheus/OpenMetrics endpoints" in result.stdout
+
+
+def test_prometheus_endpoints_are_probed_and_parsed(vms):
+    out = _run_discovery(vms).stdout
+    assert "/prometheusmetrics/" in out
+    assert "NFS/protocol-relevant exporter metrics:" in out
+
+
+def test_discovery_survives_a_cluster_without_prometheus(vms):
+    vms.state.prometheus = {}
+    result = _run_discovery(vms)
+    assert result.returncode == 0, result.stderr[-1500:]
+    assert "13. Candidate supporting data" in result.stdout
+
+
+def test_prometheus_parser_reads_help_type_and_labels():
+    import vast_discovery
+
+    body = (
+        "# HELP vast_view_nfs_iops Per-view NFS operations per second\n"
+        "# TYPE vast_view_nfs_iops gauge\n"
+        'vast_view_nfs_iops{view="/a",tenant="t1"} 44.2\n'
+        'vast_view_nfs_iops{view="/b",tenant="t2"} 12.0\n'
+        "# HELP vast_total_bytes Lifetime bytes\n"
+        "# TYPE vast_total_bytes counter\n"
+        "vast_total_bytes 99\n"
+    )
+    metrics = vast_discovery.parse_prometheus(body)
+    assert metrics["vast_view_nfs_iops"]["type"] == "gauge"
+    assert metrics["vast_view_nfs_iops"]["help"].startswith("Per-view NFS")
+    assert metrics["vast_view_nfs_iops"]["labels"] == {"view", "tenant"}
+    assert metrics["vast_view_nfs_iops"]["samples"] == 2
+    assert metrics["vast_total_bytes"]["type"] == "counter"
+
+
+def test_prometheus_parser_tolerates_junk():
+    import vast_discovery
+
+    assert vast_discovery.parse_prometheus("") == {}
+    assert vast_discovery.parse_prometheus("<html>not prometheus</html>") == {}
+
+
+def test_series_classification_uses_values_not_names():
+    import vast_discovery
+
+    # Monitor rows arrive newest-first, so a lifetime counter descends.
+    assert vast_discovery.classify_series([300, 200, 100]) == "cumulative"
+    assert vast_discovery.classify_series([100, 200, 300]) == "cumulative"
+    assert vast_discovery.classify_series([5, 9, 2, 7]) == "rate/gauge"
+    assert vast_discovery.classify_series([4, 4, 4]) == "constant"
+    assert vast_discovery.classify_series([None, None]) == "no data"
+    assert vast_discovery.classify_series([7]) == "single sample"
+
+
+def test_openapi_endpoint_matching_groups_by_keyword():
+    import vast_discovery
+    from tests.mock_vms import OPENAPI_SPEC
+
+    endpoints = vast_discovery.openapi_endpoints(OPENAPI_SPEC)
+    assert any(path == "/views/" for path, _m, _s in endpoints)
+    hits = vast_discovery.match_endpoints(endpoints, ("nfs", "topn"))
+    assert any("nfs_client_connections" in p for p, _m, _s in hits["nfs"])
+    assert hits["topn"]
+
+
+def test_describe_payload_handles_every_list_shape():
+    import vast_discovery
+
+    assert vast_discovery.describe_payload([{"a": 1, "b": 2}]) == (1, ["a", "b"])
+    assert vast_discovery.describe_payload({"results": [{"c": 1}]}) == (1, ["c"])
+    assert vast_discovery.describe_payload({"x": 1})[0] == 1
+
+
+def test_discovery_is_read_only_and_leaves_no_monitors(vms):
+    """Every temporary monitor must be gone, and nothing but GET/POST-monitor
+    /DELETE-monitor may be issued."""
+    result = _run_discovery(vms)
+    assert result.returncode == 0, result.stderr[-1500:]
+    assert vms.live_monitors() == {}
+
+    mutating = [
+        (method, path) for _ts, method, path, _status in vms.calls()
+        if method != "GET" and not path.startswith("/api/monitors")
+    ]
+    assert mutating == [], f"discovery issued non-monitor writes: {mutating}"
+
+    posts = sum(1 for _t, m, p, _s in vms.calls()
+                if m == "POST" and p == "/api/monitors/")
+    deletes = sum(1 for _t, m, p, _s in vms.calls() if m == "DELETE")
+    assert deletes == posts, f"{posts} monitors created, {deletes} deleted"
+
+
+def test_discovery_reports_client_activity_and_topn_scopes(vms):
+    out = _run_discovery(vms).stdout
+    assert "NFS client connections" in out
+    assert "topn object_type=view" in out
+    assert "topn object_type=client" in out
+
+
+def test_candidate_block_renders_every_required_field():
+    import vast_discovery
+
+    block = "\n".join(vast_discovery.candidate_block(
+        api_path="/api/x", source="s", scope="cluster", provides="p",
+        read_only="yes", queried="yes", opstat_use="u", caveats="c"))
+    for field in ("API path:", "Data source:", "Scope:", "What it provides:",
+                  "Read-only:", "Successfully queried:", "Potential opstat use:",
+                  "Caveats:"):
+        assert field in block

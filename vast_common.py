@@ -84,31 +84,33 @@ def close_connection():
         _CONN = None
 
 
-def _send_once(method, path, data):
+def _send_once(method, path, data, base=None):
     """One request/response on the persistent connection. Returns (status, body)."""
     conn = _get_connection()
-    conn.request(method, f"{_BASE_PATH}{path}", body=data, headers=_HEADERS)
+    prefix = _BASE_PATH if base is None else base
+    conn.request(method, f"{prefix}{path}", body=data, headers=_HEADERS)
     resp = conn.getresponse()
     body = resp.read().decode(errors="replace")
     return resp.status, body
 
 
-def request(method, path, payload=None):
-    """Issue an authenticated VMS REST request; log every call via vast_api_log.
+def request_text(method, path, payload=None, root=False):
+    """Issue an authenticated VMS request and return the raw response body.
 
-    Reuses one keep-alive connection across calls; a request that fails on a
-    previously-used connection (e.g. the server idled it out between refresh
-    ticks) is retried once on a fresh connection. Raises RuntimeError on any
-    HTTP or transport error (never leaks the raw http.client exception type).
+    ``root=True`` addresses the server root rather than the API base path, for
+    resources such as the Swagger UI that live outside ``/api``. Used by
+    discovery for endpoints that do not return JSON - the Prometheus exporter
+    serves ``text/plain``, which :func:`request` would fail to parse.
     """
-    url = f"{_BASE_URL}{path}"
+    base = "" if root else _BASE_PATH
+    url = f"https://{_HOST}:{_PORT}{base}{path}"
     data = json.dumps(payload).encode() if payload is not None else None
     started = time.monotonic()
     with _CONN_LOCK:
         try:
             reused = _CONN is not None
             try:
-                status, body = _send_once(method, path, data)
+                status, body = _send_once(method, path, data, base=base)
             except (http.client.HTTPException, ConnectionError, BrokenPipeError, OSError):
                 # Stale keep-alive socket: retry exactly once on a new
                 # connection, but only if the failed attempt was on a reused
@@ -116,7 +118,7 @@ def request(method, path, payload=None):
                 if not reused:
                     raise
                 close_connection()
-                status, body = _send_once(method, path, data)
+                status, body = _send_once(method, path, data, base=base)
         except Exception as e:
             close_connection()
             elapsed_ms = (time.monotonic() - started) * 1000
@@ -129,7 +131,26 @@ def request(method, path, payload=None):
         vast_api_log.log_call(method, url, payload, status, body, err, elapsed_ms)
         raise RuntimeError(f"{method} {url} failed: {err}")
     vast_api_log.log_call(method, url, payload, status, body, None, elapsed_ms)
-    return json.loads(body) if body else None
+    return body
+
+
+def request(method, path, payload=None):
+    """Issue an authenticated VMS REST request; log every call via vast_api_log.
+
+    Reuses one keep-alive connection across calls; a request that fails on a
+    previously-used connection (e.g. the server idled it out between refresh
+    ticks) is retried once on a fresh connection. Raises RuntimeError on any
+    HTTP or transport error (never leaks the raw http.client exception type).
+    """
+    body = request_text(method, path, payload)
+    if not body:
+        return None
+    try:
+        return json.loads(body)
+    except ValueError as e:
+        raise RuntimeError(
+            f"{method} {_BASE_URL}{path} returned non-JSON body: {str(e)[:80]}"
+        ) from e
 
 
 # ---------------------------------------------------------------------------
