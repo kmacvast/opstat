@@ -2025,11 +2025,26 @@ def discover_metrics():
                        "_req_latency_count")
             seq_row = next((r for k, r in by_metric.items() if k[0] == seq_key),
                            None)
+            # DERIVED RATIO, not a native metric: VMS publishes no compound
+            # counter. NFSv4.1 carries exactly one SEQUENCE per compound, so
+            # (all other ops) / SEQUENCE estimates operations per compound.
             if seq_row and seq_row["per_sec"]:
                 per_compound = total_ops_per_sec / seq_row["per_sec"]
-                emit(f"  SEQUENCE/s {seq_row['per_sec']:.2f}; all other ops "
-                     f"{total_ops_per_sec:.2f}/s -> {per_compound:.2f} ops per "
-                     f"compound (v4.1 sends one SEQUENCE per compound)")
+                emit(f"  DERIVED RATIO (not a native metric): SEQUENCE/s "
+                     f"{seq_row['per_sec']:.2f}; all other ops "
+                     f"{total_ops_per_sec:.2f}/s -> {per_compound:.2f} ops "
+                     f"per compound")
+            elif seq_row and seq_row["second"]:
+                lifetime_others = sum(
+                    r["second"] for k, r in by_metric.items()
+                    if k[0].startswith("vast_cluster_metrics_Nfs4Metrics_nfs4_")
+                    and k[0].endswith("_req_latency_count")
+                    and "nfs4_sequence_" not in k[0])
+                emit(f"  DERIVED RATIO (not a native metric, lifetime totals - "
+                     f"no traffic in this window): SEQUENCE "
+                     f"{seq_row['second']:,.0f}; all other ops "
+                     f"{lifetime_others:,.0f} -> "
+                     f"{lifetime_others / seq_row['second']:.2f} ops per compound")
 
             # An idle window yields no delta-derived latency, but the
             # lifetime totals still carry a long-run mean usable for units.
@@ -2049,22 +2064,35 @@ def discover_metrics():
 
             cnode_series = {k for k in n4_second if "cnode_metrics" in k[0]}
             emit(f"  cNode-scope Nfs4Metrics series: {len(cnode_series)}")
-            emit("  cluster vs sum-of-cNodes (delta counts):")
-            for op in discovered_ops[:40]:
+            # Compare deltas when the window carried traffic; otherwise fall
+            # back to lifetime totals, which still show whether per-cNode
+            # counters account for the cluster figure.
+            any_delta = any(r["delta"] for r in rows)
+            field = "delta" if any_delta else "second"
+            emit(f"  cluster vs sum-of-cNodes ({'delta' if any_delta else 'lifetime'}"
+                 f" counts):")
+            emit(f"    {'operation':<18}{'cluster':>12}{'cnodes':>12}"
+                 f"{'diff':>12}{'variance':>10}")
+            reconciled = 0
+            for op in discovered_ops:
                 c_key = (f"vast_cluster_metrics_Nfs4Metrics_nfs4_{op}"
                          f"_req_latency_count")
                 n_key = (f"vast_cnode_metrics_Nfs4Metrics_nfs4_{op}"
                          f"_req_latency_count")
-                cluster_delta = next((r["delta"] for k, r in by_metric.items()
-                                      if k[0] == c_key), None)
-                cnode_sum = sum(r["delta"] for k, r in by_metric.items()
+                cluster_val = next((r[field] for k, r in by_metric.items()
+                                    if k[0] == c_key), None)
+                cnode_sum = sum(r[field] for k, r in by_metric.items()
                                 if k[0] == n_key)
-                if not cluster_delta and not cnode_sum:
+                if not cluster_val and not cnode_sum:
                     continue
-                match = "" if not cluster_delta else (
-                    f"  ({cnode_sum / cluster_delta * 100:.1f}% of cluster)")
-                emit(f"    {op:<18}cluster={cluster_delta:>10.0f}"
-                     f"  cnodes={cnode_sum:>10.0f}{match}")
+                reconciled += 1
+                diff = cnode_sum - (cluster_val or 0)
+                variance = (f"{diff / cluster_val * 100:+.1f}%"
+                            if cluster_val else "n/a")
+                emit(f"    {op:<18}{(cluster_val or 0):>12,.0f}{cnode_sum:>12,.0f}"
+                     f"{diff:>12,.0f}{variance:>10}")
+            if not reconciled:
+                emit("    no operation carried a non-zero value at either scope")
             for key in sorted(cnode_series)[:6]:
                 lines.append(f"        {key[0]} {dict(key[1])}")
     emit()

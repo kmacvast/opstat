@@ -250,7 +250,12 @@ def describe_payload(payload, sample_fields=40):
                 # Dimension-keyed payload: describe the nested structure.
                 return _describe_nested(inner, sample_fields)
         else:
-            records = [payload]
+            # Unknown envelope: descend into the first list-of-records under
+            # any key. VMS wraps NFSv4 delegations in "delegate_info" beside
+            # pagination fields, and reporting the wrapper's own keys hid the
+            # delegation record schema entirely.
+            nested = _first_record_list(payload)
+            records = nested if nested is not None else [payload]
     if not isinstance(records, list):
         return 0, []
     fields = set()
@@ -258,6 +263,14 @@ def describe_payload(payload, sample_fields=40):
         if isinstance(record, dict):
             fields |= set(record)
     return len(records), sorted(fields)[:sample_fields]
+
+
+def _first_record_list(payload):
+    """First list-of-dicts under any key of *payload*, or None."""
+    for value in payload.values():
+        if isinstance(value, list) and value and isinstance(value[0], dict):
+            return value
+    return None
 
 
 def _describe_nested(block, sample_fields=40):

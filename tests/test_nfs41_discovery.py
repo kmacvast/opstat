@@ -819,7 +819,48 @@ def test_cluster_and_cnode_counters_are_reconciled(vms, monkeypatch):
     monkeypatch.setenv("OPSTAT_NFS4_PROBE_INTERVAL", "1")
     out = _run_discovery(vms).stdout
     assert "cluster vs sum-of-cNodes (delta counts):" in out
-    assert "% of cluster)" in out
+    assert "variance" in out
+    assert "no operation carried a non-zero value" not in out
+
+
+def test_reconciliation_falls_back_to_lifetime_totals_when_idle(vms, monkeypatch):
+    """An idle window produced an empty heading and no evidence at all;
+    lifetime totals still show whether cNode counters account for the
+    cluster figure."""
+    import tests.mock_vms as mm
+
+    live = mm._nfs4_exposition
+    monkeypatch.setattr(mm, "_nfs4_exposition", lambda elapsed: live(0.0))
+    monkeypatch.setenv("OPSTAT_NFS4_PROBE_INTERVAL", "1")
+    out = _run_discovery(vms).stdout
+    assert "cluster vs sum-of-cNodes (lifetime counts):" in out
+    assert "no operation carried a non-zero value" not in out
+    assert "ops per compound" in out, "compound ratio vanished when idle"
+
+
+def test_compound_ratio_is_labelled_as_derived(vms, monkeypatch):
+    """VMS publishes no compound counter; the figure is inferred from
+    SEQUENCE and must not read as native telemetry."""
+    monkeypatch.setenv("OPSTAT_NFS4_PROBE_INTERVAL", "1")
+    out = _run_discovery(vms).stdout
+    assert "DERIVED RATIO (not a native metric)" in out
+    assert "ops per compound" in out
+
+
+def test_delegation_record_schema_is_reported(vms, monkeypatch):
+    """The response wraps records in "delegate_info" beside pagination keys;
+    describing the wrapper hid the delegation schema."""
+    monkeypatch.setenv("OPSTAT_NFS4_PROBE_INTERVAL", "1")
+    _run_discovery(vms)
+    import vast_discovery
+
+    payload = {"delegate_info": [{"client_ip": "10.9.0.1", "stateid": "0x01",
+                                  "deleg_type": "READ", "path": "/v"}],
+               "delegate_info_count_total": 1,
+               "xeystore_pagination": None}
+    count, fields = vast_discovery.describe_payload(payload)
+    assert count == 1
+    assert "client_ip" in fields and "deleg_type" in fields and "stateid" in fields
 
 
 def test_units_reference_falls_back_when_nfs4common_is_null(vms, monkeypatch):

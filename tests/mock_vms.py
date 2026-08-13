@@ -453,12 +453,19 @@ class _Handler(BaseHTTPRequestHandler):
             if "file_path" not in query:
                 return self._error(
                     400, "['__root__->file_path: field required']")
-            return self._send({"results": [
+            records = [
                 {"client_ip": f"10.9.0.{i}", "path": f"/view/{300 + i}",
                  "stateid": f"0x{tid:04x}{i:04x}", "deleg_type": "READ",
                  "tenant_id": tid, "created_at": "2026-08-13T14:00:00Z"}
                 for i in range(2 if tid % 2 == 0 else 0)
-            ]})
+            ]
+            # Real VMS wraps records in delegate_info beside pagination keys.
+            return self._send({
+                "delegate_info": records,
+                "delegate_info_count_total": len(records),
+                "xeystore_pagination": None,
+                "xeystore_pagination_next_client_id": None,
+            })
 
         if path.startswith("/api/prometheusmetrics"):
             body = self.state.prometheus.get(path)
