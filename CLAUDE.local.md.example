@@ -1,0 +1,59 @@
+# CLAUDE.local.md (example)
+
+Copy this file to `CLAUDE.local.md` for your own machine-local notes. That file
+is **git-ignored** and must never be committed.
+
+> **No secrets. Ever.**
+>
+> Not `VAST_TOKEN`, not `VAST_PASSWORD`, not an API key, not a cluster password,
+> not a token pasted "just for a minute". Credentials come from the environment
+> or your OS keychain — see [AGENTS.md](AGENTS.md#secrets-handling).
+>
+> Also keep real cluster hostnames, IPs, tenant names and view paths out of it
+> where you can. Use placeholders.
+>
+> This file is loaded into the agent's context on every session. Treat it as
+> readable by anything that reads this repository on this machine.
+
+Everything below is optional. Delete what you do not use.
+
+---
+
+## Machine notes
+
+- OS / hardware:
+- Anything unusual about this machine's setup:
+
+## Interpreters
+
+- `python3` resolves to:
+- Python 3.8 available via: <!-- e.g. uv, pyenv, /usr/local/bin/python3.8 -->
+- `openssl` version: <!-- required; 171 tests skip silently without it -->
+
+## Lab and cluster shortcuts
+
+Non-secret conveniences only — hostnames you are comfortable having on disk,
+aliases, ssh config names. **No credentials.**
+
+- Lab host alias(es):
+- Test cluster placeholder to substitute for `<VMS_HOST>`:
+
+## Convenience commands
+
+Things you run often on this machine:
+
+```bash
+# e.g.
+# ./scripts/validate.sh --fast
+# python3 tests/mock_vms.py --port 8443
+```
+
+## Terminal preferences
+
+- Preferred terminal size for TUI work: <!-- the footer is budgeted to 140 cols -->
+- Notes on your terminal emulator's color / wide-character behavior:
+
+## Personal reminders
+
+- Anything you want re-stated to yourself at the start of each session in this
+  repository.

@@ -457,12 +457,44 @@ nvme_tcp.py            # NVMe-oTCP engine
 smb.py                 # SMB engine
 s3.py                  # S3 object storage engine
 wizard.py              # Interactive launcher
-vast_common.py         # Shared VMS helpers
+vast_common.py         # Auth, HTTPS transport, monitor lifecycle, sample selection
+vast_drill.py          # Shared drill ranking, batching, throttling
+vast_discovery.py      # Read-only VMS observability survey (--discover-metrics)
+nfs4_native.py         # Native NFSv4 telemetry from the Prometheus exporter
+tui_layout.py          # Column layout and value formatting
+vast_api_log.py        # --log-api-calls REST logging
 openmetrics.py         # JSON Lines exporter
+AGENTS.md              # Engineering contract for contributors and AI agents
+CLAUDE.md              # Claude Code entrypoint (imports AGENTS.md)
+.claude/               # Agent rules, reviewers, skills, permission policy
+docs/                  # Engineering documentation — see docs/README.md
+tests/                 # pytest suite + mock_vms.py VMS test double
 S3_README.md           # S3 protocol reference
-scripts/               # Loadgens (see scripts/README-systemd.md) and PyInstaller build helpers
+scripts/               # validate.sh, loadgens (see scripts/README-systemd.md), build helpers
 releases/              # Local binary build staging (not committed)
-.github/workflows/     # Tag-triggered multi-OS releases
+.github/workflows/     # pytest matrix (3.8–3.14) and tag-triggered releases
+```
+
+### Contributing / development
+
+Everything about *working on* `opstat` — rather than using it — starts at
+[docs/README.md](docs/README.md).
+
+- [AGENTS.md](AGENTS.md) — the engineering contract: architecture, the Python
+  3.8 floor, the command and test contract, API-efficiency invariants, VMS
+  safety, git policy, definition of done. Applies to humans and AI agents
+  alike; [CLAUDE.md](CLAUDE.md) imports it for Claude Code.
+- [docs/decisions/](docs/decisions/) — settled engineering decisions and the
+  evidence behind them.
+- [docs/REFACTOR_HANDOFF.md](docs/REFACTOR_HANDOFF.md) — current state of the
+  `refactor/tui-performance` effort and its outstanding work.
+- [docs/WORKSTATION_BOOTSTRAP.md](docs/WORKSTATION_BOOTSTRAP.md) — setting up a
+  new machine to continue that work.
+
+Run the full validation gate with:
+
+```bash
+./scripts/validate.sh
 ```
 
 ---

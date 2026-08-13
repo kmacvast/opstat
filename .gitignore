@@ -222,3 +222,11 @@ __marimo__/
 releases/*
 !releases/README.md
 !releases/.gitkeep
+
+# Agent configuration.
+#   Shared, project-level configuration is TRACKED: AGENTS.md, CLAUDE.md,
+#   .claude/settings.json, .claude/rules/, .claude/agents/, .claude/skills/.
+#   Only machine-local overrides are ignored. Never put credentials in either —
+#   see AGENTS.md "Secrets handling".
+CLAUDE.local.md
+.claude/settings.local.json

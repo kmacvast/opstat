@@ -1,19 +1,55 @@
 ---
-description: Lab files go through git on the MacBook, never scp into a clone
+description: Cursor adapter — AGENTS.md is the source of truth for this repository
 alwaysApply: true
 ---
 
-# Lab git sync
+# opstat working agreements (Cursor adapter)
 
-Do not write or `scp` files onto the lab server (`kevin-mcdonald-ubu-01`, `kmactools`, or any other clone) when those files belong in git.
+**Read `AGENTS.md` in the repository root.** It is the tool-neutral source of
+truth for how work is done here — architecture, the mandatory Python 3.8 floor,
+the command and test contract, the L1/L2/L3 decision hierarchy, API-efficiency
+invariants, VMS safety, TUI requirements, secrets handling, git policy,
+prohibited actions, the definition of done, and the required completion report.
 
-Workflow:
+This file exists only because Cursor does not read `AGENTS.md` automatically.
+It deliberately does **not** restate the rules — two copies would eventually
+disagree. Detailed rules live in `.claude/rules/` and apply to every agent
+regardless of which tool loads them:
 
-1. Edit and add files in the MacBook clone of the repo.
-2. Commit (when the user asks, or when they asked to commit and push as part of this task).
-3. `git push` to origin.
-4. On the lab host only: `git pull` (or `git fetch` + checkout). Never copy the same tree over SSH.
+- `.claude/rules/git-and-approval.md`
+- `.claude/rules/vast-api-safety.md`
+- `.claude/rules/testing-and-evidence.md`
+- `.claude/rules/tui-behavior.md`
 
-If a lab clone already has leftover scp copies, delete those untracked files, then pull so git owns the tree.
+Settled engineering decisions, with the evidence that settled them, are in
+`docs/decisions/`. Branch state and open work are in
+`docs/REFACTOR_HANDOFF.md`.
 
-Live systemd units under `/etc/systemd/system/` are installed from the pulled tree (`scripts/systemd/install-lab-loadgen-units.sh`). Do not treat `/etc` as the source of truth for script content.
+## The three things most easily got wrong here
+
+1. **Do not push, merge, tag, or open a PR without explicit approval.** Do not
+   commit unbidden. Rebasing onto fetched upstream commits *is* allowed and is
+   the correct response to a rejected push — never force-push.
+2. **Run `./scripts/validate.sh`, not a bare `pytest`.** 171 of the 400 tests
+   skip silently without the `openssl` binary, and Python 3.8 is a mandatory
+   floor that the development interpreter will not catch for you.
+3. **Never display a value the cluster did not return**, and never collapse a
+   measured `0` into "unavailable".
+
+## Lab hosts receive code through git
+
+Do not write or `scp` files onto the lab server (`kevin-mcdonald-ubu-01`,
+`kmactools`, or any other clone) when those files belong in git.
+
+1. Edit and add files in the MacBook clone.
+2. Commit — when the user asks.
+3. `git push` to origin — when the user asks.
+4. On the lab host only: `git pull` (or `git fetch` + checkout). Never copy the
+   same tree over SSH.
+
+If a lab clone already has leftover scp copies, delete those untracked files,
+then pull so git owns the tree.
+
+Live systemd units under `/etc/systemd/system/` are installed from the pulled
+tree (`scripts/systemd/install-lab-loadgen-units.sh`). Do not treat `/etc` as
+the source of truth for script content.
