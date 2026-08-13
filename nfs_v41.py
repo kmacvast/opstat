@@ -128,9 +128,49 @@ SESSION_OPS_V41 = [
     ("bind_conn_to_session", "BIND_CONN"),
     ("reclaim_complete", "RECLAIM_CMPL"),
 ]
+# pNFS / layout candidates. Nothing is displayed for these unless the cluster
+# actually exports them - they exist so discovery can report whether VAST
+# publishes pNFS telemetry at all.
+PNFS_OPS = [
+    ("layoutget", "LAYOUTGET"),
+    ("layoutreturn", "LAYOUTRETURN"),
+    ("layoutcommit", "LAYOUTCOMMIT"),
+    ("getdeviceinfo", "GETDEVICEINFO"),
+    ("getdevicelist", "GETDEVICELIST"),
+]
+
 # Rendered in this order in the STATE / LOCKING / SESSION panel.
 STATE_PANEL_OPS = STATE_OPS + DELEGATION_OPS + SESSION_OPS_V41
 STATE_PANEL_TITLE = "STATE / LOCKING / SESSION (NfsMetrics)"
+
+PNFS_PANEL_TITLE = "pNFS / LAYOUT (NfsMetrics)"
+
+# Every v4.1-specific op we know how to ask for, grouped for discovery.
+DISCOVERY_OP_GROUPS = (
+    ("open / lock state", STATE_OPS),
+    ("delegation", DELEGATION_OPS),
+    ("session / client", SESSION_OPS_V41),
+    ("pNFS / layout", PNFS_OPS),
+)
+
+# VMS has used more than one spelling for NfsMetrics op counters across
+# builds, and the v4.1 ops may not follow the v3 convention at all. Discovery
+# tries each pattern so a naming difference shows up as evidence rather than
+# as a silently empty panel.
+_OP_NAME_PATTERNS = (
+    "NfsMetrics,nfs_{op}_latency__rate",
+    "NfsMetrics,nfs_{op}_latency__avg",
+    "NfsMetrics,nfs_{op}",
+    "NfsMetrics,nfs4_{op}_latency__rate",
+    "NfsMetrics,nfs4_{op}",
+)
+
+# Concept keywords used to sweep the metric catalog for anything v4.1-ish.
+NFS41_CONCEPTS = (
+    "nfs4", "nfsv4", "session", "sequence", "exchange", "open", "close",
+    "lock", "deleg", "layout", "device", "stateid", "reclaim", "compound",
+    "callback", "backchannel", "trunk", "grace", "replay", "retry",
+)
 
 _DRILL_CFG = {
     "cnode": {
@@ -188,9 +228,11 @@ DATA_MONITOR_ID = META_MONITOR_ID = None
 SUPPLEMENT_MONITOR_ID = BW_MONITOR_ID = None
 STATE_MONITOR_ID = None
 STATE_OPS_AVAILABLE = []   # (op, label) pairs the cluster actually exports
+PNFS_OPS_AVAILABLE = []    # pNFS/layout ops, only when VMS exports them
 METRICS_SOURCE = "NFS4Common"
 SORT_MODE = "default"   # default | ops | latency
-LAST_ROWS = {"data": [], "stateful": [], "state": [], "session": [], "meta": {}}
+LAST_ROWS = {"data": [], "stateful": [], "state": [], "pnfs": [],
+             "session": [], "meta": {}}
 LAST_SAMPLE = "-"
 DRILL_MODE = DRILL_ERROR = None
 DRILL_OBJECTS = []
@@ -378,27 +420,84 @@ def _collect_metric_names(obj):
     return names
 
 
-def probe_available_state_ops():
-    """Return the subset of STATE_PANEL_OPS the cluster's metric catalog exports.
+def op_name_candidates(op):
+    """Every metric spelling we know to try for one NFSv4.1 operation."""
+    return [pattern.format(op=op) for pattern in _OP_NAME_PATTERNS]
+
+
+def _catalog_exports_op(names, op):
+    """True when the catalog contains any known spelling of *op*'s counters.
+
+    Matching on the op token alone (rather than one hard-coded suffix) means
+    a build that publishes ``nfs_open_ops`` instead of ``nfs_open_latency``
+    is still detected. The token is bounded by underscores so ``lock`` does
+    not match ``release_lockowner`` and inflate the result.
+    """
+    tokens = (f"_{op}_", f"_{op}")
+    for name in names:
+        lowered = name.lower()
+        if any(lowered.endswith(t) or t + "_" in lowered or t in lowered
+               for t in tokens):
+            return True
+    return False
+
+
+def probe_available_state_ops(names=None, ops=None):
+    """Return the subset of *ops* the cluster's metric catalog exports.
 
     Best-effort and read-only. Returns:
       - a (possibly empty) list of (op, label) when the catalog is readable, or
       - None when the catalog cannot be read, so the caller can fall back to a
         trial monitor-creation attempt.
     """
-    try:
-        raw = api_request("GET", "/metrics/")
-    except RuntimeError:
-        return None
-    names = _collect_metric_names(raw)
-    if not names:
-        return None
-    available = []
-    for op, label in STATE_PANEL_OPS:
-        needle = f"nfs_{op}_latency"
-        if any(needle in name for name in names):
-            available.append((op, label))
-    return available
+    if names is None:
+        names = vast_common.fetch_metric_catalog(api_request)
+        if not names:
+            return None
+    return [(op, label) for op, label in (ops or STATE_PANEL_OPS)
+            if _catalog_exports_op(names, op)]
+
+
+def concept_scan(names):
+    """Group catalog metric names by NFSv4.1 concept keyword.
+
+    Returns {keyword: sorted names}. A name can appear under several
+    keywords; that is intentional, the point is to make every v4.1-adjacent
+    metric easy to find in the report.
+    """
+    hits = {}
+    for keyword in NFS41_CONCEPTS:
+        matched = sorted(n for n in names if keyword in n.lower())
+        if matched:
+            hits[keyword] = matched
+    return hits
+
+
+def probe_prop_support(props, chunk=40):
+    """Return (supported, rejected) prop names, verified against live monitors.
+
+    Catalog presence does not guarantee a property is queryable, so this
+    creates a temporary monitor per chunk, reads which props VMS echoes back
+    in the query's prop_list, and deletes the monitor. Read-only in effect:
+    nothing survives the call. A chunk whose create is rejected outright is
+    reported as rejected rather than retried prop-by-prop, to bound cost.
+    """
+    supported, rejected = [], []
+    for start in range(0, len(props), chunk):
+        batch = props[start:start + chunk]
+        monitor_id = None
+        try:
+            monitor_id = create_monitor(f"discover_{start}", batch)
+            result = api_request("GET", f"/monitors/{monitor_id}/query/")
+            returned = set(result.get("prop_list", []) or []) if isinstance(result, dict) else set()
+            for prop in batch:
+                (supported if prop in returned else rejected).append(prop)
+        except RuntimeError:
+            rejected.extend(batch)
+        finally:
+            if monitor_id is not None:
+                delete_monitor(monitor_id)
+    return supported, rejected
 
 
 def build_drill_prop_list(mode="cnode"):
@@ -455,7 +554,7 @@ def _result_parts(result):
     return prop_list, data, prop_idx
 
 
-def _latest_row(result):
+def _latest_row(result, prop_names=None):
     """Values from the newest usable sample row.
 
     VMS publishes the newest bucket while it is still filling (a real cluster
@@ -463,7 +562,7 @@ def _latest_row(result):
     data[0] verbatim - see vast_common.latest_complete_row.
     """
     _prop_list, data, prop_idx = _result_parts(result)
-    return vast_common.latest_complete_values(data, prop_idx)
+    return vast_common.latest_complete_values(data, prop_idx, prop_names)
 
 
 def _metric(values, suffix):
@@ -539,6 +638,17 @@ def _build_state_rows(state_values):
     )
 
 
+def _build_pnfs_rows(state_values):
+    """pNFS/layout rows. Empty unless the cluster exports layout counters -
+    opstat never synthesises pNFS activity."""
+    if not PNFS_OPS_AVAILABLE:
+        return []
+    return _rows_with_pct(
+        PNFS_OPS_AVAILABLE,
+        lambda k: _nfs_op_metrics(state_values, k),
+    )
+
+
 def _build_session_rows(meta):
     """NFS4Common md_iops workload profile (instantaneous rates, no deltas)."""
     def _meta_metric(key):
@@ -573,10 +683,20 @@ def build_rows_from_results(
     state_result=None,
 ):
     global METRICS_SOURCE
-    nfs4_values, sample = _latest_row(data_result)
-    supplement_values, _ = _latest_row(supplement_result) if supplement_result else ({}, sample)
-    bw_values, _ = _latest_row(bw_result) if bw_result else ({}, sample)
-    meta_values, _ = _latest_row(meta_result) if meta_result else ({}, sample)
+    # Each family scores against its own props. One merged monitor carries
+    # all of them, and they do not fill the same sample bucket: on a real
+    # cluster only the NFSCommon bandwidth columns were populated in the
+    # newest cNode row while NfsMetrics landed in older ones.
+    nfs4_values, sample = _latest_row(data_result, build_data_monitor_props())
+    supplement_values, _ = (
+        _latest_row(supplement_result, build_supplement_monitor_props())
+        if supplement_result else ({}, sample))
+    bw_values, _ = (
+        _latest_row(bw_result, build_bw_monitor_props())
+        if bw_result else ({}, sample))
+    meta_values, _ = (
+        _latest_row(meta_result, build_meta_monitor_props())
+        if meta_result else ({}, sample))
     state_values, _ = _latest_row(state_result) if state_result else ({}, sample)
 
     data_rows = _rows_with_pct(
@@ -617,12 +737,14 @@ def build_rows_from_results(
     }
     stateful_rows = _build_stateful_rows(supplement_values)
     state_rows = _build_state_rows(state_values)
+    pnfs_rows = _build_pnfs_rows(state_values)
     session_rows = _build_session_rows(meta)
 
     return {
         "data": data_rows,
         "stateful": stateful_rows,
         "state": state_rows,
+        "pnfs": pnfs_rows,
         "session": session_rows,
         "meta": meta,
     }, sample
@@ -766,6 +888,26 @@ def _render_state_panel(rows, width):
         print(box_row(_simple_row_cells(row), width))
     if not active:
         print(box_row(c("No active OPEN/CLOSE/LOCK/session ops this sample.", _DIM), width))
+    print(box_bottom(width))
+
+
+def _render_pnfs_panel(rows, width):
+    """pNFS / layout activity. Only reached when the cluster exports it."""
+    titles = [
+        ("Operation", "label", "<"), ("Ops/s", "iops", ">"), ("", "throughput", ">"),
+        ("", "size", ">"), ("Latency", "latency", ">"),
+    ]
+    print(box_top(PNFS_PANEL_TITLE, width))
+    print(box_row(_table_header_titles(titles), width))
+    print(box_sep(width))
+    active = [r for r in rows if (as_float(r.get("ops_sec")) or 0) > 0]
+    for row in _sort_rows(active or rows):
+        print(box_row(_simple_row_cells(row), width))
+    if not active:
+        print(box_row(
+            c("No layout activity this sample (clients are not using pNFS).", _DIM),
+            width,
+        ))
     print(box_bottom(width))
 
 
@@ -1128,8 +1270,40 @@ def render_screen():
     vast_common.flush_frame(buf.getvalue())
 
 
+_NAV_CONTROLS = (
+    ("q", "Quit"),
+    ("o", "Ops"),
+    ("l", "Lat"),
+    ("n", "Name"),
+    ("c", "cNode"),
+    ("v", "View"),
+    ("t", "Tenant"),
+    ("x", "Exit drill"),
+    ("space", "Refresh"),
+)
+
+# Never let a narrow terminal collapse the frame to the point where the
+# controls vanish entirely; box_row truncates content to width - 4.
+_MIN_FRAME_WIDTH = 24
+
+
+def _frame_width():
+    return max(_MIN_FRAME_WIDTH,
+               min(shutil.get_terminal_size((120, 40)).columns, 120))
+
+
+def _render_nav_footer(width):
+    """Application navigation bar, shown in every mode including drill-downs."""
+    parts = []
+    for key, label in _NAV_CONTROLS:
+        if parts:
+            parts.append(c("|", _DIM))
+        parts.append(c(f"[{key}]", _BWHITE) + c(f" {label} ", _DIM))
+    print(box_row("".join(parts), width), flush=True)
+
+
 def _render_frame():
-    width = min(shutil.get_terminal_size((120, 40)).columns, 120)
+    width = _frame_width()
     title = (
         c("  VAST NFSv41", _BCYAN) + c(" opstat", _BWHITE) + c(f" v{VERSION}", _DIM)
         + f"   VMS {c(f'{VMS}:{PORT}', _BWHITE)}   cluster {c(CLUSTER_NAME, _BWHITE)}"
@@ -1137,95 +1311,193 @@ def _render_frame():
     )
     if DRILL_MODE:
         title += c(f"   | {DRILL_MODE.upper()} DRILL", _BYELLOW)
-    print(title)
+    # Header lines sit outside the box borders, so they must be truncated
+    # explicitly: an untruncated line wraps on a narrow terminal, shifting
+    # every row below it and corrupting the frame.
+    print(truncate_display(title, width))
     os_label = format_os_release(CLUSTER_OS)
-    print(c(
+    print(truncate_display(c(
         f"  sample {LAST_SAMPLE}   frame {API_TIME_FRAME}   source {METRICS_SOURCE}"
         + f"   sort {_sort_label()}"
         + (f"   {os_label}" if os_label else ""),
         _DIM,
-    ))
+    ), width))
     print()
+    # Body: drill panel or the cluster panels. The navigation footer below is
+    # rendered by this common path for every mode - a drill panel returning
+    # early used to take the footer with it, leaving drill modes with no
+    # visible controls at all.
     if DRILL_MODE:
         _render_drill_panel(width)
-        return
-    _render_health_panel(LAST_ROWS, width)
-    print()
-    _render_data_panel(LAST_ROWS["data"], width)
-    print()
-    if STATE_OPS_AVAILABLE:
-        _render_state_panel(LAST_ROWS["state"], width)
     else:
-        _render_stateful_panel(LAST_ROWS["stateful"], LAST_ROWS["meta"], width)
+        _render_health_panel(LAST_ROWS, width)
+        print()
+        _render_data_panel(LAST_ROWS["data"], width)
+        print()
+        if STATE_OPS_AVAILABLE:
+            _render_state_panel(LAST_ROWS["state"], width)
+        else:
+            _render_stateful_panel(LAST_ROWS["stateful"], LAST_ROWS["meta"], width)
+        print()
+        if PNFS_OPS_AVAILABLE:
+            _render_pnfs_panel(LAST_ROWS.get("pnfs", []), width)
+            print()
+        _render_session_panel(LAST_ROWS["session"], LAST_ROWS["meta"], width)
     print()
-    _render_session_panel(LAST_ROWS["session"], LAST_ROWS["meta"], width)
-    print()
-    print(box_row(
-        c("[q]", _BWHITE) + c(" Quit ", _DIM)
-        + c("|", _DIM) + c("[o]", _BWHITE) + c(" Ops ", _DIM)
-        + c("|", _DIM) + c("[l]", _BWHITE) + c(" Lat ", _DIM)
-        + c("|", _DIM) + c("[n]", _BWHITE) + c(" Name ", _DIM)
-        + c("|", _DIM) + c("[c]", _BWHITE) + c(" cNode ", _DIM)
-        + c("|", _DIM) + c("[v]", _BWHITE) + c(" View ", _DIM)
-        + c("|", _DIM) + c("[t]", _BWHITE) + c(" Tenant ", _DIM)
-        + c("|", _DIM) + c("[x]", _BWHITE) + c(" Exit drill ", _DIM)
-        + c("|", _DIM) + c("[space]", _BWHITE) + c(" Refresh", _DIM),
-        width,
-    ), flush=True)
+    _render_nav_footer(width)
+
+
+def _discovery_report_path():
+    safe = "".join(ch if ch.isalnum() or ch in ".-_" else "_" for ch in str(VMS))
+    return os.path.join("/tmp", f"opstat-nfs41-discovery-{safe}-{os.getpid()}.txt")
 
 
 def discover_metrics():
+    """Read-only survey of the NFSv4.1 telemetry this VMS actually exports.
+
+    Prints a short console summary and writes the full evidence (every
+    catalog name matching an NFSv4.1 concept, plus per-property monitor probe
+    results) to a file, so the report can be sent back for analysis without
+    scrolling a terminal. Creates only temporary monitors, each deleted
+    before the function returns.
+    """
     global CLUSTER_ID, CLUSTER_NAME
-    print(f"NFS v4.1 metric discovery - VMS {VMS}:{PORT}\n")
+
+    lines = []
+
+    def emit(text="", console=True):
+        lines.append(text)
+        if console:
+            print(text)
+
+    emit(f"NFS v4.1 metric discovery - VMS {VMS}:{PORT}")
     try:
         CLUSTER_ID, CLUSTER_NAME = get_current_cluster()
-        print(f"Cluster: {CLUSTER_NAME} (id={CLUSTER_ID})\n")
+        os_label = format_os_release(vast_common.get_current_cluster_os(api_request))
+        emit(f"Cluster: {CLUSTER_NAME} (id={CLUSTER_ID})  {os_label}")
     except RuntimeError as e:
         print(f"ERROR: Could not connect to VMS: {e}")
         sys.exit(1)
+    emit()
 
-    print("[ NFS4Common ProtoMetrics (data path - instantaneous rates) ]")
-    for suffix in (
-        "rd_iops", "wr_iops", "rd_bw", "wr_bw",
-        "read_latency__avg", "write_latency__avg",
-        "md_iops", "rd_md_iops", "wr_md_iops", "iops", "latency",
-    ):
-        print(f"  {_data_fqn(suffix)}")
-
-    print("\n[ NfsMetrics namespace/metadata ops (real, exported - rate + avg) ]")
-    for op in _SUPPLEMENT_DATA_OPS + _SUPPLEMENT_META_OPS:
-        print(f"  {_nfs_fqn(op, 'rate')} / __avg")
-    print(f"  {_COMMIT_WAIT_FQN}__avg  (server-side commit/durability wait)")
-    print("  Data fallback: nfs_{read,write}_latency__rate when NFS4Common IOPS are zero.")
-
-    print("\n[ Bandwidth fallback ]")
-    for prop in build_bw_monitor_props():
-        print(f"  {prop}")
-
-    print("\n[ State / locking / session ops (probed live from metric catalog) ]")
-    probed = probe_available_state_ops()
-    if probed is None:
-        print("  metric catalog unreadable - availability decided by monitor creation")
+    # -- 1. catalog ---------------------------------------------------------
+    names = vast_common.fetch_metric_catalog(api_request)
+    emit("[ 1. Metric catalog ]")
+    if not names:
+        emit("  /metrics/ unreadable or empty - falling back to monitor probes only")
     else:
-        available_keys = {op for op, _ in probed}
-        for op, label in STATE_PANEL_OPS:
-            status = "exported" if op in available_keys else "not exported"
-            print(f"  {label:<14} NfsMetrics,nfs_{op}_latency__rate / __avg - {status}")
-        if not probed:
-            print("  none exported → STATE panel falls back to NfsMetrics proxies")
-    print("  Fallback stateful panel: NfsMetrics proxies (GETATTR, LOOKUP, CREATE, REMOVE)")
-    print("  Session panel: NFS4Common md_iops / rd_md_iops / wr_md_iops")
+        families = {}
+        for name in names:
+            fam = vast_common.metric_family(name)
+            families[fam] = families.get(fam, 0) + 1
+        emit(f"  {len(names)} metric names across {len(families)} families")
+        for fam, count in sorted(families.items(), key=lambda kv: -kv[1]):
+            emit(f"    {fam:<28} {count}")
+    emit()
 
-    print("\n[ Drill-down endpoints ]")
+    # -- 2. concept scan ----------------------------------------------------
+    emit("[ 2. NFSv4.1 concept scan ]")
+    hits = concept_scan(names) if names else {}
+    if not names:
+        emit("  (skipped - no catalog)")
+    else:
+        for keyword in NFS41_CONCEPTS:
+            matched = hits.get(keyword, [])
+            emit(f"  {keyword:<12} {len(matched):>4} name(s)")
+            for name in matched:
+                lines.append(f"        {name}")          # file only
+        emit("  (full name lists are in the report file)")
+    emit()
+
+    # -- 3. per-op probe ----------------------------------------------------
+    emit("[ 3. NFSv4.1 operation probe (temporary monitors, then deleted) ]")
+    candidates = []
+    for _group, ops in DISCOVERY_OP_GROUPS:
+        for op, _label in ops:
+            candidates.extend(op_name_candidates(op))
+    # Probe only spellings the catalog knows about when we have one; a full
+    # blind sweep is what the no-catalog path is for.
+    to_probe = [p for p in candidates if p in names] if names else candidates
+    supported, _rejected = probe_prop_support(sorted(set(to_probe)))
+    supported_set = set(supported)
+    for group, ops in DISCOVERY_OP_GROUPS:
+        emit(f"  -- {group} --")
+        for op, label in ops:
+            hit = [p for p in op_name_candidates(op) if p in supported_set]
+            in_catalog = bool(names) and _catalog_exports_op(names, op)
+            if hit:
+                emit(f"    {label:<14} QUERYABLE   {hit[0]}")
+                for extra in hit[1:]:
+                    lines.append(f"                                {extra}")
+            elif in_catalog:
+                emit(f"    {label:<14} in catalog, not queryable under known names")
+            else:
+                emit(f"    {label:<14} not exported")
+    emit()
+
+    # -- 4. families that already work --------------------------------------
+    emit("[ 4. Families in use today ]")
+    for label, props in (
+        ("NFS4Common data path", build_data_monitor_props()),
+        ("NfsMetrics supplement", build_supplement_monitor_props()[:4]),
+        ("NFSCommon bandwidth", build_bw_monitor_props()),
+        ("NFS4Common session/md", build_meta_monitor_props()),
+    ):
+        ok, bad = probe_prop_support(list(props))
+        emit(f"  {label:<24} {len(ok)}/{len(ok) + len(bad)} queryable")
+        for prop in bad:
+            lines.append(f"        rejected: {prop}")
+    emit()
+
+    # -- 5. object-scope support -------------------------------------------
+    emit("[ 5. Object scopes ]")
     for mode, cfg in _DRILL_CFG.items():
         try:
             objects = normalize_list_response(api_request("GET", cfg["endpoint"]))
-            print(f"  {mode:<8} {cfg['endpoint']:<12} {len(objects)} object(s)")
+            count = len(objects)
         except RuntimeError as e:
-            print(f"  {mode:<8} {cfg['endpoint']:<12} error: {e}")
+            emit(f"  {mode:<8} {cfg['endpoint']:<12} error: {e}")
+            continue
+        probe_ids = [o["id"] for o in objects[:4] if "id" in o]
+        status = "no objects"
+        if probe_ids:
+            monitor_id = None
+            try:
+                monitor_id = _create_monitor_raw(
+                    f"discover_{mode}", build_drill_prop_list(mode),
+                    cfg["object_type"], probe_ids,
+                    no_aggregation=cfg.get("no_aggregation", False),
+                )
+                result = api_request("GET", f"/monitors/{monitor_id}/query/")
+                returned = set(result.get("prop_list", []) or [])
+                metrics = [p for p in returned if "," in p]
+                rows = len(result.get("data", []) or [])
+                status = (f"{len(metrics)}/{len(build_drill_prop_list(mode))} props, "
+                          f"{rows} rows, object_id={'yes' if 'object_id' in returned else 'no'}")
+            except RuntimeError as e:
+                status = f"monitor rejected: {str(e)[:70]}"
+            finally:
+                if monitor_id is not None:
+                    delete_monitor(monitor_id)
+        emit(f"  {mode:<8} {cfg['endpoint']:<12} {count:>4} object(s)  {status}")
+    emit()
 
-    print("\nPoll semantics: VMS delivers instantaneous rates (__rate, rd_iops) and")
-    print("pre-averaged fields (__avg). No counter-delta engine is used in nfs_v41.")
+    emit("[ 6. Summary ]")
+    populated = [label for group, ops in DISCOVERY_OP_GROUPS for op, label in ops
+                 if any(p in supported_set for p in op_name_candidates(op))]
+    if populated:
+        emit(f"  Native v4.1 ops available: {', '.join(populated)}")
+    else:
+        emit("  No native v4.1 state/session/layout ops are queryable on this build;")
+        emit("  the dashboard falls back to NfsMetrics namespace counters.")
+
+    path = _discovery_report_path()
+    try:
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(lines) + "\n")
+        print(f"\nFull report written to {path}")
+    except OSError as e:
+        print(f"\nCould not write report file: {e}")
 
 
 setup_keyboard = vast_common.setup_keyboard
@@ -1254,27 +1526,39 @@ def signal_handler(_signum, _frame):
     sys.exit(0)
 
 
-def _init_state_monitor(candidates=None):
+def _ops_present(ops, returned_props):
+    """Keep only ops whose counters VMS actually echoed in a query prop_list."""
+    return [(op, label) for op, label in ops
+            if any(_nfs_fqn(op, kind) in returned_props for kind in ("rate", "avg"))]
+
+
+def _init_state_monitor(candidates=None, pnfs=None):
     """Create the state/locking/session monitor from whatever the cluster exports.
 
     Uses the metric catalog to trim candidates, then verifies by creating the
     monitor. On any failure the feature is disabled and the classic NfsMetrics
     proxy panel is shown instead - never breaking the dashboard.
     """
-    global STATE_MONITOR_ID, STATE_OPS_AVAILABLE
+    global STATE_MONITOR_ID, STATE_OPS_AVAILABLE, PNFS_OPS_AVAILABLE
     if candidates is None:
         candidates = probe_available_state_ops()
     if candidates is None:            # catalog unreadable - try the full set
         candidates = STATE_PANEL_OPS
-    if not candidates:
-        STATE_OPS_AVAILABLE = []
+    if pnfs is None:
+        pnfs = PNFS_OPS
+    wanted = list(candidates) + list(pnfs)
+    if not wanted:
+        STATE_OPS_AVAILABLE = PNFS_OPS_AVAILABLE = []
         return
     try:
-        STATE_MONITOR_ID = create_monitor("state", build_state_monitor_props(candidates))
-        STATE_OPS_AVAILABLE = candidates
+        STATE_MONITOR_ID = create_monitor("state", build_state_monitor_props(wanted))
+        result = api_request("GET", f"/monitors/{STATE_MONITOR_ID}/query/")
+        returned = set(result.get("prop_list", []) or []) if isinstance(result, dict) else set()
+        STATE_OPS_AVAILABLE = _ops_present(candidates, returned)
+        PNFS_OPS_AVAILABLE = _ops_present(pnfs, returned)
     except RuntimeError:
         STATE_MONITOR_ID = None
-        STATE_OPS_AVAILABLE = []
+        STATE_OPS_AVAILABLE = PNFS_OPS_AVAILABLE = []
 
 
 def create_headline_monitors():
@@ -1289,7 +1573,7 @@ def create_headline_monitors():
     falls back to the historical five split monitors.
     """
     global DATA_MONITOR_ID, SUPPLEMENT_MONITOR_ID, BW_MONITOR_ID, META_MONITOR_ID
-    global STATE_MONITOR_ID, STATE_OPS_AVAILABLE
+    global STATE_MONITOR_ID, STATE_OPS_AVAILABLE, PNFS_OPS_AVAILABLE
 
     data_props = build_data_monitor_props()
     supplement_props = build_supplement_monitor_props()
@@ -1297,16 +1581,27 @@ def create_headline_monitors():
     meta_props = build_meta_monitor_props()
     core_groups = (data_props, supplement_props, bw_props, meta_props)
 
-    state_candidates = probe_available_state_ops()
-    trial_candidates = STATE_PANEL_OPS if state_candidates is None else state_candidates
+    # One catalog read decides both the state and the pNFS candidate sets;
+    # both ride in the merged headline monitor, so neither costs an extra
+    # query per refresh. Nothing is rendered for an op the cluster does not
+    # actually return in the monitor's prop_list.
+    catalog = vast_common.fetch_metric_catalog(api_request)
+    if catalog:
+        state_candidates = probe_available_state_ops(catalog, STATE_PANEL_OPS)
+        pnfs_candidates = probe_available_state_ops(catalog, PNFS_OPS)
+    else:
+        state_candidates = pnfs_candidates = None
+    trial_state = STATE_PANEL_OPS if state_candidates is None else state_candidates
+    trial_pnfs = PNFS_OPS if pnfs_candidates is None else pnfs_candidates
     state_props = (
-        build_state_monitor_props(trial_candidates) if trial_candidates else []
+        build_state_monitor_props(trial_state + trial_pnfs)
+        if (trial_state or trial_pnfs) else []
     )
 
     # Try merged including state props, then merged without them (state
     # metrics are the most build-dependent), then the classic split layout.
-    for attempt_state_props, attempt_candidates in (
-        (state_props, trial_candidates),
+    for attempt_state_props, _attempt_candidates in (
+        (state_props, trial_state),
         ([], []),
     ):
         merged_props = [p for group in core_groups for p in group] + attempt_state_props
@@ -1323,10 +1618,12 @@ def create_headline_monitors():
                 BW_MONITOR_ID = META_MONITOR_ID = merged_id
                 if attempt_state_props and any(p in returned for p in attempt_state_props):
                     STATE_MONITOR_ID = merged_id
-                    STATE_OPS_AVAILABLE = attempt_candidates
+                    STATE_OPS_AVAILABLE = _ops_present(trial_state, returned)
+                    PNFS_OPS_AVAILABLE = _ops_present(trial_pnfs, returned)
                 else:
                     STATE_MONITOR_ID = None
                     STATE_OPS_AVAILABLE = []
+                    PNFS_OPS_AVAILABLE = []
                 return
             delete_monitor(merged_id)
         except RuntimeError:
@@ -1338,7 +1635,7 @@ def create_headline_monitors():
     SUPPLEMENT_MONITOR_ID = create_monitor("supplement", supplement_props)
     BW_MONITOR_ID = create_monitor("bw", bw_props)
     META_MONITOR_ID = create_monitor("meta", meta_props)
-    _init_state_monitor(candidates=state_candidates)
+    _init_state_monitor(candidates=state_candidates, pnfs=pnfs_candidates)
 
 
 def main():

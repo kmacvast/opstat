@@ -261,6 +261,76 @@ def get_current_cluster_os(request_fn):
 
 
 # ---------------------------------------------------------------------------
+# Metric catalog
+# ---------------------------------------------------------------------------
+def collect_metric_names(obj):
+    """Recursively gather every string in a catalog response (schema-agnostic).
+
+    VMS builds disagree about the shape of /metrics/ (a bare list, {results:
+    [...]}, dicts keyed by family, entries with a "metric" or "name" field),
+    so walk the whole structure rather than guessing a schema.
+    """
+    names = set()
+    stack = [obj]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, str):
+            names.add(node)
+        elif isinstance(node, dict):
+            stack.extend(node.values())
+        elif isinstance(node, (list, tuple)):
+            stack.extend(node)
+    return names
+
+
+def fetch_metric_catalog(request_fn, max_pages=20):
+    """Return the set of metric names VMS advertises, following pagination.
+
+    Read-only and best-effort: returns an empty set when the catalog cannot
+    be read, so callers can fall back to probing monitors directly.
+    """
+    names = set()
+    path = "/metrics/"
+    for _page in range(max_pages):
+        try:
+            payload = request_fn("GET", path)
+        except RuntimeError:
+            break
+        if payload is None:
+            break
+        names |= collect_metric_names(payload)
+        nxt = payload.get("next") if isinstance(payload, dict) else None
+        if not nxt or not isinstance(nxt, str):
+            break
+        # VMS returns either an absolute URL or a path; keep only the path
+        # so the shared transport's base URL still applies.
+        marker = "/api"
+        path = nxt[nxt.index(marker) + len(marker):] if marker in nxt else nxt
+    return filter_metric_names(names)
+
+
+def filter_metric_names(names):
+    """Keep only strings shaped like metric FQNs.
+
+    The recursive walk also picks up descriptions, URLs and enum values.
+    A metric identifier always carries a ``family,`` prefix and never
+    contains whitespace, which is enough to separate them from prose that
+    happens to contain a comma.
+    """
+    return {
+        n for n in names
+        if "," in n and not n.startswith(("http", "/")) and not any(
+            ch.isspace() for ch in n
+        )
+    }
+
+
+def metric_family(name):
+    """The family prefix of a metric FQN (text before the first comma)."""
+    return str(name).split(",", 1)[0]
+
+
+# ---------------------------------------------------------------------------
 # Monitor sample selection
 # ---------------------------------------------------------------------------
 # Columns that are always populated and so carry no information about how
@@ -301,11 +371,25 @@ def latest_complete_row(data, metric_indexes):
     return best
 
 
-def latest_complete_values(data, prop_idx):
-    """Return (values_by_prop_name, sample_timestamp) for the newest usable row."""
+def latest_complete_values(data, prop_idx, prop_names=None):
+    """Return (values_by_prop_name, sample_timestamp) for the newest usable row.
+
+    ``prop_names`` restricts which columns decide "most populated". This
+    matters whenever one monitor carries several metric families: on a real
+    cluster the newest cNode bucket had *only* the two NFSCommon bandwidth
+    props filled in, while the 44 NfsMetrics props landed in older buckets.
+    Scoring across everything therefore picked an NfsMetrics-rich row whose
+    bandwidth columns were null, and bandwidth rendered as "-". Each consumer
+    scores against the props it actually reads, so every family gets the
+    newest row that carries *it*.
+    """
     if not data:
         return {}, "-"
-    row = latest_complete_row(data, metric_column_indexes(prop_idx))
+    if prop_names:
+        indexes = [prop_idx[n] for n in prop_names if n in prop_idx]
+    else:
+        indexes = metric_column_indexes(prop_idx)
+    row = latest_complete_row(data, indexes)
     if row is None:
         return {}, "-"
     values = {name: row[idx] for name, idx in prop_idx.items() if idx < len(row)}

@@ -449,6 +449,52 @@ def test_bounding_samples_requires_all_columns_populated():
     assert vast_common.bounding_samples(data, 1, 2) == (None, None)
 
 
+def test_bandwidth_survives_a_monitor_that_mixes_metric_families():
+    """Regression: merging the RPC and bandwidth monitors made both extractors
+    score row completeness across *all* props. A real cNode monitor returned
+
+        newest row: only ProtoMetrics,NFSCommon rd_bw/wr_bw populated
+        older rows: the 44 NfsMetrics op props populated, bandwidth null
+
+    so the shared winner was an NfsMetrics-rich row with null bandwidth, and
+    GB/s rendered as "-" in the health panel, the COMBINED footer and the
+    cNode drill. Each family must score against its own props."""
+    import nfs_v3
+
+    rpc_props = nfs_v3.build_rpc_prop_list()
+    bw_props = nfs_v3.build_bw_prop_list()
+    prop_list = ["timestamp"] + rpc_props + bw_props
+    n_rpc = len(rpc_props)
+
+    newest = ["t2"] + [None] * n_rpc + [4.0e9, 2.0e9]   # only bandwidth landed
+    older = ["t1"] + [5.0] * n_rpc + [None, None]       # only RPC props landed
+    result = {"prop_list": prop_list, "data": [newest, older]}
+
+    rows, _sample = nfs_v3.build_rpc_rows_from_single_sample(result)
+    assert any(r["ops_sec"] == 5.0 for r in rows), "RPC rates lost"
+
+    read_gbs, write_gbs = nfs_v3.extract_bw_from_single_sample(result)
+    assert read_gbs == pytest.approx(4.0), "read bandwidth lost to the mixed scoring"
+    assert write_gbs == pytest.approx(2.0), "write bandwidth lost to the mixed scoring"
+
+
+def test_v41_bandwidth_survives_the_merged_headline_monitor():
+    """Same defect, NFSv4.1 side: five prop families share one monitor."""
+    import nfs_v41
+
+    bw_props = nfs_v41.build_bw_monitor_props()
+    data_props = nfs_v41.build_data_monitor_props()
+    prop_list = ["timestamp"] + data_props + bw_props
+    newest = ["t2"] + [None] * len(data_props) + [4.0e6, 2.0e6]
+    older = ["t1"] + [7.0] * len(data_props) + [None, None]
+    result = {"prop_list": prop_list, "data": [newest, older]}
+
+    bw_values, _sample = nfs_v41._latest_row(result, bw_props)
+    assert bw_values[bw_props[0]] == pytest.approx(4.0e6)
+    data_values, _sample = nfs_v41._latest_row(result, data_props)
+    assert data_values[data_props[0]] == pytest.approx(7.0)
+
+
 def test_coverage_fraction_refuses_incomparable_scopes():
     import vast_drill
 

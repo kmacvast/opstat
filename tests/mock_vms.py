@@ -88,6 +88,38 @@ _ACTIVE_TENANT_IDS = {TENANTS[i]["id"]: rank
                       for rank, i in enumerate(_ACTIVE_TENANT_INDEXES)}
 
 
+# Metric names a VAST build advertises via /metrics/. The default set models
+# a cluster that exports NFSv4.1 state/session counters but no pNFS/layout
+# telemetry, which is the interesting case for discovery.
+_CATALOG_STATE_OPS = (
+    "open", "close", "open_downgrade", "lock", "locku", "lockt",
+    "release_lockowner", "delegreturn", "sequence", "exchange_id",
+    "create_session", "destroy_session", "reclaim_complete",
+)
+_CATALOG_V3_OPS = (
+    "read", "write", "getattr", "setattr", "lookup", "access", "readdir",
+    "readdirplus", "create", "remove", "rename", "mkdir", "rmdir", "link",
+    "symlink", "readlink", "commit",
+)
+DEFAULT_CATALOG = (
+    [f"NfsMetrics,nfs_{op}_latency__rate" for op in _CATALOG_V3_OPS]
+    + [f"NfsMetrics,nfs_{op}_latency__avg" for op in _CATALOG_V3_OPS]
+    + [f"NfsMetrics,nfs_{op}_latency__rate" for op in _CATALOG_STATE_OPS]
+    + [f"NfsMetrics,nfs_{op}_latency__avg" for op in _CATALOG_STATE_OPS]
+    + [
+        "ProtoMetrics,proto_name=NFS4Common,rd_iops",
+        "ProtoMetrics,proto_name=NFS4Common,wr_iops",
+        "ProtoMetrics,proto_name=NFS4Common,md_iops",
+        "ProtoMetrics,proto_name=NFSCommon,rd_bw",
+        "ProtoMetrics,proto_name=NFSCommon,wr_bw",
+        "ProtoMetrics,proto_name=SMBCommon,md_iops",
+        "ProtoMetrics,proto_name=S3Common,rd_bw",
+        "ViewMetrics,read_iops__rate",
+        "TenantMetrics,read_iops__sum",
+    ]
+)
+
+
 def _activity_scale(prop, object_id):
     """Per-object activity multiplier for object-scoped metric families.
 
@@ -154,6 +186,9 @@ class _State:
         self.max_object_ids = None
         # Serve /monitors/topn/ (some builds/permissions do not).
         self.topn_enabled = True
+        # Metric names /metrics/ advertises. Defaults model a build that
+        # exports v4.1 state/session counters but no pNFS/layout telemetry.
+        self.catalog = set(DEFAULT_CATALOG)
         self.latency_s = 0.0
         self.t0 = time.time()
 
@@ -224,18 +259,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._send(simple[path])
 
         if path == "/api/metrics/":
-            state_ops = (
-                "open", "close", "lock", "locku", "sequence",
-                "delegreturn", "exchange_id", "create_session",
-            )
-            return self._send({"data": [
-                {"metric": "NfsMetrics,nfs_read_latency__rate"},
-                {"metric": "SMBCommon,md_iops"},
-                {"metric": "S3Common,rd_bw"},
-            ] + [
-                {"metric": f"NfsMetrics,nfs_{op}_latency__rate"}
-                for op in state_ops
-            ]})
+            entries = [{"metric": m} for m in sorted(self.state.catalog)]
+            return self._send({"data": entries})
 
         if path == "/api/openfilehandles/":
             return self._send({"results": [

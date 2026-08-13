@@ -812,7 +812,10 @@ def build_rpc_rows_from_single_sample(result):
     _prop_list, data, prop_idx = _result_parts(result)
     if not data:
         return [], "-"
-    selected_row, selected_sample = select_latest_complete_row(data, prop_idx, _prop_list)
+    # Score only the RPC props: a merged headline monitor also carries the
+    # ProtoMetrics bandwidth columns, which publish on a different cadence.
+    selected_row, selected_sample = select_latest_complete_row(
+        data, prop_idx, build_rpc_prop_list())
     rows = []
     for op, label in OPS:
         names = metric_names_for_op(op)
@@ -860,7 +863,9 @@ def extract_bw_from_single_sample(result):
     _prop_list, data, prop_idx = _result_parts(result)
     if not data:
         return None, None
-    selected_row, _sample = select_latest_complete_row(data, prop_idx, _prop_list)
+    # Score only the bandwidth props - see build_rpc_rows_from_single_sample.
+    selected_row, _sample = select_latest_complete_row(
+        data, prop_idx, build_bw_prop_list())
     return (
         raw_bw_to_gb_sec(metric_value_from_row(selected_row, prop_idx, NFS_READ_BW_FQN)),
         raw_bw_to_gb_sec(metric_value_from_row(selected_row, prop_idx, NFS_WRITE_BW_FQN)),
