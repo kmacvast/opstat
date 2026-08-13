@@ -110,6 +110,16 @@ DEFAULT_CATALOG = (
         "ProtoMetrics,proto_name=NFS4Common,rd_iops",
         "ProtoMetrics,proto_name=NFS4Common,wr_iops",
         "ProtoMetrics,proto_name=NFS4Common,md_iops",
+    ]
+    # VAST OS 5.5.0.1 publishes a full statistical surface beside every
+    # ProtoMetrics gauge; opstat reads only __avg unless told otherwise.
+    + [
+        f"ProtoMetrics,proto_name=NFS4Common,{base}{suffix}"
+        for base in ("read_latency", "write_latency", "read_size", "write_size")
+        for suffix in ("__avg", "__max", "__std", "__rate", "__time_avg",
+                       "__num_samples", "__sum", "__sum_squares")
+    ]
+    + [
         "ProtoMetrics,proto_name=NFSCommon,rd_bw",
         "ProtoMetrics,proto_name=NFSCommon,wr_bw",
         "ProtoMetrics,proto_name=SMBCommon,md_iops",
@@ -150,6 +160,13 @@ def _metric_value(prop, seed, t, object_id=None):
         return round(base * 1_000_000.0 + t * base * 20.0 * scale, 1)
     if scale == 0.0:
         return 0.0
+    # Keep a gauge's statistical variants mutually consistent: max above
+    # average, std a fraction of it. Independent values made the derived
+    # distribution panel show a max below its own average.
+    if "__max" in prop:
+        return round(base * 3.0 * wobble * 2.5, 3)
+    if "__std" in prop:
+        return round(base * 3.0 * wobble * 0.3, 3)
     if "latency" in prop and "__avg" in prop:
         return round(base * 3.0 * wobble, 3)
     if "_bw" in prop or "bw__" in prop:

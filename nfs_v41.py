@@ -165,6 +165,18 @@ _OP_NAME_PATTERNS = (
     "NfsMetrics,nfs4_{op}",
 )
 
+# Statistical variants VMS publishes alongside a ProtoMetrics gauge. opstat
+# uses only __avg today; the others carry tail latency and request-size
+# spread, which the catalog on VAST OS 5.5.0.1 confirms exist.
+_STAT_SUFFIXES = ("__avg", "__max", "__std", "__rate", "__time_avg",
+                  "__num_samples", "__sum", "__sum_squares")
+_DISTRIBUTION_BASES = ("read_latency", "write_latency", "read_size", "write_size")
+
+# Families worth dumping in full: everything NFS-related, including ones
+# opstat does not read today.
+INVENTORY_FAMILIES = ("NfsMetrics", "NfsSampledMetrics", "ProtoMetrics")
+INVENTORY_PROTO_NAMES = ("NFS4Common", "NFSCommon")
+
 # Concept keywords used to sweep the metric catalog for anything v4.1-ish.
 NFS41_CONCEPTS = (
     "nfs4", "nfsv4", "session", "sequence", "exchange", "open", "close",
@@ -229,10 +241,11 @@ SUPPLEMENT_MONITOR_ID = BW_MONITOR_ID = None
 STATE_MONITOR_ID = None
 STATE_OPS_AVAILABLE = []   # (op, label) pairs the cluster actually exports
 PNFS_OPS_AVAILABLE = []    # pNFS/layout ops, only when VMS exports them
+DISTRIBUTION_AVAILABLE = []  # (base, label) pairs whose __max/__std VMS returns
 METRICS_SOURCE = "NFS4Common"
 SORT_MODE = "default"   # default | ops | latency
 LAST_ROWS = {"data": [], "stateful": [], "state": [], "pnfs": [],
-             "session": [], "meta": {}}
+             "distribution": [], "session": [], "meta": {}}
 LAST_SAMPLE = "-"
 DRILL_MODE = DRILL_ERROR = None
 DRILL_OBJECTS = []
@@ -394,6 +407,29 @@ def build_meta_monitor_props():
     ]
 
 
+DISTRIBUTION_PANEL_TITLE = "LATENCY & REQUEST SIZE DISTRIBUTION (NFS4Common)"
+
+# VMS publishes a full statistical surface beside each ProtoMetrics gauge.
+# opstat historically read only __avg, discarding tail latency and spread
+# that the cluster already computes - confirmed present on VAST OS 5.5.0.1.
+DISTRIBUTION_BASES = (
+    ("read_latency", "READ latency", "latency"),
+    ("write_latency", "WRITE latency", "latency"),
+    ("read_size", "READ size", "size"),
+    ("write_size", "WRITE size", "size"),
+)
+DISTRIBUTION_SUFFIXES = ("__avg", "__max", "__std")
+
+
+def build_distribution_props(bases=None):
+    """NFS4Common avg/max/std props for the latency and size distributions."""
+    return [
+        f"{_NFS4},{base}{suffix}"
+        for base, _label, _kind in (bases or DISTRIBUTION_BASES)
+        for suffix in DISTRIBUTION_SUFFIXES
+    ]
+
+
 def build_state_monitor_props(ops):
     """NfsMetrics rate/avg props for the given stateful/session/delegation ops."""
     props = []
@@ -426,20 +462,42 @@ def op_name_candidates(op):
 
 
 def _catalog_exports_op(names, op):
-    """True when the catalog contains any known spelling of *op*'s counters.
+    """True when the catalog contains an NFSv4-style counter for *op*.
 
-    Matching on the op token alone (rather than one hard-coded suffix) means
-    a build that publishes ``nfs_open_ops`` instead of ``nfs_open_latency``
-    is still detected. The token is bounded by underscores so ``lock`` does
-    not match ``release_lockowner`` and inflate the result.
+    The op must appear as a whole token behind an ``nfs_``/``nfs4_`` prefix.
+    Loose substring matching produced false positives on a real 5.5.0.1
+    catalog: ``NfsMetrics,nfs3_open_file_handle_cnt`` was reported as an
+    NFSv4 OPEN counter, and ``nfs3_smb_interop_handles_closed`` as CLOSE.
+    Requiring the ``nfs_``/``nfs4_`` prefix excludes the v3/SMB-interop
+    counters, and anchoring on ``_latency`` (or end of name, for bare
+    counters like ``nfs_null``) stops ``nfs_open_`` matching
+    ``nfs_open_downgrade_latency``.
     """
-    tokens = (f"_{op}_", f"_{op}")
-    for name in names:
-        lowered = name.lower()
-        if any(lowered.endswith(t) or t + "_" in lowered or t in lowered
-               for t in tokens):
-            return True
+    for prefix in ("nfs", "nfs4"):
+        bare = f"{prefix}_{op}"
+        latency = f"{prefix}_{op}_latency"
+        for name in names:
+            lowered = name.lower()
+            if latency in lowered or lowered.endswith(bare) or f"{bare}," in lowered:
+                return True
     return False
+
+
+def _name_tokens(name):
+    """Split a metric FQN into lowercase alphanumeric tokens."""
+    return [t for t in re.split(r"[^a-z0-9]+", name.lower()) if t]
+
+
+def _matches_concept(name, keyword):
+    """True when any token of *name* starts with *keyword*.
+
+    Plain substring matching swamped the report: ``lock`` matched every one
+    of the 382 ``BlockMetrics`` names through the "b-lock" substring, 431 of
+    434 hits being noise. Token-prefix matching keeps the useful behavior
+    (``deleg`` finds ``delegreturn``, ``nfs4`` finds ``NFS4Common``) without
+    it.
+    """
+    return any(token.startswith(keyword) for token in _name_tokens(name))
 
 
 def probe_available_state_ops(names=None, ops=None):
@@ -467,7 +525,7 @@ def concept_scan(names):
     """
     hits = {}
     for keyword in NFS41_CONCEPTS:
-        matched = sorted(n for n in names if keyword in n.lower())
+        matched = sorted(n for n in names if _matches_concept(n, keyword))
         if matched:
             hits[keyword] = matched
     return hits
@@ -649,6 +707,20 @@ def _build_pnfs_rows(state_values):
     )
 
 
+def _build_distribution_rows(values):
+    """avg/max/std rows for whichever distributions the cluster returned."""
+    rows = []
+    for base, label, kind in DISTRIBUTION_AVAILABLE:
+        rows.append({
+            "label": label,
+            "kind": kind,
+            "avg": as_float(values.get(f"{_NFS4},{base}__avg")),
+            "max": as_float(values.get(f"{_NFS4},{base}__max")),
+            "std": as_float(values.get(f"{_NFS4},{base}__std")),
+        })
+    return rows
+
+
 def _build_session_rows(meta):
     """NFS4Common md_iops workload profile (instantaneous rates, no deltas)."""
     def _meta_metric(key):
@@ -738,6 +810,9 @@ def build_rows_from_results(
     stateful_rows = _build_stateful_rows(supplement_values)
     state_rows = _build_state_rows(state_values)
     pnfs_rows = _build_pnfs_rows(state_values)
+    distribution_rows = _build_distribution_rows(
+        _latest_row(data_result, build_distribution_props())[0]
+        if DISTRIBUTION_AVAILABLE else {})
     session_rows = _build_session_rows(meta)
 
     return {
@@ -745,6 +820,7 @@ def build_rows_from_results(
         "stateful": stateful_rows,
         "state": state_rows,
         "pnfs": pnfs_rows,
+        "distribution": distribution_rows,
         "session": session_rows,
         "meta": meta,
     }, sample
@@ -865,8 +941,13 @@ def _render_stateful_panel(rows, meta, width):
     for row in _sort_rows(shown):
         print(box_row(_simple_row_cells(row), width))
     cw_text, _ = format_latency_us(meta.get("commit_wait_us"))
+    # Be explicit about the ceiling: VAST OS 5.5.0.1 exports no NFSv4.1
+    # protocol-state counters at all (no session/sequence/exchange/open/lock/
+    # delegation/layout metrics exist in its catalog), so these rows are
+    # NFS-generic namespace operations, not v4.1 state machinery.
     note = (
-        "Real NfsMetrics ops (OPEN/CLOSE/LOCK unexported on this build) - "
+        "This VMS build exports no NFSv4.1 state/session/layout counters; "
+        "showing NfsMetrics namespace ops - "
         f"md_iops {format_iops(meta.get('md_iops'))}   commit-wait {cw_text}"
     )
     print(box_row(c(note, _DIM), width))
@@ -911,6 +992,44 @@ def _render_pnfs_panel(rows, width):
     print(box_bottom(width))
 
 
+def _format_distribution_value(value, kind):
+    if value is None:
+        return "-"
+    text, _ = (format_latency_us(value) if kind == "latency"
+               else format_block_size(value))
+    return text
+
+
+def _render_distribution_panel(rows, width):
+    """Tail latency and request-size spread, straight from NFS4Common.
+
+    VMS computes avg/max/std per sample window; opstat previously read only
+    the average, so a workload with a long tail looked identical to a steady
+    one.
+    """
+    titles = [
+        ("Metric", "label", "<"), ("Average", "iops", ">"),
+        ("Max", "throughput", ">"), ("Std dev", "size", ">"), ("", "latency", ">"),
+    ]
+    print(box_top(DISTRIBUTION_PANEL_TITLE, width))
+    print(box_row(_table_header_titles(titles), width))
+    print(box_sep(width))
+    for row in rows:
+        kind = row["kind"]
+        has_data = row["avg"] is not None or row["max"] is not None
+        print(box_row(join_columns([
+            _label_cell(row["label"], _COL["label"], _BWHITE if has_data else _DIM),
+            _metric_cell(_format_distribution_value(row["avg"], kind),
+                         _COL["iops"], _BGREEN if has_data else _DIM),
+            _metric_cell(_format_distribution_value(row["max"], kind),
+                         _COL["throughput"], _YELLOW if has_data else _DIM),
+            _metric_cell(_format_distribution_value(row["std"], kind),
+                         _COL["size"], _CYAN if has_data else _DIM),
+            _dash(_COL["latency"]),
+        ], _COL_SEP), width))
+    print(box_bottom(width))
+
+
 def _session_summary_line(meta):
     md = format_iops(meta.get("md_iops"))
     rd = format_iops(meta.get("rd_md_iops"))
@@ -935,8 +1054,13 @@ def _render_session_panel(rows, meta, width):
     for row in rows:
         print(box_row(_simple_row_cells(row), width))
     lat_text, _ = format_latency_us(meta.get("latency_us"))
+    # Only claim SEQUENCE is missing when it really is: the state panel shows
+    # it whenever the cluster exports it, and the two must not disagree.
+    sequence_shown = any(op == "sequence" for op, _label in STATE_OPS_AVAILABLE)
+    lead = ("NFS4Common metadata workload profile" if sequence_shown
+            else "SEQUENCE unexported on this VMS - NFS4Common metadata workload profile")
     note = (
-        "SEQUENCE unexported on this VMS - NFS4Common metadata workload profile "
+        f"{lead} "
         f"(cluster latency {lat_text})"
     )
     print(box_row(c(note, _DIM), width))
@@ -1342,6 +1466,9 @@ def _render_frame():
         if PNFS_OPS_AVAILABLE:
             _render_pnfs_panel(LAST_ROWS.get("pnfs", []), width)
             print()
+        if DISTRIBUTION_AVAILABLE:
+            _render_distribution_panel(LAST_ROWS.get("distribution", []), width)
+            print()
         _render_session_panel(LAST_ROWS["session"], LAST_ROWS["meta"], width)
     print()
     _render_nav_footer(width)
@@ -1482,7 +1609,41 @@ def discover_metrics():
         emit(f"  {mode:<8} {cfg['endpoint']:<12} {count:>4} object(s)  {status}")
     emit()
 
-    emit("[ 6. Summary ]")
+    # -- 6. statistical surface ---------------------------------------------
+    emit("[ 6. NFS4Common statistical surface ]")
+    dist_props = [
+        f"{_NFS4},{base}{suffix}"
+        for base in _DISTRIBUTION_BASES for suffix in _STAT_SUFFIXES
+    ]
+    in_catalog = [p for p in dist_props if not names or p in names]
+    dist_ok, _dist_bad = probe_prop_support(in_catalog)
+    dist_ok_set = set(dist_ok)
+    for base in _DISTRIBUTION_BASES:
+        usable = [s for s in _STAT_SUFFIXES
+                  if f"{_NFS4},{base}{s}" in dist_ok_set]
+        emit(f"  {base:<16} queryable: {', '.join(usable) if usable else 'none'}")
+    emit()
+
+    # -- 7. full inventory of NFS-related families ---------------------------
+    emit("[ 7. NFS family inventory ]")
+    inventory = {}
+    for name in names:
+        family = vast_common.metric_family(name)
+        if family not in INVENTORY_FAMILIES:
+            continue
+        if family == "ProtoMetrics" and not any(
+                p in name for p in INVENTORY_PROTO_NAMES):
+            continue
+        inventory.setdefault(family, []).append(name)
+    if not inventory:
+        emit("  (no catalog to inventory)")
+    for family, entries in sorted(inventory.items()):
+        emit(f"  {family:<20} {len(entries)} name(s) - full list in report file")
+        for entry in sorted(entries):
+            lines.append(f"        {entry}")
+    emit()
+
+    emit("[ 8. Summary ]")
     populated = [label for group, ops in DISCOVERY_OP_GROUPS for op, label in ops
                  if any(p in supported_set for p in op_name_candidates(op))]
     if populated:
@@ -1524,6 +1685,21 @@ def cleanup():
 def signal_handler(_signum, _frame):
     cleanup()
     sys.exit(0)
+
+
+def _distributions_present(returned_props):
+    """Keep distributions whose avg or max VMS actually echoed back.
+
+    Catalog presence is not enough: on a real cluster OPEN/CLOSE appeared in
+    the catalog yet no monitor would return them, so every panel gates on
+    what a live query really produced.
+    """
+    # Require __max: the panel exists to show spread, and an average alone is
+    # already on the DATA OPERATIONS panel.
+    return [
+        (base, label, kind) for base, label, kind in DISTRIBUTION_BASES
+        if f"{_NFS4},{base}__max" in returned_props
+    ]
 
 
 def _ops_present(ops, returned_props):
@@ -1574,8 +1750,10 @@ def create_headline_monitors():
     """
     global DATA_MONITOR_ID, SUPPLEMENT_MONITOR_ID, BW_MONITOR_ID, META_MONITOR_ID
     global STATE_MONITOR_ID, STATE_OPS_AVAILABLE, PNFS_OPS_AVAILABLE
+    global DISTRIBUTION_AVAILABLE
 
     data_props = build_data_monitor_props()
+    dist_props = build_distribution_props()
     supplement_props = build_supplement_monitor_props()
     bw_props = build_bw_monitor_props()
     meta_props = build_meta_monitor_props()
@@ -1604,7 +1782,8 @@ def create_headline_monitors():
         (state_props, trial_state),
         ([], []),
     ):
-        merged_props = [p for group in core_groups for p in group] + attempt_state_props
+        merged_props = ([p for group in core_groups for p in group]
+                        + dist_props + attempt_state_props)
         merged_id = None
         try:
             merged_id = create_monitor("headline", merged_props)
@@ -1616,6 +1795,7 @@ def create_headline_monitors():
             if all(any(p in returned for p in group) for group in core_groups):
                 DATA_MONITOR_ID = SUPPLEMENT_MONITOR_ID = merged_id
                 BW_MONITOR_ID = META_MONITOR_ID = merged_id
+                DISTRIBUTION_AVAILABLE = _distributions_present(returned)
                 if attempt_state_props and any(p in returned for p in attempt_state_props):
                     STATE_MONITOR_ID = merged_id
                     STATE_OPS_AVAILABLE = _ops_present(trial_state, returned)
@@ -1631,10 +1811,17 @@ def create_headline_monitors():
         if not attempt_state_props:
             break
 
-    DATA_MONITOR_ID = create_monitor("data", data_props)
+    DISTRIBUTION_AVAILABLE = []
+    DATA_MONITOR_ID = create_monitor("data", data_props + dist_props)
     SUPPLEMENT_MONITOR_ID = create_monitor("supplement", supplement_props)
     BW_MONITOR_ID = create_monitor("bw", bw_props)
     META_MONITOR_ID = create_monitor("meta", meta_props)
+    try:
+        probe = api_request("GET", f"/monitors/{DATA_MONITOR_ID}/query/")
+        DISTRIBUTION_AVAILABLE = _distributions_present(
+            set(probe.get("prop_list", []) or []) if isinstance(probe, dict) else set())
+    except RuntimeError:
+        DISTRIBUTION_AVAILABLE = []
     _init_state_monitor(candidates=state_candidates, pnfs=pnfs_candidates)
 
 
