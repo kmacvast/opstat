@@ -33,6 +33,7 @@ import time
 import openmetrics
 import vast_api_log
 import vast_common
+import vast_drill
 from tui_layout import (
     display_width, join_columns, pad_display, format_fixed_number,
     format_scaled_metric, truncate_display, c, set_color, set_unicode, glyph_set,
@@ -136,19 +137,30 @@ _DRILL_CFG = {
         "object_type": "cnode",
         "endpoint": "/cnodes/",
         "name_fields": ("name", "hostname", "mgmt_ip"),
+        "no_aggregation": False,
+        "ranked": False,
     },
     "view": {
         "object_type": "view",
         "endpoint": "/views/",
         "name_fields": ("path", "title", "name"),
+        "no_aggregation": vast_drill.VIEW_NO_AGGREGATION,
+        "ranked": True,
     },
     "tenant": {
         "object_type": "tenant",
         "endpoint": "/tenants/",
         "name_fields": ("name",),
+        "no_aggregation": vast_drill.TENANT_NO_AGGREGATION,
+        "ranked": True,
     },
 }
 _MAX_DRILL_OBJECTS = 8
+_DRILL_PROBE_LIMIT = 32
+_DRILL_MIN_QUERY_INTERVAL = 15.0
+
+# Shared ranking / batching / throttle machinery; built in init_config.
+DRILL = None
 
 _COL_SEP = "  "
 _COL = {"label": 14, "iops": 12, "throughput": 12, "size": 10, "latency": 12}
@@ -188,7 +200,8 @@ LAST_DRILL_ROWS = []
 
 def init_config(args):
     global ARGS, VMS, PORT, USER, PASSWORD, REFRESH_SECONDS, API_TIME_FRAME
-    global SAMPLE_AVERAGE_MODE, BASE_URL, AUTH, HEADERS, _COLOR
+    global SAMPLE_AVERAGE_MODE, BASE_URL, AUTH, HEADERS, _COLOR, DRILL
+    global DRILL_MODE, DRILL_ERROR, DRILL_OBJECTS, DRILL_MONITORS, LAST_DRILL_ROWS
 
     ARGS = args
     VMS = args.vms
@@ -217,6 +230,19 @@ def init_config(args):
     _COLOR = sys.stdout.isatty() and not args.no_color
     set_color(_COLOR)
     set_unicode(_UTF8)
+
+    DRILL = vast_drill.DrillSession(
+        request_fn=api_request,
+        create_monitor_fn=_create_monitor_raw,
+        delete_monitor_fn=delete_monitor,
+        max_objects=_MAX_DRILL_OBJECTS,
+        min_batch=_DRILL_PROBE_LIMIT,
+        min_query_interval=_DRILL_MIN_QUERY_INTERVAL,
+    )
+    DRILL_MODE = DRILL_ERROR = None
+    DRILL_OBJECTS = []
+    DRILL_MONITORS = []
+    LAST_DRILL_ROWS = []
 
 
 def box_top(title, width):
@@ -375,7 +401,19 @@ def probe_available_state_ops():
     return available
 
 
-def build_drill_prop_list():
+def build_drill_prop_list(mode="cnode"):
+    """Scope-aware drill props.
+
+    NFS4Common/NfsMetrics/NFSCommon are cluster- and cNode-scoped families; a
+    monitor requesting them with object_type=view or =tenant is rejected by
+    current VMS builds, so view and tenant scopes use ViewMetrics and
+    TenantMetrics instead (the same families the NFSv3 engine uses, since
+    these are object-scope metrics rather than NFS-version ones).
+    """
+    if mode == "view":
+        return vast_drill.view_display_props()
+    if mode == "tenant":
+        return vast_drill.tenant_display_props()
     return (
         build_data_monitor_props()
         + build_supplement_monitor_props()
@@ -384,11 +422,21 @@ def build_drill_prop_list():
     )
 
 
-def _create_monitor_raw(name_suffix, prop_list, object_type, object_ids):
+def build_drill_rank_prop_list(mode):
+    """Minimal props for ranking view/tenant candidates by activity."""
+    if mode == "view":
+        return vast_drill.view_rank_props()
+    if mode == "tenant":
+        return vast_drill.tenant_rank_props()
+    return build_drill_prop_list(mode)
+
+
+def _create_monitor_raw(name_suffix, prop_list, object_type, object_ids,
+                        *, no_aggregation=False):
     name = f"adhoc_opstat_nfs41_{name_suffix}_{int(time.time())}"
     return vast_common.create_monitor_raw(
         api_request, name, prop_list, object_type, object_ids,
-        time_frame=API_TIME_FRAME,
+        time_frame=API_TIME_FRAME, no_aggregation=no_aggregation,
     )
 
 
@@ -806,25 +854,43 @@ def enter_drill_mode(mode):
         DRILL_ERROR = f"No {mode} objects returned from {cfg['endpoint']}"
         return
 
-    valid = [o for o in objects if "id" in o][:_MAX_DRILL_OBJECTS]
-    DRILL_OBJECTS = [
-        {"id": o["id"], "name": _obj_name(o, cfg["name_fields"])} for o in valid
-    ]
+    all_valid = [o for o in objects if "id" in o]
+    if cfg.get("ranked"):
+        # Ranking matters here: a cluster can list hundreds of views, and
+        # taking the head of /views/ showed eight arbitrary (usually idle)
+        # ones rather than the busiest.
+        DRILL_OBJECTS = DRILL.rank(
+            mode, all_valid,
+            object_type=cfg["object_type"],
+            rank_props=build_drill_rank_prop_list(mode),
+            score_fn=lambda sliced: as_float(
+                _build_drill_row(mode, sliced, "")["total_ops"]) or 0.0,
+            time_frame=API_TIME_FRAME,
+            name_of=lambda obj: _obj_name(obj, cfg["name_fields"]),
+            no_aggregation=cfg.get("no_aggregation", False),
+        )
+    else:
+        DRILL_OBJECTS = [
+            {"id": o["id"], "name": _obj_name(o, cfg["name_fields"])}
+            for o in all_valid[:_MAX_DRILL_OBJECTS]
+        ]
+    if not DRILL_OBJECTS:
+        DRILL_ERROR = f"No valid {mode} objects available for drill-down"
+        return
+
     _cleanup_drill_monitors()
-    new_monitors = []
-    for obj in DRILL_OBJECTS:
-        try:
-            monitor_id = _create_monitor_raw(
-                f"{mode}_{obj['id']}", build_drill_prop_list(),
-                cfg["object_type"], [obj["id"]],
-            )
-            new_monitors.append((monitor_id, obj["name"]))
-        except RuntimeError:
-            pass
+    new_monitors, last_error = DRILL.create_monitors(
+        mode, DRILL_OBJECTS,
+        object_type=cfg["object_type"],
+        props=build_drill_prop_list(mode),
+        no_aggregation=cfg.get("no_aggregation", False),
+        validate_batch=(mode == "cnode"),
+    )
     if not new_monitors:
+        detail = f": {last_error}" if last_error else ""
         DRILL_ERROR = (
             f"Could not create any {mode} monitors "
-            f"(object_type='{cfg['object_type']}' may not be supported)"
+            f"(object_type='{cfg['object_type']}' may not be supported){detail}"
         )
         DRILL_OBJECTS = []
         return
@@ -843,32 +909,106 @@ def exit_drill_mode():
     DRILL_ERROR = None
 
 
-def fetch_drill_query():
-    global LAST_DRILL_ROWS
+def _build_cnode_drill_row(result, obj_name):
+    """cNode rows reuse the cluster row builders (same NFS4Common families)."""
+    snapshot, _sample = build_rows_from_results(result, result, result, result)
+    data = snapshot["data"]
+    total_ops = sum(as_float(r["ops_sec"]) or 0 for r in data)
+    total_bw = sum(as_float(r["bw_mbs"]) or 0 for r in data) / 1024.0
+    active = [r for r in data if (as_float(r["ops_sec"]) or 0) > 0]
+    top = max(active, key=lambda r: as_float(r["ops_sec"]) or 0, default=None)
+    return {
+        "name": obj_name,
+        "total_ops": total_ops if total_ops > 0 else None,
+        "latency_us": weighted_latency(data),
+        "bw_gbs": total_bw if total_bw else None,
+        "top_rpc": top["label"] if top else "-",
+        "top_rpc_pct": as_float(top["pct"]) if top else None,
+    }
+
+
+def _build_drill_row(mode, result, obj_name):
+    if mode == "view":
+        return vast_drill.build_view_row(result, obj_name)
+    if mode == "tenant":
+        return vast_drill.build_tenant_row(result, obj_name)
+    return _build_cnode_drill_row(result, obj_name)
+
+
+def fetch_drill_query(force=False):
+    """Re-query the drill monitors, throttled unless *force*.
+
+    Object-scoped metric families publish roughly once a minute, so a 5s
+    dashboard tick re-fetched identical payloads.
+    """
+    global LAST_DRILL_ROWS, DRILL_ERROR
+    if not DRILL_MODE:
+        return
+    if not DRILL.should_query(force=force, have_data=bool(LAST_DRILL_ROWS)):
+        return
     drill_rows = []
-    for monitor_id, obj_name in DRILL_MONITORS:
+    query_errors = 0
+
+    if DRILL.batch_active(DRILL_MONITORS):
+        monitor_id, _name = DRILL_MONITORS[0]
         try:
             result = api_request("GET", f"/monitors/{monitor_id}/query/")
-            snapshot, _ = build_rows_from_results(result, result, result, result)
-            data = snapshot["data"]
-            total_ops = sum(as_float(r["ops_sec"]) or 0 for r in data)
-            latency = weighted_latency(data)
-            total_bw = sum(as_float(r["bw_mbs"]) or 0 for r in data) / 1024.0
-            active = [r for r in data if (as_float(r["ops_sec"]) or 0) > 0]
-            top = max(active, key=lambda r: as_float(r["ops_sec"]) or 0, default=None)
-            drill_rows.append({
-                "name": obj_name,
-                "total_ops": total_ops,
-                "latency_us": latency,
-                "bw_gbs": total_bw if total_bw else None,
-                "top_rpc": top["label"] if top else "-",
-                "top_rpc_pct": as_float(top["pct"]) if top else None,
-            })
+            for obj in DRILL_OBJECTS:
+                drill_rows.append(_build_drill_row(
+                    DRILL_MODE,
+                    vast_drill.slice_result_for_object(result, obj["id"]),
+                    obj["name"],
+                ))
         except RuntimeError:
-            pass
-    LAST_DRILL_ROWS = sorted(drill_rows, key=lambda r: r["total_ops"] or 0, reverse=True)
+            query_errors = len(DRILL_OBJECTS)
+    else:
+        for monitor_id, obj_name in DRILL_MONITORS:
+            try:
+                result = api_request("GET", f"/monitors/{monitor_id}/query/")
+                drill_rows.append(_build_drill_row(DRILL_MODE, result, obj_name))
+            except RuntimeError:
+                query_errors += 1
+
+    LAST_DRILL_ROWS = sorted(
+        drill_rows, key=lambda r: r["total_ops"] or 0, reverse=True)
     if openmetrics.is_enabled() and DRILL_MODE:
         openmetrics.export_drill(CLUSTER_NAME, DRILL_MODE, LAST_DRILL_ROWS, sample=LAST_SAMPLE)
+    if not LAST_DRILL_ROWS and query_errors:
+        DRILL_ERROR = (
+            f"{DRILL_MODE} drill monitors returned no data "
+            f"({query_errors}/{len(DRILL_OBJECTS)} queries failed)"
+        )
+
+
+def _drill_coverage_note():
+    """State how much cluster activity the shown objects actually account for.
+
+    ViewMetrics/TenantMetrics attribute only the operations VMS can tie to a
+    view or tenant, so drill rows legitimately sum to less than the cluster
+    total (and these are only the busiest few). Saying so beats letting the
+    gap read as a bug.
+    """
+    if not LAST_DRILL_ROWS or DRILL_MODE not in ("view", "tenant"):
+        return ""
+    shown = sum(as_float(r.get("total_ops")) or 0.0 for r in LAST_DRILL_ROWS)
+    data = LAST_ROWS.get("data") or []
+    cluster = sum(as_float(r.get("ops_sec")) or 0.0 for r in data)
+    cluster += as_float((LAST_ROWS.get("meta") or {}).get("md_iops")) or 0.0
+    if cluster <= 0:
+        return ""
+    fraction = vast_drill.coverage_fraction(shown, cluster)
+    if fraction is None:
+        return (
+            c(f"Top {len(LAST_DRILL_ROWS)} {DRILL_MODE}s shown; ", _DIM)
+            + c(f"{DRILL_MODE} counters are not directly comparable to the "
+                f"cluster totals above", _DIM)
+        )
+    return (
+        c(f"Top {len(LAST_DRILL_ROWS)} {DRILL_MODE}s account for ", _DIM)
+        + c(f"{shown:,.2f} ops/s ({fraction * 100.0:.1f}%)", _BWHITE)
+        + c(f" of {cluster:,.2f} cluster ops/s - VMS attributes only "
+            f"{DRILL_MODE}-scoped operations to {DRILL_MODE}s", _DIM)
+    )
 
 
 def _render_drill_panel(width):
@@ -904,6 +1044,9 @@ def _render_drill_panel(width):
         ], " ")
         print(box_row(line, width))
     print(box_sep(width))
+    coverage = _drill_coverage_note()
+    if coverage:
+        print(box_row(coverage, width))
     print(box_row(c("Press x to return to cluster view", _DIM), width))
     print(box_bottom(width))
 
@@ -964,6 +1107,13 @@ def poll_tick():
     fetch_monitor_query()
     if DRILL_MODE:
         fetch_drill_query()
+
+
+def manual_refresh():
+    """Space-bar refresh: also bypass the drill query throttle."""
+    fetch_monitor_query()
+    if DRILL_MODE:
+        fetch_drill_query(force=True)
 
 
 def render_screen():
@@ -1226,21 +1376,21 @@ def main():
                 exit_drill_mode()
                 enter_drill_mode("cnode")
                 if DRILL_MODE:
-                    fetch_drill_query()
+                    fetch_drill_query(force=True)
             elif "v" in chars.lower():
                 exit_drill_mode()
                 enter_drill_mode("view")
                 if DRILL_MODE:
-                    fetch_drill_query()
+                    fetch_drill_query(force=True)
             elif "t" in chars.lower():
                 exit_drill_mode()
                 enter_drill_mode("tenant")
                 if DRILL_MODE:
-                    fetch_drill_query()
+                    fetch_drill_query(force=True)
             elif "x" in chars.lower():
                 exit_drill_mode()
             elif " " in chars:
-                vast_common.guarded_poll(poll_tick, render_screen)
+                vast_common.guarded_poll(manual_refresh, render_screen)
                 next_refresh = time.time() + REFRESH_SECONDS
                 continue
             render_screen()

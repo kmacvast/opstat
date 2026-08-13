@@ -19,6 +19,70 @@ batching, capability discovery and caching live here.
 
 import time
 import urllib.parse
+from datetime import datetime
+
+import vast_common
+from tui_layout import as_float, raw_bw_to_gb_sec
+
+# ---------------------------------------------------------------------------
+# Object-scope metric families
+# ---------------------------------------------------------------------------
+# NfsMetrics/ProtoMetrics are cluster- and cNode-scoped; a monitor asking for
+# them with object_type=view or =tenant is rejected by current VMS builds.
+# View and tenant scopes have their own families, and they differ in kind:
+# ViewMetrics publishes instantaneous rates, TenantMetrics publishes
+# cumulative counters that must be differentiated over the sample window.
+VIEW_READ_IOPS = "ViewMetrics,read_iops__rate"
+VIEW_WRITE_IOPS = "ViewMetrics,write_iops__rate"
+VIEW_READ_MD = "ViewMetrics,read_md_iops__rate"
+VIEW_WRITE_MD = "ViewMetrics,write_md_iops__rate"
+VIEW_READ_LAT = "ViewMetrics,read_latency__avg"
+VIEW_WRITE_LAT = "ViewMetrics,write_latency__avg"
+VIEW_READ_BW = "ViewMetrics,read_bw__rate"
+VIEW_WRITE_BW = "ViewMetrics,write_bw__rate"
+
+TENANT_READ_IOPS = "TenantMetrics,read_iops__sum"
+TENANT_WRITE_IOPS = "TenantMetrics,write_iops__sum"
+TENANT_READ_MD = "TenantMetrics,read_md_iops__sum"
+TENANT_WRITE_MD = "TenantMetrics,write_md_iops__sum"
+TENANT_READ_BW = "TenantMetrics,read_bw__sum"
+TENANT_WRITE_BW = "TenantMetrics,write_bw__sum"
+TENANT_READ_LAT = "TenantMetrics,read_latency__sum"
+TENANT_WRITE_LAT = "TenantMetrics,write_latency__sum"
+TENANT_READ_CNT = "TenantMetrics,read_iops__num_samples"
+TENANT_WRITE_CNT = "TenantMetrics,write_iops__num_samples"
+TENANT_READ_MD_CNT = "TenantMetrics,read_md_iops__num_samples"
+TENANT_WRITE_MD_CNT = "TenantMetrics,write_md_iops__num_samples"
+
+# View monitors need seconds resolution without aggregation; tenant monitors
+# keep the default avg aggregation over the frame.
+VIEW_NO_AGGREGATION = True
+TENANT_NO_AGGREGATION = False
+
+
+def view_display_props():
+    return [
+        VIEW_READ_IOPS, VIEW_WRITE_IOPS, VIEW_READ_MD, VIEW_WRITE_MD,
+        VIEW_READ_LAT, VIEW_WRITE_LAT, VIEW_READ_BW, VIEW_WRITE_BW,
+    ]
+
+
+def view_rank_props():
+    """Minimal props for ranking view candidates by activity."""
+    return [VIEW_READ_IOPS, VIEW_WRITE_IOPS, VIEW_READ_MD, VIEW_WRITE_MD]
+
+
+def tenant_display_props():
+    return [
+        TENANT_READ_IOPS, TENANT_WRITE_IOPS, TENANT_READ_MD, TENANT_WRITE_MD,
+        TENANT_READ_BW, TENANT_WRITE_BW, TENANT_READ_LAT, TENANT_WRITE_LAT,
+        TENANT_READ_CNT, TENANT_WRITE_CNT, TENANT_READ_MD_CNT,
+        TENANT_WRITE_MD_CNT,
+    ]
+
+
+def tenant_rank_props():
+    return [TENANT_READ_IOPS, TENANT_WRITE_IOPS, TENANT_READ_MD, TENANT_WRITE_MD]
 
 # ---------------------------------------------------------------------------
 # Monitor result helpers (identical in every engine)
@@ -87,6 +151,150 @@ def topn_titles(payload, object_type):
         if titles:
             return titles      # one metric bucket establishes the order
     return []
+
+
+# ---------------------------------------------------------------------------
+# View / tenant row construction
+# ---------------------------------------------------------------------------
+def parse_sample_ts(sample):
+    if not sample or sample == "-":
+        return None
+    try:
+        return datetime.fromisoformat(str(sample).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def latest_complete_values(result):
+    """(values, prop_idx, sample) from the newest usable row of *result*."""
+    _prop_list, data, prop_idx = result_parts(result)
+    values, sample = vast_common.latest_complete_values(data, prop_idx)
+    return values, prop_idx, sample
+
+
+def delta_rate_from_samples(result, sum_fqn):
+    """Average rate derived from cumulative __sum samples in a monitor query."""
+    _prop_list, data, prop_idx = result_parts(result)
+    idx = prop_idx.get(sum_fqn)
+    if idx is None:
+        return None
+    newest, oldest = vast_common.bounding_samples(data, idx)
+    if newest is None:
+        return None
+    t_new, t_old = parse_sample_ts(newest[0]), parse_sample_ts(oldest[0])
+    if not t_new or not t_old:
+        return None
+    dt = abs((t_new - t_old).total_seconds())
+    if dt <= 0:
+        return None
+    return max(as_float(newest[idx]) - as_float(oldest[idx]), 0.0) / dt
+
+
+def avg_from_sum_count_deltas(result, sum_fqn, count_fqn):
+    """Mean value per operation from paired cumulative sum/count counters."""
+    _prop_list, data, prop_idx = result_parts(result)
+    idx_s, idx_c = prop_idx.get(sum_fqn), prop_idx.get(count_fqn)
+    if idx_s is None or idx_c is None:
+        return None
+    newest, oldest = vast_common.bounding_samples(data, idx_s, idx_c)
+    if newest is None:
+        return None
+    cnt_delta = as_float(newest[idx_c]) - as_float(oldest[idx_c])
+    if cnt_delta <= 0:
+        return None
+    return (as_float(newest[idx_s]) - as_float(oldest[idx_s])) / cnt_delta
+
+
+def weighted_us(pairs):
+    """Op-weighted mean of (weight, microseconds) pairs."""
+    valid = [(w, v) for w, v in pairs if (w or 0) > 0 and v is not None]
+    weight = sum(w for w, _v in valid)
+    if weight <= 0:
+        return None
+    return sum(w * v for w, v in valid) / weight
+
+
+def top_op(op_pairs):
+    """Return (busiest label, its share of the active total) or ('-', None)."""
+    active = [(label, ops) for label, ops in op_pairs if (ops or 0) > 0]
+    if not active:
+        return "-", None
+    label, ops = max(active, key=lambda item: item[1])
+    total = sum(o for _l, o in active)
+    return label, (ops / total * 100.0) if total > 0 else None
+
+
+def build_view_row(result, obj_name):
+    """One VIEW drill row from a ViewMetrics monitor slice (instantaneous rates)."""
+    values, _prop_idx, _sample = latest_complete_values(result)
+    read_ops = as_float(values.get(VIEW_READ_IOPS)) or 0.0
+    write_ops = as_float(values.get(VIEW_WRITE_IOPS)) or 0.0
+    read_md = as_float(values.get(VIEW_READ_MD)) or 0.0
+    write_md = as_float(values.get(VIEW_WRITE_MD)) or 0.0
+    total_ops = read_ops + write_ops + read_md + write_md
+    latency = weighted_us([
+        (read_ops, as_float(values.get(VIEW_READ_LAT))),
+        (write_ops, as_float(values.get(VIEW_WRITE_LAT))),
+    ])
+    bw = ((raw_bw_to_gb_sec(values.get(VIEW_READ_BW)) or 0.0)
+          + (raw_bw_to_gb_sec(values.get(VIEW_WRITE_BW)) or 0.0))
+    label, pct = top_op([
+        ("READ", read_ops), ("WRITE", write_ops),
+        ("RD MD", read_md), ("WR MD", write_md),
+    ])
+    return {
+        "name": obj_name,
+        "total_ops": total_ops if total_ops > 0 else None,
+        "latency_us": latency,
+        "bw_gbs": bw if bw > 0 else None,
+        "top_rpc": label,
+        "top_rpc_pct": pct,
+    }
+
+
+def build_tenant_row(result, obj_name):
+    """One TENANT drill row from cumulative TenantMetrics counters."""
+    read_ops = delta_rate_from_samples(result, TENANT_READ_IOPS) or 0.0
+    write_ops = delta_rate_from_samples(result, TENANT_WRITE_IOPS) or 0.0
+    read_md = delta_rate_from_samples(result, TENANT_READ_MD) or 0.0
+    write_md = delta_rate_from_samples(result, TENANT_WRITE_MD) or 0.0
+    total_ops = read_ops + write_ops + read_md + write_md
+    latency = weighted_us([
+        (read_ops, avg_from_sum_count_deltas(
+            result, TENANT_READ_LAT, TENANT_READ_CNT)),
+        (write_ops, avg_from_sum_count_deltas(
+            result, TENANT_WRITE_LAT, TENANT_WRITE_CNT)),
+    ])
+    bw = ((raw_bw_to_gb_sec(delta_rate_from_samples(result, TENANT_READ_BW)) or 0.0)
+          + (raw_bw_to_gb_sec(delta_rate_from_samples(result, TENANT_WRITE_BW)) or 0.0))
+    label, pct = top_op([
+        ("READ", read_ops), ("WRITE", write_ops),
+        ("RD MD", read_md), ("WR MD", write_md),
+    ])
+    return {
+        "name": obj_name,
+        "total_ops": total_ops if total_ops > 0 else None,
+        "latency_us": latency,
+        "bw_gbs": bw if bw > 0 else None,
+        "top_rpc": label,
+        "top_rpc_pct": pct,
+    }
+
+
+def coverage_fraction(shown_ops, cluster_ops):
+    """Share of cluster activity the drill rows account for, or None.
+
+    Returns None when the comparison is not meaningful: no cluster activity,
+    or a share so far above 100% that the two numbers are plainly not on the
+    same footing (tenant rates come from differentiating cumulative counters
+    over the sample window, cluster rates are instantaneous, and the windows
+    need not line up). Callers should say the scopes are not comparable
+    rather than print a misleading percentage.
+    """
+    if not cluster_ops or cluster_ops <= 0 or shown_ops is None:
+        return None
+    fraction = shown_ops / cluster_ops
+    return None if fraction > 1.5 else fraction
 
 
 class DrillSession:

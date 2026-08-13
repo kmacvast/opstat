@@ -295,6 +295,116 @@ def test_manual_refresh_forces_a_drill_query(engine, vms):
 
 
 # ---------------------------------------------------------------------------
+# NFSv4.1 drill-down: scope-correct props, ranking, batching, throttle
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def engine41(vms, monkeypatch):
+    import nfs_v41
+
+    monkeypatch.setenv("VAST_TOKEN", "test-token")
+    nfs_v41.init_config(SimpleNamespace(
+        vms="127.0.0.1", port=vms.port, user="admin", password=None,
+        sample_average=None, refresh=5, csv=None, no_color=True,
+        discover_metrics=False, log_api_calls=False,
+        export_openmetrics=False, openmetrics_file=None,
+    ))
+    nfs_v41.CLUSTER_ID, nfs_v41.CLUSTER_NAME = nfs_v41.get_current_cluster()
+    nfs_v41.create_headline_monitors()
+    yield nfs_v41
+    nfs_v41.cleanup()
+    nfs_v41._CLEANED_UP = False
+    vast_common.close_connection()
+
+
+def test_v41_view_and_tenant_use_object_scoped_metric_families(engine41):
+    """NfsMetrics/ProtoMetrics are cluster/cNode families; VMS rejects them at
+    view and tenant scope, so those scopes must ask for ViewMetrics and
+    TenantMetrics instead."""
+    view_props = engine41.build_drill_prop_list("view")
+    tenant_props = engine41.build_drill_prop_list("tenant")
+    cnode_props = engine41.build_drill_prop_list("cnode")
+
+    assert {p.split(",")[0] for p in view_props} == {"ViewMetrics"}
+    assert {p.split(",")[0] for p in tenant_props} == {"TenantMetrics"}
+    assert {p.split(",")[0] for p in cnode_props} == {"NfsMetrics", "ProtoMetrics"}
+
+
+def test_v41_view_drill_ranks_by_activity(engine41, vms):
+    """Regression: the engine took the first eight objects from /views/,
+    which on a 429-view cluster meant eight arbitrary idle views."""
+    engine41.enter_drill_mode("view")
+    assert engine41.DRILL_ERROR is None
+    names = [o["name"] for o in engine41.DRILL_OBJECTS]
+    assert names == _expected_top_views(engine41._MAX_DRILL_OBJECTS)
+    assert names[0] != VIEWS[0]["path"], "still head-slicing /views/"
+
+
+def test_v41_view_drill_entry_is_cheap(engine41, vms):
+    vms.reset_calls()
+    engine41.enter_drill_mode("view")
+    total = sum(vms.counts().values())
+    assert engine41.DRILL_ERROR is None
+    assert total <= 6, f"view drill entry cost {total} calls: {vms.counts()}"
+
+
+def test_v41_drill_uses_one_batched_monitor(engine41, vms):
+    for mode in ("view", "tenant", "cnode"):
+        engine41.enter_drill_mode(mode)
+        assert engine41.DRILL_ERROR is None, mode
+        assert len(engine41.DRILL_MONITORS) == 1, f"{mode} not batched"
+        vms.reset_calls()
+        engine41.fetch_drill_query(force=True)
+        assert vms.counts() == {"GET /api/monitors/{id}/query/": 1}, mode
+        assert len(engine41.LAST_DRILL_ROWS) == len(engine41.DRILL_OBJECTS), mode
+        engine41.exit_drill_mode()
+
+
+def test_v41_drill_rows_carry_latency_and_bandwidth(engine41, vms):
+    engine41.enter_drill_mode("view")
+    engine41.fetch_drill_query(force=True)
+    active = [r for r in engine41.LAST_DRILL_ROWS if (r["total_ops"] or 0) > 0]
+    assert active
+    for row in active:
+        assert row["latency_us"] is not None, row["name"]
+        assert row["bw_gbs"] is not None, row["name"]
+    assert not all(r["top_rpc"] == "RD MD" for r in active)
+
+
+def test_v41_drill_query_is_throttled(engine41, vms):
+    engine41.enter_drill_mode("view")
+    engine41.fetch_drill_query(force=True)
+    vms.reset_calls()
+    for _ in range(4):
+        engine41.poll_tick()
+    drill_queries = sum(v for k, v in vms.counts().items() if "query" in k) - 4
+    assert drill_queries <= 1
+
+
+def test_v41_manual_refresh_forces_a_drill_query(engine41, vms):
+    engine41.enter_drill_mode("view")
+    engine41.fetch_drill_query(force=True)
+    vms.reset_calls()
+    engine41.manual_refresh()
+    assert sum(vms.counts().values()) >= 2
+
+
+def test_v41_drill_monitors_are_cleaned_up(engine41, vms):
+    engine41.enter_drill_mode("view")
+    drill_ids = {mid for mid, _n in engine41.DRILL_MONITORS}
+    engine41.exit_drill_mode()
+    assert not (drill_ids & set(vms.live_monitors()))
+
+
+def test_v41_falls_back_to_per_object_monitors(engine41, vms):
+    vms.state.max_object_ids = 1
+    engine41.enter_drill_mode("view")
+    assert engine41.DRILL_ERROR is None
+    assert len(engine41.DRILL_MONITORS) == len(engine41.DRILL_OBJECTS)
+    engine41.fetch_drill_query(force=True)
+    assert len(engine41.LAST_DRILL_ROWS) == len(engine41.DRILL_OBJECTS)
+
+
+# ---------------------------------------------------------------------------
 # Shared sample-selection helper (used by every engine)
 # ---------------------------------------------------------------------------
 def test_latest_complete_row_skips_the_filling_bucket():
@@ -337,6 +447,37 @@ def test_bounding_samples_ignores_rows_missing_a_column():
 def test_bounding_samples_requires_all_columns_populated():
     data = [["t2", 5.0, None], ["t1", 4.0, 9.0]]
     assert vast_common.bounding_samples(data, 1, 2) == (None, None)
+
+
+def test_coverage_fraction_refuses_incomparable_scopes():
+    import vast_drill
+
+    assert vast_drill.coverage_fraction(50.0, 100.0) == pytest.approx(0.5)
+    assert vast_drill.coverage_fraction(100.0, 100.0) == pytest.approx(1.0)
+    # Tenant rates come from differentiating cumulative counters over the
+    # sample window; when they dwarf the instantaneous cluster rate the two
+    # are not on the same footing and a percentage would mislead.
+    assert vast_drill.coverage_fraction(97000.0, 715.0) is None
+    assert vast_drill.coverage_fraction(10.0, 0.0) is None
+    assert vast_drill.coverage_fraction(None, 100.0) is None
+
+
+@pytest.mark.parametrize("engine_name", ["nfs_v3", "nfs_v41"])
+def test_drill_coverage_note_never_prints_an_absurd_percentage(engine_name):
+    import importlib
+
+    module = importlib.import_module(engine_name)
+    module.DRILL_MODE = "tenant"
+    module.LAST_DRILL_ROWS = [{"name": "t", "total_ops": 97000.0}]
+    if engine_name == "nfs_v3":
+        module.LAST_ROWS = [{"label": "READ", "ops_sec": 715.0}]
+    else:
+        module.LAST_ROWS = {"data": [{"ops_sec": 715.0}], "meta": {}}
+    note = module._drill_coverage_note()
+    assert "%" not in note
+    assert "not directly comparable" in note
+    module.DRILL_MODE = None
+    module.LAST_DRILL_ROWS = []
 
 
 @pytest.mark.parametrize("module_name", ["smb", "s3", "nfs_v41"])

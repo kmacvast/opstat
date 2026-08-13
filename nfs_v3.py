@@ -122,27 +122,10 @@ META_LABELS = frozenset(label for _, label in OPS) - IO_LABELS
 # Drill-down configuration - object_type values are the VAST API monitor parameter names.
 # cnode scopes use NfsMetrics; view/tenant scopes use ViewMetrics/TenantMetrics
 # (NfsMetrics query returns HTTP 400 for view/tenant on current VMS builds).
-_VIEW_READ_IOPS = "ViewMetrics,read_iops__rate"
-_VIEW_WRITE_IOPS = "ViewMetrics,write_iops__rate"
-_VIEW_READ_MD = "ViewMetrics,read_md_iops__rate"
-_VIEW_WRITE_MD = "ViewMetrics,write_md_iops__rate"
-_VIEW_READ_LAT = "ViewMetrics,read_latency__avg"
-_VIEW_WRITE_LAT = "ViewMetrics,write_latency__avg"
-_VIEW_READ_BW = "ViewMetrics,read_bw__rate"
-_VIEW_WRITE_BW = "ViewMetrics,write_bw__rate"
-
-_TENANT_READ_IOPS = "TenantMetrics,read_iops__sum"
-_TENANT_WRITE_IOPS = "TenantMetrics,write_iops__sum"
-_TENANT_READ_MD = "TenantMetrics,read_md_iops__sum"
-_TENANT_WRITE_MD = "TenantMetrics,write_md_iops__sum"
-_TENANT_READ_BW = "TenantMetrics,read_bw__sum"
-_TENANT_WRITE_BW = "TenantMetrics,write_bw__sum"
-_TENANT_READ_LAT = "TenantMetrics,read_latency__sum"
-_TENANT_WRITE_LAT = "TenantMetrics,write_latency__sum"
-_TENANT_READ_CNT = "TenantMetrics,read_iops__num_samples"
-_TENANT_WRITE_CNT = "TenantMetrics,write_iops__num_samples"
-_TENANT_READ_MD_CNT = "TenantMetrics,read_md_iops__num_samples"
-_TENANT_WRITE_MD_CNT = "TenantMetrics,write_md_iops__num_samples"
+_VIEW_READ_IOPS = vast_drill.VIEW_READ_IOPS
+_VIEW_WRITE_IOPS = vast_drill.VIEW_WRITE_IOPS
+_VIEW_READ_MD = vast_drill.VIEW_READ_MD
+_VIEW_WRITE_MD = vast_drill.VIEW_WRITE_MD
 
 _DRILL_CFG = {
     "cnode":  {
@@ -523,33 +506,18 @@ def build_bw_prop_list():
 def build_drill_prop_list(mode):
     """Scope-aware monitor props - NfsMetrics only work for cluster/cnode scopes."""
     if mode == "view":
-        return [
-            _VIEW_READ_IOPS, _VIEW_WRITE_IOPS,
-            _VIEW_READ_MD, _VIEW_WRITE_MD,
-            _VIEW_READ_LAT, _VIEW_WRITE_LAT,
-            _VIEW_READ_BW, _VIEW_WRITE_BW,
-        ]
+        return vast_drill.view_display_props()
     if mode == "tenant":
-        return [
-            _TENANT_READ_IOPS, _TENANT_WRITE_IOPS,
-            _TENANT_READ_MD, _TENANT_WRITE_MD,
-            _TENANT_READ_BW, _TENANT_WRITE_BW,
-            _TENANT_READ_LAT, _TENANT_WRITE_LAT,
-            _TENANT_READ_CNT, _TENANT_WRITE_CNT,
-            _TENANT_READ_MD_CNT, _TENANT_WRITE_MD_CNT,
-        ]
+        return vast_drill.tenant_display_props()
     return build_rpc_prop_list() + build_bw_prop_list()
 
 
 def build_drill_rank_prop_list(mode):
     """Minimal props for one-shot batch ranking of view/tenant candidates."""
     if mode == "view":
-        return [_VIEW_READ_IOPS, _VIEW_WRITE_IOPS, _VIEW_READ_MD, _VIEW_WRITE_MD]
+        return vast_drill.view_rank_props()
     if mode == "tenant":
-        return [
-            _TENANT_READ_IOPS, _TENANT_WRITE_IOPS,
-            _TENANT_READ_MD, _TENANT_WRITE_MD,
-        ]
+        return vast_drill.tenant_rank_props()
     return build_drill_prop_list(mode)
 
 
@@ -1188,87 +1156,13 @@ def _cleanup_drill_monitors():
     DRILL_MONITORS = []
 
 
-def _parse_sample_ts(sample):
-    if not sample or sample == "-":
-        return None
-    try:
-        return datetime.fromisoformat(str(sample).replace("Z", "+00:00"))
-    except ValueError:
-        return None
-
-
-def _latest_complete_values(result):
-    """Return (values, prop_idx, sample) from the newest *usable* sample row.
-
-    VMS returns the newest bucket of an object-scoped monitor while it is
-    still filling: on VAST OS 5.5.0.1 a ViewMetrics row arrived as
-
-        ["...T14:08:00Z", 92, null, null, 0.083, null, null, null, null, null]
-
-    with only ``read_md_iops__rate`` populated. Reading ``data[0]`` verbatim
-    therefore reported no latency, no bandwidth, and "RD MD 100%" as the top
-    operation for every view. Select the newest row carrying the most
-    populated metrics instead - the same rule the cluster-scope path has
-    always used via :func:`select_latest_complete_row` - so all values come
-    from one consistent instant.
-    """
-    _prop_list, data, prop_idx = _result_parts(result)
-    values, sample = vast_common.latest_complete_values(data, prop_idx)
-    return values, prop_idx, sample
-
-
+_parse_sample_ts = vast_drill.parse_sample_ts
+_latest_complete_values = vast_drill.latest_complete_values
 _bounding_samples = vast_common.bounding_samples
-
-
-def _delta_rate_from_samples(result, sum_fqn):
-    """Derive an average rate from cumulative __sum samples in a monitor query."""
-    _prop_list, data, prop_idx = _result_parts(result)
-    idx = prop_idx.get(sum_fqn)
-    if idx is None:
-        return None
-    newest, oldest = _bounding_samples(data, idx)
-    if newest is None:
-        return None
-    t_new = _parse_sample_ts(newest[0])
-    t_old = _parse_sample_ts(oldest[0])
-    if not t_new or not t_old:
-        return None
-    dt = abs((t_new - t_old).total_seconds())
-    if dt <= 0:
-        return None
-    return max(as_float(newest[idx]) - as_float(oldest[idx]), 0.0) / dt
-
-
-def _avg_from_sum_count_deltas(result, sum_fqn, count_fqn):
-    _prop_list, data, prop_idx = _result_parts(result)
-    idx_s, idx_c = prop_idx.get(sum_fqn), prop_idx.get(count_fqn)
-    if idx_s is None or idx_c is None:
-        return None
-    newest, oldest = _bounding_samples(data, idx_s, idx_c)
-    if newest is None:
-        return None
-    cnt_delta = as_float(newest[idx_c]) - as_float(oldest[idx_c])
-    if cnt_delta <= 0:
-        return None
-    return (as_float(newest[idx_s]) - as_float(oldest[idx_s])) / cnt_delta
-
-
-def _weighted_us(pairs):
-    valid = [(w, v) for w, v in pairs if (w or 0) > 0 and v is not None]
-    weight = sum(w for w, _v in valid)
-    if weight <= 0:
-        return None
-    return sum(w * v for w, v in valid) / weight
-
-
-def _drill_top_op(op_pairs):
-    active = [(label, ops) for label, ops in op_pairs if (ops or 0) > 0]
-    if not active:
-        return "-", None
-    top_label, top_ops = max(active, key=lambda item: item[1])
-    total = sum(ops for _, ops in active)
-    pct = (top_ops / total * 100.0) if total > 0 else None
-    return top_label, pct
+_delta_rate_from_samples = vast_drill.delta_rate_from_samples
+_avg_from_sum_count_deltas = vast_drill.avg_from_sum_count_deltas
+_weighted_us = vast_drill.weighted_us
+_drill_top_op = vast_drill.top_op
 
 
 def _build_cnode_drill_row(result, obj_name):
@@ -1288,58 +1182,8 @@ def _build_cnode_drill_row(result, obj_name):
     }
 
 
-def _build_view_drill_row(result, obj_name):
-    values, _prop_idx, _sample = _latest_complete_values(result)
-    read_ops = as_float(values.get(_VIEW_READ_IOPS)) or 0.0
-    write_ops = as_float(values.get(_VIEW_WRITE_IOPS)) or 0.0
-    read_md = as_float(values.get(_VIEW_READ_MD)) or 0.0
-    write_md = as_float(values.get(_VIEW_WRITE_MD)) or 0.0
-    total_ops = read_ops + write_ops + read_md + write_md
-    latency = _weighted_us([
-        (read_ops, as_float(values.get(_VIEW_READ_LAT))),
-        (write_ops, as_float(values.get(_VIEW_WRITE_LAT))),
-    ])
-    read_bw = raw_bw_to_gb_sec(values.get(_VIEW_READ_BW)) or 0.0
-    write_bw = raw_bw_to_gb_sec(values.get(_VIEW_WRITE_BW)) or 0.0
-    top_rpc, top_pct = _drill_top_op([
-        ("READ", read_ops), ("WRITE", write_ops),
-        ("RD MD", read_md), ("WR MD", write_md),
-    ])
-    return {
-        "name": obj_name,
-        "total_ops": total_ops if total_ops > 0 else None,
-        "latency_us": latency,
-        "bw_gbs": (read_bw + write_bw) if (read_bw + write_bw) > 0 else None,
-        "top_rpc": top_rpc,
-        "top_rpc_pct": top_pct,
-    }
-
-
-def _build_tenant_drill_row(result, obj_name):
-    read_ops = _delta_rate_from_samples(result, _TENANT_READ_IOPS) or 0.0
-    write_ops = _delta_rate_from_samples(result, _TENANT_WRITE_IOPS) or 0.0
-    read_md = _delta_rate_from_samples(result, _TENANT_READ_MD) or 0.0
-    write_md = _delta_rate_from_samples(result, _TENANT_WRITE_MD) or 0.0
-    total_ops = read_ops + write_ops + read_md + write_md
-    read_lat = _avg_from_sum_count_deltas(result, _TENANT_READ_LAT, _TENANT_READ_CNT)
-    write_lat = _avg_from_sum_count_deltas(result, _TENANT_WRITE_LAT, _TENANT_WRITE_CNT)
-    latency = _weighted_us([(read_ops, read_lat), (write_ops, write_lat)])
-    read_bw = _delta_rate_from_samples(result, _TENANT_READ_BW)
-    write_bw = _delta_rate_from_samples(result, _TENANT_WRITE_BW)
-    read_bw_gbs = raw_bw_to_gb_sec(read_bw) or 0.0
-    write_bw_gbs = raw_bw_to_gb_sec(write_bw) or 0.0
-    top_rpc, top_pct = _drill_top_op([
-        ("READ", read_ops), ("WRITE", write_ops),
-        ("RD MD", read_md), ("WR MD", write_md),
-    ])
-    return {
-        "name": obj_name,
-        "total_ops": total_ops if total_ops > 0 else None,
-        "latency_us": latency,
-        "bw_gbs": (read_bw_gbs + write_bw_gbs) if (read_bw_gbs + write_bw_gbs) > 0 else None,
-        "top_rpc": top_rpc,
-        "top_rpc_pct": top_pct,
-    }
+_build_view_drill_row = vast_drill.build_view_row
+_build_tenant_drill_row = vast_drill.build_tenant_row
 
 
 def _build_drill_row(mode, result, obj_name):
@@ -1934,10 +1778,16 @@ def _drill_coverage_note():
     cluster = sum(as_float(r["ops_sec"]) or 0.0 for r in LAST_ROWS)
     if cluster <= 0:
         return ""
-    pct = shown / cluster * 100.0
+    fraction = vast_drill.coverage_fraction(shown, cluster)
+    if fraction is None:
+        return (
+            c(f"Top {len(LAST_DRILL_ROWS)} {DRILL_MODE}s shown; ", _DIM)
+            + c(f"{DRILL_MODE} counters are not directly comparable to the "
+                f"cluster totals above", _DIM)
+        )
     return (
         c(f"Top {len(LAST_DRILL_ROWS)} {DRILL_MODE}s account for ", _DIM)
-        + c(f"{shown:,.2f} ops/s ({pct:.1f}%)", _BWHITE)
+        + c(f"{shown:,.2f} ops/s ({fraction * 100.0:.1f}%)", _BWHITE)
         + c(f" of {cluster:,.2f} cluster ops/s - VMS attributes only "
             f"{DRILL_MODE}-scoped operations to {DRILL_MODE}s", _DIM)
     )

@@ -274,8 +274,9 @@ def test_nfs_v41_drill_mode_tracks_and_queries_monitors(vms, monkeypatch):
     assert nfs_v41.DRILL_ERROR is None
     assert nfs_v41.DRILL_MONITORS, "drill monitors must be tracked module-wide"
 
-    nfs_v41.fetch_drill_query()
-    assert len(nfs_v41.LAST_DRILL_ROWS) == len(nfs_v41.DRILL_MONITORS)
+    nfs_v41.fetch_drill_query(force=True)
+    # One batch monitor now covers every drill object.
+    assert len(nfs_v41.LAST_DRILL_ROWS) == len(nfs_v41.DRILL_OBJECTS)
 
     drill_ids = {mid for mid, _name in nfs_v41.DRILL_MONITORS}
     nfs_v41.exit_drill_mode()

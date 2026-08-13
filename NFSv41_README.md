@@ -146,6 +146,40 @@ Drill-down endpoints are path-relative to `BASE_URL` (`/cnodes/`, `/views/`,
 
 ---
 
+## Drill-Down Mode
+
+| Mode | Key | `object_type` | Metric family |
+|------|-----|---------------|---------------|
+| cNode | `c` | `cnode` | `NFS4Common` + `NfsMetrics` + `NFSCommon` (same as cluster) |
+| View | `v` | `view` | `ViewMetrics,*__rate/__avg` (no aggregation) |
+| Tenant | `t` | `tenant` | `TenantMetrics,*__sum/__num_samples` (delta-derived rates) |
+
+`NfsMetrics`/`ProtoMetrics` are cluster- and cNode-scoped families; a monitor
+requesting them with `object_type=view` or `=tenant` is rejected by current VMS
+builds. View and tenant scopes therefore use `ViewMetrics`/`TenantMetrics` — the same
+object-scope families the NFSv3 engine uses, since these are properties of the object,
+not of the NFS version.
+
+View and tenant candidates are **ranked by activity** before selection (via
+[`vast_drill`](vast_drill.py): one server-side `/monitors/topn/` request, else the
+fewest batched rank monitors the cluster accepts, cached for 5 minutes). Taking the
+head of `/views/` instead would show eight arbitrary — usually idle — views on a
+cluster with hundreds.
+
+All three scopes use **one batch monitor** covering every drill object, so a refresh
+issues one query rather than one per row. cNode batching is probe-validated at entry
+and falls back to per-object monitors if the response cannot be split by `object_id`.
+Drill monitors are re-queried at most every 15 s because object-scoped families
+publish roughly once a minute; `Space` forces an immediate re-query.
+
+`ViewMetrics`/`TenantMetrics` account only for operations VMS can attribute to a view
+or tenant, so drill rows legitimately sum to less than the cluster total. The panel
+states the shortfall rather than scaling numbers to match, and says so plainly when
+the two scopes are not directly comparable (tenant rates are differentiated from
+cumulative counters; cluster rates are instantaneous).
+
+---
+
 ## Interactive Keys
 
 | Key | Action |
