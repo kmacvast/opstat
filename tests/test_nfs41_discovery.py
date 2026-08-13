@@ -698,10 +698,17 @@ def test_attribution_reports_protocol_values_and_cardinality(vms, monkeypatch):
 
 
 def test_delegation_endpoint_probed_read_only(vms, monkeypatch):
+    """The endpoint requires file_path ("['__root__->file_path: field
+    required']"), so it answers per-file rather than listing delegations.
+    Discovery must pass a real NFS4 view path taken from host_view."""
     monkeypatch.setenv("OPSTAT_NFS4_PROBE_INTERVAL", "1")
     result = _run_discovery(vms)
     assert "17. NFSv4 delegation REST endpoint" in result.stdout
-    assert "delegation(s)" in result.stdout
+    assert "record(s)" in result.stdout
+    delegs = [p for _t, m, p, _s in vms.calls() if "nfs4_delegs" in p]
+    assert delegs, "delegation endpoint was never probed"
+    assert any("file_path=" in p for p in delegs), (
+        "probed without the required file_path parameter")
     # The sibling DELETE endpoint must never be called.
     deletes = [p for _t, m, p, _s in vms.calls()
                if m == "DELETE" and "nfs4_deleg" in p]
@@ -793,3 +800,38 @@ def test_exporter_paths_are_not_probed_as_json(vms):
     out = _run_discovery(vms).stdout
     rest_section = out.split("[ 10.")[1].split("[ 11.")[0]
     assert "prometheus" not in rest_section.lower()
+
+
+def test_discovery_enumerates_every_nfs4_operation_not_a_curated_list(vms, monkeypatch):
+    """Regression: a hardcoded 14-op probe list omitted putfh/getfh/access -
+    the most frequent operations in any NFSv4 compound - so no reasoning
+    about compound composition was supported by the data."""
+    monkeypatch.setenv("OPSTAT_NFS4_PROBE_INTERVAL", "1")
+    out = _run_discovery(vms).stdout
+    for op in ("putfh", "getfh", "access", "savefh", "restorefh",
+               "secinfo_no_name", "lookupp", "putrootfh"):
+        assert f"    {op:<18}" in out, f"{op} missing from the per-op table"
+    header = [l for l in out.split("\n") if "per-operation (cluster scope" in l]
+    assert header and "ops)" in header[0]
+
+
+def test_cluster_and_cnode_counters_are_reconciled(vms, monkeypatch):
+    monkeypatch.setenv("OPSTAT_NFS4_PROBE_INTERVAL", "1")
+    out = _run_discovery(vms).stdout
+    assert "cluster vs sum-of-cNodes (delta counts):" in out
+    assert "% of cluster)" in out
+
+
+def test_units_reference_falls_back_when_nfs4common_is_null(vms, monkeypatch):
+    """NFS4Common data counters read zero on some clusters, leaving the
+    microsecond reference null. Other known-microsecond sources must be
+    tried before giving up on proving units."""
+    vms.state.unsupported_prop_prefixes = (
+        "ProtoMetrics,proto_name=NFS4Common,read_latency",
+        "ProtoMetrics,proto_name=NFS4Common,write_latency",
+    )
+    monkeypatch.setenv("OPSTAT_NFS4_PROBE_INTERVAL", "1")
+    out = _run_discovery(vms).stdout
+    assert "microsecond reference:" in out
+    assert "none available" not in out.split("microsecond reference:")[1][:60], (
+        "gave up instead of trying NFSCommon / NfsMetrics")

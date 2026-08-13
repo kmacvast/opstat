@@ -450,6 +450,9 @@ class _Handler(BaseHTTPRequestHandler):
             if not self.state.delegations_enabled:
                 return self._error(404, "delegation endpoint absent")
             tid = int(m.group(1))
+            if "file_path" not in query:
+                return self._error(
+                    400, "['__root__->file_path: field required']")
             return self._send({"results": [
                 {"client_ip": f"10.9.0.{i}", "path": f"/view/{300 + i}",
                  "stateid": f"0x{tid:04x}{i:04x}", "deleg_type": "READ",

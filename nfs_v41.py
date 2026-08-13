@@ -1943,11 +1943,23 @@ def discover_metrics():
 
             by_metric = {(r["metric"], frozenset(r["labels"].items())): r
                          for r in rows}
-            emit("  per-operation (cluster scope):")
+            # Enumerate every operation present rather than a curated subset:
+            # a hardcoded list omitted putfh/getfh/access, which are the most
+            # frequent operations in any NFSv4 compound, so any reasoning
+            # about compound composition was unsupported by the data.
+            discovered_ops = sorted({
+                re.sub(r"^vast_cluster_metrics_Nfs4Metrics_nfs4_", "",
+                       k[0]).replace("_req_latency_count", "")
+                for k in by_metric
+                if k[0].startswith("vast_cluster_metrics_Nfs4Metrics_nfs4_")
+                and k[0].endswith("_req_latency_count")
+            })
+            emit(f"  per-operation (cluster scope, {len(discovered_ops)} ops):")
             emit(f"    {'operation':<18}{'dcount':>10}{'ops/s':>10}"
                  f"{'dsum':>14}{'derived lat':>13}{'lifetime lat':>14}")
             derived_read = lifetime_read = None
-            for op in _NFS4_PROBE_OPS:
+            total_ops_per_sec = 0.0
+            for op in discovered_ops:
                 base = f"vast_cluster_metrics_Nfs4Metrics_nfs4_{op}_req_latency"
                 cnt = next((r for k, r in by_metric.items()
                             if k[0] == base + "_count"), None)
@@ -1956,6 +1968,8 @@ def discover_metrics():
                 if cnt is None:
                     emit(f"    {op:<18}{'not present':>10}")
                     continue
+                if op != "sequence":
+                    total_ops_per_sec += cnt["per_sec"] or 0.0
                 lat = vast_discovery.derive_latency(
                     cnt["delta"], tot["delta"] if tot else None)
                 lifetime = vast_discovery.lifetime_mean(
@@ -1978,41 +1992,86 @@ def discover_metrics():
             # Units: compare a derived latency against NFS4Common's
             # read_latency__avg, which the existing dashboard already reads in
             # microseconds.
-            reference = None
+            # NFS4Common read_latency__avg is null on clusters where the
+            # NFS4Common data counters stay at zero - a documented condition
+            # this engine already compensates for elsewhere. Try a chain of
+            # sources that are all known to be microseconds, and report which
+            # one supplied the reference.
+            reference, reference_name = None, None
+            unit_refs = [
+                (f"{_NFS4},read_latency__avg", "NFS4Common read_latency__avg"),
+                (f"{_NFS4},write_latency__avg", "NFS4Common write_latency__avg"),
+                (f"{_NFS_COMMON},read_latency__avg", "NFSCommon read_latency__avg"),
+                (f"{_NFS_COMMON},write_latency__avg", "NFSCommon write_latency__avg"),
+                (_nfs_fqn("read", "avg"), "NfsMetrics nfs_read_latency__avg"),
+                (_nfs_fqn("write", "avg"), "NfsMetrics nfs_write_latency__avg"),
+            ]
             monitor_id = None
             try:
-                monitor_id = create_monitor("unitref", build_data_monitor_props())
+                monitor_id = create_monitor("unitref", [p for p, _l in unit_refs])
                 probe = api_request("GET", f"/monitors/{monitor_id}/query/")
-                values, _sample = _latest_row(probe, build_data_monitor_props())
-                reference = as_float(values.get(f"{_NFS4},read_latency__avg"))
+                for prop, label in unit_refs:
+                    values, _sample = _latest_row(probe, [prop])
+                    candidate = as_float(values.get(prop))
+                    if candidate and candidate > 0:
+                        reference, reference_name = candidate, label
+                        break
             except RuntimeError:
                 reference = None
             finally:
                 if monitor_id is not None:
                     delete_monitor(monitor_id)
+            seq_key = ("vast_cluster_metrics_Nfs4Metrics_nfs4_sequence"
+                       "_req_latency_count")
+            seq_row = next((r for k, r in by_metric.items() if k[0] == seq_key),
+                           None)
+            if seq_row and seq_row["per_sec"]:
+                per_compound = total_ops_per_sec / seq_row["per_sec"]
+                emit(f"  SEQUENCE/s {seq_row['per_sec']:.2f}; all other ops "
+                     f"{total_ops_per_sec:.2f}/s -> {per_compound:.2f} ops per "
+                     f"compound (v4.1 sends one SEQUENCE per compound)")
+
             # An idle window yields no delta-derived latency, but the
             # lifetime totals still carry a long-run mean usable for units.
             basis = derived_read if derived_read else lifetime_read
             basis_label = "delta-derived" if derived_read else "lifetime mean"
             unit, ratio = vast_discovery.infer_time_unit(basis, reference)
-            emit(f"  NFS4Common read_latency__avg (known microseconds): "
-                 f"{reference if reference is not None else 'unavailable'}")
+            emit(f"  microsecond reference: "
+                 f"{reference_name or 'none available'}"
+                 + (f" = {reference:.1f}" if reference else ""))
             emit(f"  Nfs4Metrics read latency ({basis_label}): "
                  f"{f'{basis:.1f}' if basis else 'unavailable'}")
             emit(f"  latency-unit inference: {unit or 'not determinable'}"
                  + (f" (ratio {ratio:.4g})" if ratio else ""))
             if reference is None:
-                emit("  NOTE: the reference is null when the cluster is idle; "
-                     "re-run under NFSv4.1 load to prove units.")
+                emit("  NOTE: no microsecond reference was populated; units "
+                     "remain inferred from magnitude alone.")
 
             cnode_series = {k for k in n4_second if "cnode_metrics" in k[0]}
             emit(f"  cNode-scope Nfs4Metrics series: {len(cnode_series)}")
+            emit("  cluster vs sum-of-cNodes (delta counts):")
+            for op in discovered_ops[:40]:
+                c_key = (f"vast_cluster_metrics_Nfs4Metrics_nfs4_{op}"
+                         f"_req_latency_count")
+                n_key = (f"vast_cnode_metrics_Nfs4Metrics_nfs4_{op}"
+                         f"_req_latency_count")
+                cluster_delta = next((r["delta"] for k, r in by_metric.items()
+                                      if k[0] == c_key), None)
+                cnode_sum = sum(r["delta"] for k, r in by_metric.items()
+                                if k[0] == n_key)
+                if not cluster_delta and not cnode_sum:
+                    continue
+                match = "" if not cluster_delta else (
+                    f"  ({cnode_sum / cluster_delta * 100:.1f}% of cluster)")
+                emit(f"    {op:<18}cluster={cluster_delta:>10.0f}"
+                     f"  cnodes={cnode_sum:>10.0f}{match}")
             for key in sorted(cnode_series)[:6]:
                 lines.append(f"        {key[0]} {dict(key[1])}")
     emit()
 
     # -- 16. Client/view attribution cardinality ----------------------------
     emit("[ 16. host_view / user_view / vip_view attribution ]")
+    nfs4_paths = set()
     for path in ("/prometheusmetrics/host_view", "/prometheusmetrics/user_view",
                  "/prometheusmetrics/vip_view"):
         body, elapsed, size, err = vast_discovery.scrape_timed(
@@ -2022,13 +2081,18 @@ def discover_metrics():
             continue
         samples = vast_discovery.sample_values(body)
         protocols = {}
-        for (_name, labels), _v in samples.items():
+        for (_name, labels) in samples:
             proto = dict(labels).get("protocol", "(none)")
             protocols[proto] = protocols.get(proto, 0) + 1
         emit(f"  {path:<38} {size:>7} bytes  {elapsed * 1000:>5.0f} ms  "
              f"{len(samples)} series")
         for proto, count in sorted(protocols.items(), key=lambda kv: -kv[1]):
             emit(f"      protocol={proto:<12} {count} series")
+        if path.endswith("host_view"):
+            for _n, lbls in samples:
+                d = dict(lbls)
+                if d.get("protocol") == "NFS4" and d.get("path"):
+                    nfs4_paths.add(d["path"])
         lines.append(f"    {path} label vocabulary:")
         for label in ("protocol", "ip", "path", "tenant", "username", "vip", "vippool"):
             values = sorted({dict(l).get(label) for _n, l in samples
@@ -2053,17 +2117,30 @@ def discover_metrics():
             continue
         probed += 1
         # GET only. The sibling DELETE endpoint is never called.
-        info = vast_discovery.probe_readonly(
-            api_request, f"/tenants/{tid}/nfs4_delegs/")
         name = tenant.get("name", tid)
-        if info["ok"]:
-            emit(f"  tenant {str(name)[:20]:<22} {info['count']:>4} delegation(s)")
-            if info["fields"]:
-                lines.append(f"        tenant {name} fields: "
-                             f"{', '.join(info['fields'])}")
-        else:
-            emit(f"  tenant {str(name)[:20]:<22} {_short_error(info['detail'])}")
-            lines.append(f"        tenant {name} -> {info['detail']}")
+        # The endpoint reports HTTP 400 "file_path: field required": it answers
+        # "who holds a delegation on this file", not "list all delegations".
+        # Probe it with real NFS4 view paths taken from host_view.
+        candidates = sorted(nfs4_paths)[:2] or [None]
+        for file_path in candidates:
+            if file_path is None:
+                path = f"/tenants/{tid}/nfs4_delegs/"
+                label = "(no file_path)"
+            else:
+                path = (f"/tenants/{tid}/nfs4_delegs/?file_path="
+                        + urllib.parse.quote(file_path, safe=""))
+                label = file_path
+            info = vast_discovery.probe_readonly(api_request, path)
+            if info["ok"]:
+                emit(f"  tenant {str(name)[:16]:<18} {label[:24]:<26}"
+                     f"{info['count']:>4} record(s)")
+                if info["fields"]:
+                    lines.append(f"        tenant {name} {label} fields: "
+                                 f"{', '.join(info['fields'])}")
+            else:
+                emit(f"  tenant {str(name)[:16]:<18} {label[:24]:<26}"
+                     f"{_short_error(info['detail'])}")
+                lines.append(f"        tenant {name} {label} -> {info['detail']}")
     if not probed:
         emit("  no tenants available to probe")
     emit()
