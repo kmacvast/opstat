@@ -54,11 +54,12 @@ CNODES = [
     for i in range(12)
 ]
 
-# Deliberately large so the drill ranking path has to chunk (32 per chunk).
+# Deliberately large (the real cluster this was validated against has ~429)
+# so the drill ranking path cannot rely on scanning everything cheaply.
 VIEWS = [
     {"id": 1000 + i, "path": f"/view/{i:03d}", "name": f"view-{i:03d}",
      "title": f"view-{i:03d}"}
-    for i in range(400)
+    for i in range(429)
 ]
 
 TENANTS = [{"id": 10 + i, "name": f"tenant-{i}"} for i in range(6)]
@@ -72,21 +73,56 @@ VOLUMES = [
 VIPS = [{"id": 700 + i, "ip": f"10.1.0.{i + 1}", "name": f"vip-{i}"} for i in range(4)]
 
 
-def _metric_value(prop, seed, t):
+# Which views/tenants actually carry load, most-active first. Deliberately
+# placed deep in the /views/ listing so an implementation that ranks by
+# "first N objects returned" picks the wrong set and the tests catch it.
+_ACTIVE_VIEW_INDEXES = [317, 288, 401, 12, 355, 190, 260, 99, 333, 77, 210, 44]
+_ACTIVE_TENANT_INDEXES = [4, 1, 5, 2]
+
+assert max(_ACTIVE_VIEW_INDEXES) < len(VIEWS)
+assert max(_ACTIVE_TENANT_INDEXES) < len(TENANTS)
+
+_ACTIVE_VIEW_IDS = {VIEWS[i]["id"]: rank
+                    for rank, i in enumerate(_ACTIVE_VIEW_INDEXES)}
+_ACTIVE_TENANT_IDS = {TENANTS[i]["id"]: rank
+                      for rank, i in enumerate(_ACTIVE_TENANT_INDEXES)}
+
+
+def _activity_scale(prop, object_id):
+    """Per-object activity multiplier for object-scoped metric families.
+
+    Cluster-scope props (no object) always carry load. View/Tenant props only
+    carry load for the objects in the activity tables above, so ranking
+    correctness is observable.
+    """
+    if prop.startswith("ViewMetrics,"):
+        rank = _ACTIVE_VIEW_IDS.get(object_id)
+        return 0.0 if rank is None else 1.0 / (rank + 1)
+    if prop.startswith("TenantMetrics,"):
+        rank = _ACTIVE_TENANT_IDS.get(object_id)
+        return 0.0 if rank is None else 1.0 / (rank + 1)
+    return 1.0
+
+
+def _metric_value(prop, seed, t, object_id=None):
     """Deterministic-but-lively synthetic value for a monitor property."""
     h = 0
     for ch in prop:
         h = (h * 31 + ord(ch)) & 0xFFFF
     base = (h % 997) + 1
+    scale = _activity_scale(prop, object_id)
     wobble = 1.0 + 0.25 * math.sin((t + seed) / 7.0 + h)
+    if "__sum" in prop or "num_samples" in prop:
+        # Cumulative counters: a large lifetime base plus monotonic growth
+        # proportional to this object's activity, as VMS TenantMetrics do.
+        return round(base * 1_000_000.0 + t * base * 20.0 * scale, 1)
+    if scale == 0.0:
+        return 0.0
     if "latency" in prop and "__avg" in prop:
         return round(base * 3.0 * wobble, 3)
     if "_bw" in prop or "bw__" in prop:
-        return round(base * 5.0e6 * wobble, 1)
-    if "__sum" in prop or "num_samples" in prop:
-        # Cumulative counters must grow monotonically for delta-rate math.
-        return round(base * 1000.0 + t * base * 3.0, 1)
-    return round(base * 0.5 * wobble, 3)
+        return round(base * 5.0e6 * wobble * scale, 1)
+    return round(base * 0.5 * wobble * scale, 3)
 
 
 class _State:
@@ -108,6 +144,16 @@ class _State:
         # Prop-name prefixes that make POST /monitors/ fail outright, for
         # engines whose fallback path reacts to a rejected create.
         self.reject_prop_prefixes = ()
+        # Reproduce observed VMS 5.5.0.1 behavior: the newest bucket of an
+        # object-scoped monitor is still filling, so every property except
+        # the ones listed here comes back null in that row. Set to None to
+        # emit fully-populated newest rows.
+        self.partial_newest_props = ("ViewMetrics,read_md_iops__rate",)
+        # Largest object_ids list POST /monitors/ will accept (None = no cap).
+        # Real clusters cap this; engines must discover it and adapt.
+        self.max_object_ids = None
+        # Serve /monitors/topn/ (some builds/permissions do not).
+        self.topn_enabled = True
         self.latency_s = 0.0
         self.t0 = time.time()
 
@@ -198,6 +244,22 @@ class _Handler(BaseHTTPRequestHandler):
             ]})
 
         if path == "/api/monitors/topn/":
+            if not self.state.topn_enabled:
+                return self._error(404, "topn not available on this build")
+            obj_type = (query.get("object_type") or [None])[0]
+            if obj_type == "view":
+                # Ranked most-active first, titled by view path so callers can
+                # map back to ids from /views/.
+                return self._send({"data": {"view": {"iops": [
+                    {"title": VIEWS[i]["path"], "value": 500.0 - i}
+                    for i in _ACTIVE_VIEW_INDEXES[:16]
+                ]}}})
+            if obj_type == "tenant":
+                return self._send({"data": {"tenant": {"iops": [
+                    {"title": TENANTS[i]["name"], "value": 400.0 - i}
+                    for i in _ACTIVE_TENANT_INDEXES[:16]
+                ]}}})
+
             def block(prefix):
                 return [{"title": f"{prefix}{i}", "value": 1000.0 - i * 37}
                         for i in range(10)]
@@ -240,6 +302,9 @@ class _Handler(BaseHTTPRequestHandler):
             for p in payload.get("prop_list") or []:
                 if str(p).startswith(tuple(self.state.reject_prop_prefixes)):
                     return self._error(400, f"unsupported metric: {p}")
+        cap = self.state.max_object_ids
+        if cap is not None and len(payload.get("object_ids") or []) > cap:
+            return self._error(400, f"too many object_ids (max {cap})")
         with self.state.lock:
             monitor_id = self.state.next_monitor_id
             self.state.next_monitor_id += 1
@@ -280,6 +345,7 @@ class _Handler(BaseHTTPRequestHandler):
         prop_list = ["timestamp"] + (["object_id"] if batch else []) + props
 
         now = time.time() - self.state.t0
+        partial = self.state.partial_newest_props
         rows = []
         # Newest first, matching the VMS ordering the engines assume.
         for step in range(12):
@@ -292,7 +358,13 @@ class _Handler(BaseHTTPRequestHandler):
                 row = [stamp]
                 if batch:
                     row.append(oid)
-                row.extend(_metric_value(p, seed, t) for p in props)
+                for p in props:
+                    # The newest bucket is still filling on a real VMS: only
+                    # a subset of properties has landed, the rest are null.
+                    if step == 0 and partial is not None and p not in partial:
+                        row.append(None)
+                    else:
+                        row.append(_metric_value(p, seed, t, oid))
                 rows.append(row)
         return self._send({"prop_list": prop_list, "data": rows})
 

@@ -122,9 +122,18 @@ and latency movement - independent of the cumulative counter engine.
 | **`x`** | **Return to primary cluster dashboard view** |
 | `q` | Quit |
 
-View and tenant drill-down rank up to 32 candidates with a **single batch rank monitor**,
-select the top 8 by ops/s, then maintain one **batch display monitor** for ongoing
-refreshes (one API query per cycle instead of per-object probes).
+View and tenant drill-down rank **every** candidate by activity, select the top 8, then
+maintain one **batch display monitor** for ongoing refreshes (one API query per cycle
+instead of per-object probes). Ranking tries, in order:
+
+1. a single server-side `GET /monitors/topn/` (no monitors created), used only when
+   enough returned titles map back to real objects;
+2. the fewest batched rank monitors the cluster accepts — one covering every object
+   where possible, stepping down through 256/128/64/32 ids if a create is rejected,
+   remembering the working size for the session;
+3. the historical 32-per-chunk scan as a last resort.
+
+The ranking is cached for 5 minutes, so leaving and re-entering a drill is free.
 
 Press `c`, `v`, or `t` again while in drill mode to switch scope. Use `x` to exit all
 drill modes and restore cluster monitors.
@@ -142,10 +151,30 @@ drill modes and restore cluster monitors.
 Flow:
 
 1. Fetch object list from VMS.
-2. For view/tenant: batch-rank candidates by activity, keep top 8.
-3. Create scope-appropriate monitors (batch for view/tenant, per-object for cnode).
-4. Refresh on the normal interval; rows sorted by total ops/s.
+2. For view/tenant: rank candidates by activity (topn → batched rank monitors), keep top 8.
+3. Create one batch monitor covering every drill object. cNode batching is
+   probe-validated at entry and falls back to one monitor per cNode if the cluster
+   cannot split the response by `object_id`.
+4. Re-query no more than every 15 s — `ViewMetrics`/`TenantMetrics` publish a new
+   sample roughly once a minute, so a 5 s poll returned identical payloads. `Space`
+   forces an immediate re-query.
 5. Press `x` to tear down drill monitors and return to cluster view.
+
+### Sample selection
+
+VMS publishes the newest bucket of a monitor while it is still filling. On VAST OS
+5.5.0.1 a `ViewMetrics` row arrived with only `read_md_iops__rate` populated and every
+other property `null`. All scopes therefore select the **newest row carrying the most
+populated metrics** rather than `data[0]`, so latency, bandwidth, and the workload mix
+all come from one consistent, complete instant. Cumulative `TenantMetrics` rates are
+derived between the newest and oldest samples that actually carry the counter.
+
+### Attribution coverage
+
+`ViewMetrics`/`TenantMetrics` only account for operations VMS can attribute to a view
+or tenant, so drill rows legitimately sum to less than the cluster total. The drill
+panel states the shortfall explicitly (`Top 8 views account for N ops/s (X%) of the
+cluster total`) rather than scaling the numbers to match.
 
 > View monitors require **seconds resolution without aggregation**. Tenant scope cannot
 > use cluster `NfsMetrics` - tenant counters require the delta engine described above.

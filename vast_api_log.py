@@ -9,7 +9,23 @@ from datetime import datetime
 _LOG_ENABLED = False
 _LOG_PATH = None
 _LOG_FILE = None
-_MAX_BODY_CHARS = 2048
+
+# Response bodies are the whole point of --log-api-calls: a monitor query for
+# eight objects over a 10-minute window runs ~8 KB, and the previous 2 KB cap
+# truncated exactly the sample rows needed to diagnose a drill-down. Keep a
+# cap so a pathological response cannot fill /tmp, but a useful one, and let
+# an operator raise it for a deep-dive capture.
+_DEFAULT_MAX_BODY_CHARS = 32768
+
+
+def _max_body_chars():
+    raw = os.environ.get("OPSTAT_API_LOG_BODY_CHARS")
+    if raw:
+        try:
+            return max(256, int(raw))
+        except ValueError:
+            pass
+    return _DEFAULT_MAX_BODY_CHARS
 
 
 def configure(enabled, protocol, vms, port):
@@ -64,9 +80,10 @@ def _write_line(text):
 def _truncate(text):
     if text is None:
         return None
-    if len(text) <= _MAX_BODY_CHARS:
+    limit = _max_body_chars()
+    if len(text) <= limit:
         return text
-    return f"{text[:_MAX_BODY_CHARS]}…({len(text)} bytes total)"
+    return f"{text[:limit]}…({len(text)} bytes total)"
 
 
 def _payload_summary(payload):
