@@ -289,3 +289,5 @@ nfs_v3.run()
 ./opstat --nfs --version=3.0 --vms var203.selab.vastdata.com \
   --csv nfs_stats.csv --log-api-calls
 ```
+
+Lab traffic generator (systemd): [scripts/README.md](scripts/README.md) (`nfs3-loadgen`).

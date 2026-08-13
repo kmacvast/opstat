@@ -1,0 +1,19 @@
+[Unit]
+Description=VAST NFSv4.1 protocol load generator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/vastdata/kmactools/scripts/nfs41-loadgen.sh /mnt/nfs41test
+WorkingDirectory=/tmp
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

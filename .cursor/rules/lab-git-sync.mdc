@@ -1,0 +1,19 @@
+---
+description: Lab files go through git on the MacBook, never scp into a clone
+alwaysApply: true
+---
+
+# Lab git sync
+
+Do not write or `scp` files onto the lab server (`kevin-mcdonald-ubu-01`, `kmactools`, or any other clone) when those files belong in git.
+
+Workflow:
+
+1. Edit and add files in the MacBook clone of the repo.
+2. Commit (when the user asks, or when they asked to commit and push as part of this task).
+3. `git push` to origin.
+4. On the lab host only: `git pull` (or `git fetch` + checkout). Never copy the same tree over SSH.
+
+If a lab clone already has leftover scp copies, delete those untracked files, then pull so git owns the tree.
+
+Live systemd units under `/etc/systemd/system/` are installed from the pulled tree (`scripts/systemd/install-lab-loadgen-units.sh`). Do not treat `/etc` as the source of truth for script content.

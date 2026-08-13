@@ -1,0 +1,26 @@
+[Unit]
+Description=VAST S3 protocol load generator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vastdata
+Group=vastdata
+Environment=HOME=/home/vastdata
+Environment=AWS_PROFILE=elbencho
+Environment=S3_ENDPOINT=http://172.200.202.2
+Environment=S3_BUCKET=kmacs-elbencho-test
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/home/vastdata/kmactools/scripts/s3-loadgen.sh
+WorkingDirectory=/tmp
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=45
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

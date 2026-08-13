@@ -232,6 +232,8 @@ Single-volume alias:
 .\scripts\Invoke-SmbOpstatLoad.ps1 -NasShare '\\172.200.203.6\opstattest'
 ```
 
+Linux CIFS loadgen, plus NFS / block / S3 systemd units: **[scripts/README.md](scripts/README.md)**.
+
 ### S3 (object storage)
 
 ```bash

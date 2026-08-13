@@ -1,0 +1,19 @@
+[Unit]
+Description=VAST SMB2 protocol load generator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/vastdata/kmactools/scripts/smb-loadgen.sh /mnt/smbtest
+WorkingDirectory=/tmp
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
