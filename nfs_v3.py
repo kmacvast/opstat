@@ -54,6 +54,7 @@ from datetime import datetime
 import openmetrics
 import vast_api_log
 import vast_common
+import vast_drill
 from tui_layout import (
     display_width, join_columns, pad_display, format_fixed_number,
     format_scaled_metric, truncate_display, c, set_color, set_unicode, glyph_set,
@@ -169,25 +170,10 @@ _DRILL_CFG = {
 
 _MAX_DRILL_OBJECTS = 8      # rows displayed / permanent monitors after ranking
 _DRILL_PROBE_LIMIT = 32     # smallest rank batch tried before giving up
-_TOPN_LIMIT = 32            # candidates requested from /monitors/topn/
-
-# Largest object_ids batch this cluster accepted for a rank monitor, learned
-# once per session by stepping down from "everything in one monitor".
-_RANK_CHUNK_SIZE = None
-# mode -> (monotonic_stamp, object-list signature, ranked objects)
-_RANK_CACHE = {}
-_RANK_CACHE_TTL = 300       # seconds; re-rank after this even for the same list
-
-# ViewMetrics/TenantMetrics advance about once a minute, so re-querying a
-# drill monitor on every 5s headline tick returned byte-identical payloads
-# nine times running on VAST OS 5.5.0.1. Re-query no more often than this
-# (the space bar always forces an immediate refresh).
-_DRILL_MIN_QUERY_INTERVAL = 15.0
-_LAST_DRILL_QUERY_AT = 0.0
-
-# Cleared when a cluster proves it cannot serve one cnode monitor covering
-# every cnode; the engine then falls back to one monitor per cnode.
-BATCH_CNODE_OK = True
+# Shared ranking / batching / throttle machinery. Constructed lazily in
+# init_config once the engine's monitor helpers exist.
+DRILL = None
+_DRILL_MIN_QUERY_INTERVAL = 15.0   # ViewMetrics/TenantMetrics publish ~1/min
 
 
 # ---------------------------------------------------------------------------
@@ -275,7 +261,7 @@ def init_config(args):
     global RPC_MONITOR_ID, BW_MONITOR_ID, CLUSTER_ID, CLUSTER_NAME, SORT_MODE
     global LAST_ROWS, LAST_SAMPLE, PREV_ROWS
     global DRILL_MODE, DRILL_OBJECTS, DRILL_MONITORS, LAST_DRILL_ROWS, DRILL_ERROR, DRILL_STATUS
-    global BATCH_CNODE_OK, _RANK_CHUNK_SIZE, _LAST_DRILL_QUERY_AT
+    global DRILL
 
     ARGS = args
 
@@ -329,10 +315,14 @@ def init_config(args):
     LAST_DRILL_ROWS = []
     DRILL_ERROR = None
     DRILL_STATUS = None
-    BATCH_CNODE_OK = True
-    _RANK_CHUNK_SIZE = None
-    _LAST_DRILL_QUERY_AT = 0.0
-    _RANK_CACHE.clear()
+    DRILL = vast_drill.DrillSession(
+        request_fn=api_request,
+        create_monitor_fn=_create_monitor_raw,
+        delete_monitor_fn=delete_monitor,
+        max_objects=_MAX_DRILL_OBJECTS,
+        min_batch=_DRILL_PROBE_LIMIT,
+        min_query_interval=_DRILL_MIN_QUERY_INTERVAL,
+    )
 
 CSV_HEADER = [
     "local_time", "runtime", "vms", "port", "cluster", "cluster_id",
@@ -564,42 +554,12 @@ def build_drill_rank_prop_list(mode):
 
 
 def _is_batch_drill_mode(mode=None):
-    """True when one monitor covers every drill object for *mode*.
-
-    view/tenant always batch. cnode batches too when the cluster proves it
-    can: :func:`_create_batch_drill_monitor` probes the created monitor and
-    clears BATCH_CNODE_OK if the response cannot be split per object.
-    """
-    mode = mode or DRILL_MODE
-    if mode == "cnode":
-        return BATCH_CNODE_OK
-    return mode in ("view", "tenant")
+    """True when one monitor currently covers every drill object."""
+    return vast_drill.DrillSession.batch_active(None, DRILL_MONITORS)
 
 
-def _normalize_object_id(value):
-    """Coerce VMS object_id values for reliable batch-monitor slicing."""
-    if value is None:
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return value
-
-
-def _slice_result_for_object(result, object_id):
-    """Return a monitor query payload containing only one object_id's samples."""
-    if not isinstance(result, dict):
-        return result
-    prop_list, data, prop_idx = _result_parts(result)
-    oid_idx = prop_idx.get("object_id")
-    if oid_idx is None:
-        return result
-    want = _normalize_object_id(object_id)
-    filtered = [
-        row for row in data
-        if len(row) > oid_idx and _normalize_object_id(row[oid_idx]) == want
-    ]
-    return {"prop_list": prop_list, "data": filtered}
+_normalize_object_id = vast_drill.normalize_object_id
+_slice_result_for_object = vast_drill.slice_result_for_object
 
 
 def _create_monitor_raw(name_suffix, prop_list, object_type, object_ids, *, no_aggregation=False):
@@ -1390,155 +1350,9 @@ def _build_drill_row(mode, result, obj_name):
     return _build_cnode_drill_row(result, obj_name)
 
 
-def _rank_via_topn(mode, objects, cfg):
-    """Rank candidates with one GET /monitors/topn/, or None when unusable.
-
-    topn ranks server-side, so this replaces the whole scan with a single
-    read-only request and creates no monitors at all. It is best-effort: the
-    endpoint is absent on some builds, and it identifies objects by title
-    rather than id, so the result is accepted only when enough titles map
-    back to real objects. Anything less falls through to the monitor scan.
-    """
-    # When every candidate fits in a single rank monitor, that scan is both
-    # cheap and exact (real per-object counters, no title matching), so the
-    # topn round trip would only add a request.
-    if len(objects) <= _DRILL_PROBE_LIMIT:
-        return None
-    prop = build_drill_rank_prop_list(mode)[0]
-    path = (
-        "/monitors/topn/?object_type=" + urllib.parse.quote(cfg["object_type"], safe="")
-        + "&prop_list=" + urllib.parse.quote(prop, safe=",")
-        + "&time_frame=" + urllib.parse.quote(API_TIME_FRAME, safe="")
-        + f"&limit={_TOPN_LIMIT}"
-    )
-    try:
-        payload = api_request("GET", path)
-    except RuntimeError:
-        return None
-    titles = _topn_titles(payload, cfg["object_type"])
-    if not titles:
-        return None
-
-    by_name = {}
-    for obj in objects:
-        by_name.setdefault(_obj_name(obj, cfg["name_fields"]).lower(), obj)
-    ranked, seen = [], set()
-    for title in titles:
-        obj = by_name.get(str(title).lower())
-        if obj is None or obj["id"] in seen:
-            continue
-        seen.add(obj["id"])
-        ranked.append({"id": obj["id"], "name": _obj_name(obj, cfg["name_fields"])})
-        if len(ranked) >= _MAX_DRILL_OBJECTS:
-            break
-    # A short list means topn and /views/ disagree about naming, or the
-    # cluster really is near-idle; either way the monitor scan is authoritative.
-    if len(ranked) < min(_MAX_DRILL_OBJECTS, len(objects)):
-        return None
-    return ranked
-
-
-def _topn_titles(payload, object_type):
-    """Flatten a /monitors/topn/ payload into an ordered list of object titles."""
-    if not isinstance(payload, dict):
-        return []
-    data = payload.get("data")
-    if not isinstance(data, dict):
-        return []
-    block = data.get(object_type)
-    buckets = []
-    if isinstance(block, dict):
-        buckets = [rows for rows in block.values() if isinstance(rows, list)]
-    elif isinstance(block, list):
-        buckets = [block]
-    titles = []
-    for rows in buckets:
-        for row in rows:
-            if isinstance(row, dict) and row.get("title"):
-                titles.append(row["title"])
-        if titles:
-            break        # one metric bucket is enough to establish an order
-    return titles
-
-
-def _rank_chunk_sizes(total):
-    """Batch sizes to try, largest first, when ranking *total* objects.
-
-    A cluster that rejects an oversized ``object_ids`` list makes the create
-    fail fast, so stepping down discovers the real cap in at most a few extra
-    POSTs and the working size is remembered for the rest of the session.
-    """
-    if _RANK_CHUNK_SIZE:
-        return [_RANK_CHUNK_SIZE]
-    sizes = [total, 256, 128, 64, _DRILL_PROBE_LIMIT]
-    ordered = []
-    for size in sizes:
-        size = min(size, total)
-        if size >= 1 and size not in ordered:
-            ordered.append(size)
-    return sorted(ordered, reverse=True)
-
-
-def _rank_scan(mode, objects, cfg, chunk_size, id_to_name):
-    """Rank every object using monitors of *chunk_size* ids each.
-
-    Raises RuntimeError if the very first create is rejected, so the caller
-    can retry with a smaller batch instead of reporting the cluster as idle.
-    """
-    ranked = []
-    prop_list = build_drill_rank_prop_list(mode)
-    for start in range(0, len(objects), chunk_size):
-        chunk = objects[start:start + chunk_size]
-        object_ids = [obj["id"] for obj in chunk]
-        monitor_id = None
-        try:
-            monitor_id = _create_monitor_raw(
-                f"rank_{mode}_{start}", prop_list, cfg["object_type"], object_ids,
-                no_aggregation=cfg.get("no_aggregation", False),
-            )
-            result = api_request("GET", f"/monitors/{monitor_id}/query/")
-            for obj_id in object_ids:
-                row = _build_drill_row(
-                    mode, _slice_result_for_object(result, obj_id), id_to_name[obj_id],
-                )
-                ranked.append({
-                    "id": obj_id,
-                    "name": id_to_name[obj_id],
-                    "total_ops": as_float(row.get("total_ops")) or 0.0,
-                })
-        except RuntimeError:
-            if start == 0:
-                raise
-            # A later chunk failing is not worth abandoning the ranking for;
-            # treat those objects as idle rather than losing the whole drill.
-            for obj_id in object_ids:
-                ranked.append({"id": obj_id, "name": id_to_name[obj_id],
-                               "total_ops": 0.0})
-        finally:
-            delete_monitor(monitor_id)
-    return ranked
-
-
-def _rank_via_monitors(mode, objects, cfg):
-    """Rank candidates with as few batched rank monitors as the cluster allows."""
-    global _RANK_CHUNK_SIZE
-    id_to_name = {obj["id"]: _obj_name(obj, cfg["name_fields"]) for obj in objects}
-    ranked = None
-    for chunk_size in _rank_chunk_sizes(len(objects)):
-        try:
-            ranked = _rank_scan(mode, objects, cfg, chunk_size, id_to_name)
-        except RuntimeError:
-            continue
-        _RANK_CHUNK_SIZE = chunk_size
-        break
-    if ranked is None:
-        # Every batch size was refused: keep the objects rather than the drill
-        # failing outright, ordered by name so the list is at least stable.
-        ranked = [{"id": obj["id"], "name": id_to_name[obj["id"]], "total_ops": 0.0}
-                  for obj in objects]
-    ranked.sort(key=lambda item: (-item["total_ops"], item["name"].lower()))
-    return [{"id": item["id"], "name": item["name"]}
-            for item in ranked[:_MAX_DRILL_OBJECTS]]
+def _drill_score(mode, sliced_result):
+    """Activity score for one object during ranking."""
+    return as_float(_build_drill_row(mode, sliced_result, "")["total_ops"]) or 0.0
 
 
 def _rank_drill_candidates(mode, objects, cfg):
@@ -1546,85 +1360,19 @@ def _rank_drill_candidates(mode, objects, cfg):
 
     Ranking a cluster's full object list used to mean one create/query/delete
     round trip per 32 objects, serially: 429 views cost 42 requests and ~47 s
-    of "stand by" on a cluster answering in 0.3-4 s per call. Now the ranking
-    tries, in order, a single server-side topn request, then the fewest
-    batched rank monitors the cluster will accept, and the result is cached
-    so leaving and re-entering the drill is free.
+    of "stand by" on a cluster answering in ~1 s per call. vast_drill tries a
+    single server-side topn request, then the fewest batched rank monitors the
+    cluster accepts, and caches the result so re-entering a drill is free.
     """
-    if not objects:
-        return []
-    cached = _cached_ranking(mode, objects)
-    if cached is not None:
-        return cached
-    ranked = _rank_via_topn(mode, objects, cfg)
-    if ranked is None:
-        ranked = _rank_via_monitors(mode, objects, cfg)
-    _store_ranking(mode, objects, ranked)
-    return ranked
-
-
-def _ranking_signature(objects):
-    return len(objects), tuple(sorted(obj["id"] for obj in objects))[:64]
-
-
-def _cached_ranking(mode, objects):
-    entry = _RANK_CACHE.get(mode)
-    if not entry:
-        return None
-    stamped, signature, ranked = entry
-    if signature != _ranking_signature(objects):
-        return None
-    if time.monotonic() - stamped > _RANK_CACHE_TTL:
-        return None
-    return list(ranked)
-
-
-def _store_ranking(mode, objects, ranked):
-    _RANK_CACHE[mode] = (time.monotonic(), _ranking_signature(objects), list(ranked))
-
-
-def _create_batch_drill_monitor(mode, cfg, prop_list):
-    """Create one monitor covering every drill object; returns (id, error).
-
-    For cnode the batch layout is probe-validated: VMS returns an
-    ``object_id`` column even for a single-object cnode monitor, and the
-    tenant batch monitor proves ``aggregation=avg`` does not collapse rows
-    across objects - but rather than assume, query the new monitor once and
-    confirm it really can be split per object. If it cannot, drop
-    BATCH_CNODE_OK so the caller falls back to one monitor per cnode.
-    """
-    global BATCH_CNODE_OK
-    object_ids = [obj["id"] for obj in DRILL_OBJECTS]
-    try:
-        monitor_id = _create_monitor_raw(
-            f"{mode}_batch", prop_list, cfg["object_type"], object_ids,
-            no_aggregation=cfg.get("no_aggregation", False),
-        )
-    except RuntimeError as e:
-        if mode == "cnode":
-            BATCH_CNODE_OK = False
-        return None, str(e)
-
-    if mode != "cnode" or len(object_ids) < 2:
-        return monitor_id, None
-
-    try:
-        result = api_request("GET", f"/monitors/{monitor_id}/query/")
-    except RuntimeError as e:
-        delete_monitor(monitor_id)
-        BATCH_CNODE_OK = False
-        return None, str(e)
-
-    _prop_list, _data, prop_idx = _result_parts(result)
-    distinct = {
-        len(_slice_result_for_object(result, oid).get("data") or [])
-        for oid in object_ids
-    }
-    if "object_id" in prop_idx and distinct != {0}:
-        return monitor_id, None
-    delete_monitor(monitor_id)
-    BATCH_CNODE_OK = False
-    return None, "cnode batch monitor is not splittable per object"
+    return DRILL.rank(
+        mode, objects,
+        object_type=cfg["object_type"],
+        rank_props=build_drill_rank_prop_list(mode),
+        score_fn=lambda sliced: _drill_score(mode, sliced),
+        time_frame=API_TIME_FRAME,
+        name_of=lambda obj: _obj_name(obj, cfg["name_fields"]),
+        no_aggregation=cfg.get("no_aggregation", False),
+    )
 
 
 def enter_drill_mode(mode):
@@ -1662,28 +1410,15 @@ def enter_drill_mode(mode):
         return
 
     _cleanup_drill_monitors()
-    prop_list = build_drill_prop_list(mode)
-    new_monitors = []
-    last_error = None
-
-    if _is_batch_drill_mode(mode):
-        monitor_id, last_error = _create_batch_drill_monitor(mode, cfg, prop_list)
-        if monitor_id is not None:
-            new_monitors.append((monitor_id, None))
-
-    if not new_monitors and not _is_batch_drill_mode(mode):
-        for obj in DRILL_OBJECTS:
-            try:
-                monitor_id = _create_monitor_raw(
-                    f"{mode}_{obj['id']}",
-                    prop_list,
-                    cfg["object_type"],
-                    [obj["id"]],
-                    no_aggregation=cfg.get("no_aggregation", False),
-                )
-                new_monitors.append((monitor_id, obj["name"]))
-            except RuntimeError as e:
-                last_error = str(e)
+    new_monitors, last_error = DRILL.create_monitors(
+        mode, DRILL_OBJECTS,
+        object_type=cfg["object_type"],
+        props=build_drill_prop_list(mode),
+        no_aggregation=cfg.get("no_aggregation", False),
+        # cnode per-object rows are inferred (VMS returns an object_id column
+        # even for a single-object cnode monitor), so confirm before trusting.
+        validate_batch=(mode == "cnode"),
+    )
 
     if not new_monitors:
         hint = ""
@@ -1724,14 +1459,11 @@ def fetch_drill_query(force=False):
     timestamp. Skipping those wasted queries keeps the panel exactly as fresh
     while cutting drill request volume. The space bar passes force=True.
     """
-    global LAST_DRILL_ROWS, DRILL_ERROR, _LAST_DRILL_QUERY_AT
+    global LAST_DRILL_ROWS, DRILL_ERROR
     if not DRILL_MODE:
         return
-    now = time.monotonic()
-    if (not force and LAST_DRILL_ROWS
-            and now - _LAST_DRILL_QUERY_AT < _DRILL_MIN_QUERY_INTERVAL):
+    if not DRILL.should_query(force=force, have_data=bool(LAST_DRILL_ROWS)):
         return
-    _LAST_DRILL_QUERY_AT = now
     drill_rows = []
     query_errors = 0
 

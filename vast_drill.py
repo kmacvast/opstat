@@ -1,0 +1,374 @@
+#!/usr/bin/env python3
+"""Shared VMS drill-down machinery: candidate ranking, batch monitors, throttle.
+
+Every protocol engine offers the same drill-down shape - pick the most active
+cNodes / views / tenants, keep a monitor on them, refresh alongside the
+dashboard - and every engine had grown its own copy. The copies diverged in
+ways that mattered on a real cluster:
+
+* ranking by creating, querying and deleting one temporary monitor per 32
+  objects, serially, which cost 42 requests and ~47 s to rank 429 views;
+* or no ranking at all, so the drill showed whichever objects ``/views/``
+  happened to list first - typically eight idle ones;
+* one monitor per object, so a refresh tick issued one query per row.
+
+This module holds the version that was measured and fixed. Engines supply
+their own metric families, row builders and activity scoring; the ordering,
+batching, capability discovery and caching live here.
+"""
+
+import time
+import urllib.parse
+
+# ---------------------------------------------------------------------------
+# Monitor result helpers (identical in every engine)
+# ---------------------------------------------------------------------------
+
+
+def result_parts(result):
+    """Return (prop_list, data, prop_idx) from a monitor query result dict."""
+    if not isinstance(result, dict):
+        return [], [], {}
+    prop_list = result.get("prop_list", []) or []
+    data = result.get("data", []) or []
+    return prop_list, data, {name: idx for idx, name in enumerate(prop_list)}
+
+
+def normalize_object_id(value):
+    """Coerce a VMS object_id for reliable batch-monitor slicing."""
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return value
+
+
+def slice_result_for_object(result, object_id):
+    """Return a monitor query payload containing only one object_id's samples.
+
+    A batch monitor's response carries every object's rows interleaved under
+    an ``object_id`` column. Results without that column are passed through
+    unchanged, which is what a single-object monitor returns.
+    """
+    if not isinstance(result, dict):
+        return result
+    prop_list, data, prop_idx = result_parts(result)
+    oid_idx = prop_idx.get("object_id")
+    if oid_idx is None:
+        return result
+    want = normalize_object_id(object_id)
+    return {
+        "prop_list": prop_list,
+        "data": [
+            row for row in data
+            if len(row) > oid_idx and normalize_object_id(row[oid_idx]) == want
+        ],
+    }
+
+
+def topn_titles(payload, object_type):
+    """Flatten a /monitors/topn/ payload into an ordered list of object titles."""
+    if not isinstance(payload, dict):
+        return []
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return []
+    block = data.get(object_type)
+    if isinstance(block, dict):
+        buckets = [rows for rows in block.values() if isinstance(rows, list)]
+    elif isinstance(block, list):
+        buckets = [block]
+    else:
+        return []
+    for rows in buckets:
+        titles = [row["title"] for row in rows
+                  if isinstance(row, dict) and row.get("title")]
+        if titles:
+            return titles      # one metric bucket establishes the order
+    return []
+
+
+class DrillSession:
+    """Per-run drill state: learned cluster capabilities and cached rankings.
+
+    ``create_monitor_fn(name_suffix, prop_list, object_type, object_ids)`` and
+    ``delete_monitor_fn(monitor_id)`` are the engine's own helpers, so API-call
+    logging and monitor-teardown registration keep working unchanged.
+    """
+
+    def __init__(self, *, request_fn, create_monitor_fn, delete_monitor_fn,
+                 max_objects=8, min_batch=32, topn_limit=32,
+                 cache_ttl=300.0, min_query_interval=15.0):
+        self._request = request_fn
+        self._create_monitor = create_monitor_fn
+        self._delete_monitor = delete_monitor_fn
+        self.max_objects = max_objects
+        self.min_batch = min_batch
+        self.topn_limit = topn_limit
+        self.cache_ttl = cache_ttl
+        self.min_query_interval = min_query_interval
+        self.reset()
+
+    def reset(self):
+        """Clear learned capabilities and cached rankings (new run, or tests)."""
+        self._rank_cache = {}
+        self._rank_chunk_size = None
+        self._batch_unsupported = set()
+        self._last_query_at = 0.0
+
+    # -- poll throttling ---------------------------------------------------
+    def should_query(self, force=False, have_data=True):
+        """True when the drill monitors are due for a re-query.
+
+        Object-scoped metric families publish roughly once a minute, so a 5 s
+        dashboard tick re-fetched byte-identical payloads. Returning False
+        skips those without making the panel any staler.
+        """
+        now = time.monotonic()
+        if force or not have_data:
+            self._last_query_at = now
+            return True
+        if now - self._last_query_at < self.min_query_interval:
+            return False
+        self._last_query_at = now
+        return True
+
+    def note_queried(self):
+        self._last_query_at = time.monotonic()
+
+    # -- ranking -----------------------------------------------------------
+    def rank(self, mode, objects, *, object_type, rank_props, score_fn,
+             time_frame, name_of, no_aggregation=False, use_topn=True):
+        """Return the most active ``max_objects`` candidates as {id, name} dicts.
+
+        ``score_fn(sliced_result)`` returns one object's activity; ``name_of``
+        maps a raw VMS object dict to its display name.
+        """
+        if not objects:
+            return []
+        cached = self._cached(mode, objects)
+        if cached is not None:
+            return cached
+        ranked = None
+        if use_topn:
+            ranked = self._rank_via_topn(
+                objects, object_type, rank_props, time_frame, name_of,
+            )
+        if ranked is None:
+            ranked = self._rank_via_monitors(
+                mode, objects, object_type, rank_props, score_fn, time_frame,
+                name_of, no_aggregation,
+            )
+        self._store(mode, objects, ranked)
+        return ranked
+
+    def _rank_via_topn(self, objects, object_type, rank_props, time_frame, name_of):
+        """One server-side GET /monitors/topn/, or None when it is not usable.
+
+        Creates no monitors. Best-effort: absent on some builds, and it
+        identifies objects by title rather than id, so the result is accepted
+        only when enough titles map back to real objects. When every candidate
+        already fits in one rank monitor that scan is both cheap and exact, so
+        skip the extra round trip entirely.
+        """
+        if len(objects) <= self.min_batch or not rank_props:
+            return None
+        path = (
+            "/monitors/topn/?object_type=" + urllib.parse.quote(object_type, safe="")
+            + "&prop_list=" + urllib.parse.quote(rank_props[0], safe=",")
+            + "&time_frame=" + urllib.parse.quote(str(time_frame), safe="")
+            + "&limit=%d" % self.topn_limit
+        )
+        try:
+            payload = self._request("GET", path)
+        except RuntimeError:
+            return None
+        titles = topn_titles(payload, object_type)
+        if not titles:
+            return None
+        by_name = {}
+        for obj in objects:
+            by_name.setdefault(name_of(obj).lower(), obj)
+        ranked, seen = [], set()
+        for title in titles:
+            obj = by_name.get(str(title).lower())
+            if obj is None or obj["id"] in seen:
+                continue
+            seen.add(obj["id"])
+            ranked.append({"id": obj["id"], "name": name_of(obj)})
+            if len(ranked) >= self.max_objects:
+                break
+        # A short list means topn and the object endpoint disagree about
+        # naming, or the cluster is near-idle; the monitor scan is
+        # authoritative either way.
+        if len(ranked) < min(self.max_objects, len(objects)):
+            return None
+        return ranked
+
+    def _rank_chunk_sizes(self, total):
+        """Batch sizes to try, largest first: everything, then stepping down.
+
+        A cluster that refuses an oversized ``object_ids`` list fails the
+        create fast, so this discovers the real cap in a few extra POSTs and
+        the working size is reused for the rest of the run.
+        """
+        if self._rank_chunk_size:
+            return [min(self._rank_chunk_size, total)]
+        ordered = []
+        for size in (total, 256, 128, 64, self.min_batch):
+            size = min(size, total)
+            if size >= 1 and size not in ordered:
+                ordered.append(size)
+        return sorted(ordered, reverse=True)
+
+    def _rank_scan(self, mode, objects, object_type, rank_props, score_fn,
+                   time_frame, id_to_name, no_aggregation, chunk_size):
+        """Rank every object using monitors of *chunk_size* ids each.
+
+        Re-raises if the very first create is rejected so the caller can retry
+        with a smaller batch instead of reporting the cluster as idle.
+        """
+        ranked = []
+        for start in range(0, len(objects), chunk_size):
+            chunk = objects[start:start + chunk_size]
+            object_ids = [obj["id"] for obj in chunk]
+            monitor_id = None
+            try:
+                monitor_id = self._create_monitor(
+                    "rank_%s_%d" % (mode, start), rank_props, object_type,
+                    object_ids, no_aggregation=no_aggregation,
+                )
+                result = self._request("GET", "/monitors/%s/query/" % monitor_id)
+                for obj_id in object_ids:
+                    score = score_fn(slice_result_for_object(result, obj_id))
+                    ranked.append({"id": obj_id, "name": id_to_name[obj_id],
+                                   "total_ops": score or 0.0})
+            except RuntimeError:
+                if start == 0:
+                    raise
+                # A later chunk failing is not worth losing the whole drill
+                # for; treat those objects as idle.
+                for obj_id in object_ids:
+                    ranked.append({"id": obj_id, "name": id_to_name[obj_id],
+                                   "total_ops": 0.0})
+            finally:
+                if monitor_id is not None:
+                    self._delete_monitor(monitor_id)
+        return ranked
+
+    def _rank_via_monitors(self, mode, objects, object_type, rank_props,
+                           score_fn, time_frame, name_of, no_aggregation):
+        id_to_name = {obj["id"]: name_of(obj) for obj in objects}
+        ranked = None
+        for chunk_size in self._rank_chunk_sizes(len(objects)):
+            try:
+                ranked = self._rank_scan(
+                    mode, objects, object_type, rank_props, score_fn,
+                    time_frame, id_to_name, no_aggregation, chunk_size,
+                )
+            except RuntimeError:
+                continue
+            self._rank_chunk_size = chunk_size
+            break
+        if ranked is None:
+            # Every batch size was refused: keep the objects so the drill can
+            # still open, ordered by name so the list is at least stable.
+            ranked = [{"id": obj["id"], "name": id_to_name[obj["id"]],
+                       "total_ops": 0.0} for obj in objects]
+        ranked.sort(key=lambda item: (-item["total_ops"], str(item["name"]).lower()))
+        return [{"id": item["id"], "name": item["name"]}
+                for item in ranked[:self.max_objects]]
+
+    def _signature(self, objects):
+        return len(objects), tuple(sorted(str(obj["id"]) for obj in objects))[:64]
+
+    def _cached(self, mode, objects):
+        entry = self._rank_cache.get(mode)
+        if not entry:
+            return None
+        stamped, signature, ranked = entry
+        if signature != self._signature(objects):
+            return None
+        if time.monotonic() - stamped > self.cache_ttl:
+            return None
+        return list(ranked)
+
+    def _store(self, mode, objects, ranked):
+        self._rank_cache[mode] = (
+            time.monotonic(), self._signature(objects), list(ranked),
+        )
+
+    # -- monitor creation --------------------------------------------------
+    def create_monitors(self, mode, drill_objects, *, object_type, props,
+                        no_aggregation=False, validate_batch=False):
+        """Create drill monitors, batched into one where the cluster allows it.
+
+        Returns ``(monitors, error)`` where monitors is a list of
+        ``(monitor_id, object_name_or_None)``; a single entry with a None name
+        means one batch monitor covers every object. ``validate_batch`` spends
+        one extra query confirming the response really can be split per
+        object before committing to the batch layout - worth it for scopes
+        where per-object rows are inferred rather than documented.
+        """
+        object_ids = [obj["id"] for obj in drill_objects]
+        if not object_ids:
+            return [], "no objects selected"
+
+        if mode not in self._batch_unsupported:
+            monitor_id, error = self._create_batch(
+                mode, object_ids, object_type, props, no_aggregation, validate_batch,
+            )
+            if monitor_id is not None:
+                return [(monitor_id, None)], None
+            batch_error = error
+        else:
+            batch_error = None
+
+        monitors, last_error = [], batch_error
+        for obj in drill_objects:
+            try:
+                monitors.append((
+                    self._create_monitor(
+                        "%s_%s" % (mode, obj["id"]), props, object_type,
+                        [obj["id"]], no_aggregation=no_aggregation,
+                    ),
+                    obj["name"],
+                ))
+            except RuntimeError as exc:
+                last_error = str(exc)
+        return monitors, (None if monitors else last_error)
+
+    def _create_batch(self, mode, object_ids, object_type, props,
+                      no_aggregation, validate):
+        try:
+            monitor_id = self._create_monitor(
+                "%s_batch" % mode, props, object_type, object_ids,
+                no_aggregation=no_aggregation,
+            )
+        except RuntimeError as exc:
+            self._batch_unsupported.add(mode)
+            return None, str(exc)
+
+        if not validate or len(object_ids) < 2:
+            return monitor_id, None
+        try:
+            result = self._request("GET", "/monitors/%s/query/" % monitor_id)
+        except RuntimeError as exc:
+            self._delete_monitor(monitor_id)
+            self._batch_unsupported.add(mode)
+            return None, str(exc)
+        _props, _data, prop_idx = result_parts(result)
+        splits = {
+            len(slice_result_for_object(result, oid).get("data") or [])
+            for oid in object_ids
+        }
+        if "object_id" in prop_idx and splits != {0}:
+            return monitor_id, None
+        self._delete_monitor(monitor_id)
+        self._batch_unsupported.add(mode)
+        return None, "%s batch monitor is not splittable per object" % mode
+
+    def batch_active(self, monitors):
+        """True when *monitors* is the single-batch layout."""
+        return len(monitors) == 1 and monitors[0][1] is None
