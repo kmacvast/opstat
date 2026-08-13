@@ -433,10 +433,10 @@ def test_space_forces_a_native_rescrape(engine):
     assert scrapes == ["/api/prometheusmetrics/basic"]
 
 
-def test_client_drill_uses_host_view_only(engine):
+def test_hosts_drill_uses_host_view_only(engine):
     nfs_v41, server = engine
     server.reset_calls()
-    nfs_v41.enter_exporter_mode("client")
+    nfs_v41.enter_exporter_mode("hosts")
     paths = [p for _t, _m, p, _s in server.calls() if "prometheus" in p]
     assert paths == ["/api/prometheusmetrics/host_view"]
     assert nfs_v41.HOSTVIEW.rows or nfs_v41.HOSTVIEW.error is None
@@ -446,7 +446,7 @@ def test_exporter_drill_leaves_no_monitors_behind(engine):
     nfs_v41, server = engine
     before = set(server.live_monitors())
     nfs_v41.enter_exporter_mode("native")
-    nfs_v41.enter_exporter_mode("client")
+    nfs_v41.enter_exporter_mode("hosts")
     nfs_v41.exit_exporter_mode()
     assert set(server.live_monitors()) == before
 
@@ -454,7 +454,7 @@ def test_exporter_drill_leaves_no_monitors_behind(engine):
 def test_exporter_drill_never_calls_the_delete_delegation_endpoint(engine):
     nfs_v41, server = engine
     nfs_v41.enter_exporter_mode("native")
-    nfs_v41.enter_exporter_mode("client")
+    nfs_v41.enter_exporter_mode("hosts")
     for _ in range(3):
         nfs_v41.poll_tick()
     bad = [p for _t, m, p, _s in server.calls()

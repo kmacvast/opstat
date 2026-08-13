@@ -75,7 +75,7 @@ def v41(monkeypatch):
 ALL_MODES = [None, "view", "cnode", "tenant"]
 # Exporter-backed drills render through a different path and must keep the
 # same footer.
-EXPORTER_MODES = ["native", "client"]
+EXPORTER_MODES = ["native", "hosts"]
 
 
 @pytest.mark.parametrize("mode", ALL_MODES)
@@ -90,7 +90,7 @@ def test_navigation_footer_present_in_every_mode(v41, mode):
 @pytest.mark.parametrize("key,label", [
     ("q", "Quit"), ("o", "Ops"), ("l", "Lat"), ("n", "Name"),
     ("c", "cNode"), ("v", "View"), ("t", "Tenant"),
-    ("4", "Native v4"), ("h", "v4 Clients"),
+    ("4", "Native v4"), ("h", "v4 hosts"),
     ("x", "Exit drill"), ("space", "Refresh"),
 ])
 def test_every_control_is_listed_in_every_mode(v41, mode, key, label):
@@ -200,7 +200,7 @@ def test_footer_present_in_exporter_drill_modes(v41, mode):
     assert "[q] Quit" in frame
     assert "[x] Exit drill" in frame
     assert "[4] Native v4" in frame
-    assert "[h] v4 Clients" in frame
+    assert "[h] v4 hosts" in frame
 
 
 @pytest.mark.parametrize("mode", EXPORTER_MODES)

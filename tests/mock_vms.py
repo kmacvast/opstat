@@ -265,7 +265,13 @@ NFS4_EXPORTER_OPS = (
     "restorefh", "savefh", "secinfo", "secinfo_no_name", "sequence",
     "setattr", "test_stateid", "write",
 )
-_NFS4_CNODES = ((1, "cnode-01"), (2, "cnode-02"), (3, "cnode-03"))
+# Real hostnames differ only in a trailing digit, which is what made a
+# right-truncated column render every cNode identically.
+_NFS4_CNODES = ((1, "se-az-arrow-cb4-cn1"), (2, "se-az-arrow-cb4-cn2"),
+                (3, "se-az-arrow-cb4-cn3"))
+
+# Observed on VAST OS 5.5.0.1: SEQUENCE and GETFH are well under 1 us.
+_NFS4_SUBMICRO_OPS = {"sequence": 0.42, "getfh": 0.19, "putfh": 3.1}
 
 
 def _nfs4_exposition(elapsed):
@@ -277,7 +283,9 @@ def _nfs4_exposition(elapsed):
     out = []
     for idx, op in enumerate(NFS4_EXPORTER_OPS):
         rate = 5.0 + idx * 1.5              # operations per second
-        latency_us = 200.0 + idx * 37.0     # mean microseconds per operation
+        # Match the real cluster's shape: session-slot and filehandle
+        # bookkeeping is sub-microsecond, data operations are hundreds of us.
+        latency_us = _NFS4_SUBMICRO_OPS.get(op, 200.0 + idx * 37.0)
         count = 1_000_000 + rate * elapsed
         total = count * latency_us
         base = f"vast_cluster_metrics_Nfs4Metrics_nfs4_{op}_req_latency"

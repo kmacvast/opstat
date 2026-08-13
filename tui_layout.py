@@ -118,6 +118,13 @@ def format_latency_us(us, active=True):
         return "-", None
     if us >= 1000:
         return f"{us / 1000:.2f} ms", us
+    # Sub-microsecond operations are real: NFSv4 SEQUENCE and GETFH are
+    # session-slot and filehandle bookkeeping and measure well under 1 us on
+    # a live cluster. Rounding those to "0 us" said "no data" when the true
+    # answer was "extremely fast", so keep decimals until the integer part
+    # carries the information itself.
+    if us < 10:
+        return f"{us:.2f} {_MUS}", us
     return f"{us:.0f} {_MUS}", us
 
 

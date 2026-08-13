@@ -1349,23 +1349,23 @@ def fetch_drill_query(force=False):
 
 def switch_drill_mode(mode):
     """Enter drill mode with an immediate standby message for slow monitor setup."""
-    global DRILL_STATUS, SORT_MODE
-    cfg = _DRILL_CFG.get(mode, {})
+    global SORT_MODE
+    _cfg = _DRILL_CFG.get(mode, {})
     exit_drill_mode()
     if mode in ("view", "tenant"):
         SORT_MODE = "ops"
-    label = cfg.get("label", mode.upper())
-    if mode in ("view", "tenant"):
-        DRILL_STATUS = f"Ranking {label} drill-down by activity, stand by..."
-    else:
-        DRILL_STATUS = f"Switching to {label} drill-down, stand by..."
-    render_screen()
-    try:
+    def _work():
         enter_drill_mode(mode)
         if DRILL_MODE:
             fetch_drill_query(force=True)
-    finally:
-        DRILL_STATUS = None
+
+    vast_drill.with_loading_status(
+        _set_drill_status, render_screen, mode, _work)
+
+
+def _set_drill_status(text):
+    global DRILL_STATUS
+    DRILL_STATUS = text
 
 
 # ---------------------------------------------------------------------------

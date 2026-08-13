@@ -232,7 +232,7 @@ DRILL = None
 # from DRILL_MODE so the monitor-API drills stay exactly as validated: the
 # exporter costs ~276 KB and 1.2-2.4 s per scrape and must never touch the
 # dashboard refresh path.
-EXPORTER_MODE = None        # None | "native" | "client"
+EXPORTER_MODE = None        # None | "native" | "hosts" | "view"
 EXPORTER_STATUS = None      # transient "Scraping..." message
 NFS4 = None                 # nfs4_native.Nfs4Collector
 HOSTVIEW = None             # nfs4_native.HostViewCollector
@@ -271,6 +271,7 @@ LAST_ROWS = {"data": [], "stateful": [], "state": [], "pnfs": [],
              "distribution": [], "session": [], "meta": {}}
 LAST_SAMPLE = "-"
 DRILL_MODE = DRILL_ERROR = None
+DRILL_STATUS = None         # transient "Loading..." message during drill setup
 DRILL_OBJECTS = []
 DRILL_MONITORS = []
 LAST_DRILL_ROWS = []
@@ -279,7 +280,8 @@ LAST_DRILL_ROWS = []
 def init_config(args):
     global ARGS, VMS, PORT, USER, PASSWORD, REFRESH_SECONDS, API_TIME_FRAME
     global SAMPLE_AVERAGE_MODE, BASE_URL, AUTH, HEADERS, _COLOR, DRILL
-    global DRILL_MODE, DRILL_ERROR, DRILL_OBJECTS, DRILL_MONITORS, LAST_DRILL_ROWS
+    global DRILL_MODE, DRILL_ERROR, DRILL_STATUS, DRILL_OBJECTS
+    global DRILL_MONITORS, LAST_DRILL_ROWS
     global EXPORTER_MODE, EXPORTER_STATUS, NFS4, HOSTVIEW
 
     ARGS = args
@@ -322,6 +324,7 @@ def init_config(args):
     DRILL_OBJECTS = []
     DRILL_MONITORS = []
     LAST_DRILL_ROWS = []
+    DRILL_STATUS = None
     EXPORTER_MODE = EXPORTER_STATUS = None
     NFS4 = nfs4_native.Nfs4Collector(vast_common.request_text)
     HOSTVIEW = nfs4_native.HostViewCollector(vast_common.request_text)
@@ -1330,6 +1333,19 @@ def _exporter_source_line():
     return "   ".join(parts)
 
 
+def _shorten_hostname(hostname, width):
+    """Trim a hostname while keeping what distinguishes it.
+
+    Cluster hostnames share a long prefix (se-az-arrow-cb4-cn1, -cn2, -cn3),
+    so truncating from the right rendered every cNode identically. Keep the
+    tail, which is where the node number lives.
+    """
+    text = str(hostname)
+    if len(text) <= width:
+        return text
+    return "…" + text[-(width - 1):]
+
+
 def _render_native_panels(width):
     """Native NFSv4 session, file-state, operation-mix and cNode panels."""
     if NFS4.error:
@@ -1434,7 +1450,8 @@ def _render_native_panels(width):
     # -- cNode attribution -------------------------------------------------
     print(box_top("NFSv4.1 PER-cNODE (VMS exporter attribution)", width))
     print(box_row(join_columns([
-        c(pad_display("cNode", 18, "<"), _BOLD),
+        c(pad_display("ID", 5, "<"), _BOLD),
+        c(pad_display("cNode", 22, "<"), _BOLD),
         c(pad_display("v4 ops/s", 12, ">"), _BOLD),
         c(pad_display("SEQUENCE/s", 12, ">"), _BOLD),
         c(pad_display("READ/s", 10, ">"), _BOLD),
@@ -1447,7 +1464,9 @@ def _render_native_panels(width):
     for row in NFS4.cnode_rows():
         ops = row["ops"]
         print(box_row(join_columns([
-            c(pad_display(str(row["hostname"])[:18], 18, "<"), _BWHITE),
+            c(pad_display(str(row["cnode_id"]), 5, "<"), _BCYAN),
+            c(pad_display(_shorten_hostname(row["hostname"], 22), 22, "<"),
+              _BWHITE),
             c(pad_display(_fmt_rate(row["total_ops"]), 12, ">"), _GREEN),
             c(pad_display(_fmt_rate(ops.get("sequence")), 12, ">"), _DIM),
             c(pad_display(_fmt_rate(ops.get("read")), 10, ">"), _CYAN),
@@ -1457,15 +1476,17 @@ def _render_native_panels(width):
             c(pad_display("-" if row["connections"] is None
                           else f"{row['connections']:,.0f}", 7, ">"), _DIM),
         ], " "), width))
-    print(box_row(c("Per-cNode figures are VMS exporter attribution; they are "
-                    "not guaranteed to sum to the cluster totals.", _DIM), width))
+    print(box_row(c("VMS exporter attribution. Measured against a live cluster "
+                    "the per-cNode rates summed to the cluster totals exactly "
+                    "(SEQUENCE 1553.08 of 1553.1; READ/WRITE/OPEN to the "
+                    "displayed precision).", _DIM), width))
     print(box_bottom(width))
 
 
-def _render_client_panel(width):
-    """Per-client NFSv4 attribution from vast_host_view_*, protocol=NFS4."""
+def _render_hosts_panel(width):
+    """NFSv4 host attribution: client IP x view path, protocol=NFS4."""
     if HOSTVIEW.error:
-        print(box_top("NFSv4 CLIENT / VIEW ATTRIBUTION", width))
+        print(box_top("NFSv4 HOSTS", width))
         print(box_row(c(f"Scrape failed: {HOSTVIEW.error[:width - 20]}", _BRED),
                       width))
         if HOSTVIEW.rows:
@@ -1477,7 +1498,8 @@ def _render_client_panel(width):
             return
         print()
 
-    print(box_top("NFSv4 CLIENT / VIEW ATTRIBUTION (protocol=NFS4)", width))
+    print(box_top("NFSv4 HOSTS - client IP x view attribution "
+                  "(host_view, protocol=NFS4)", width))
     age = (time.monotonic() - HOSTVIEW.last_scrape_at
            if HOSTVIEW.last_scrape_at else None)
     print(box_row(c(f"source {HOSTVIEW.endpoint}   "
@@ -1515,19 +1537,86 @@ def _render_client_panel(width):
     print(box_bottom(width))
 
 
+def _render_view_panel(width):
+    """Per-view NFSv4 attribution, aggregated from host_view by path.
+
+    ViewMetrics is the monitor-API family for view scope, but on a live
+    cluster it reported no meaningful NFSv4 activity while Nfs4Metrics
+    measured ~1553 SEQUENCE/s. The exporter attributes that traffic to
+    specific paths, so this drill is built from it instead.
+    """
+    if HOSTVIEW.error and not HOSTVIEW.rows:
+        print(box_top("NFSv4 VIEWS", width))
+        print(box_row(c(f"Scrape failed: {HOSTVIEW.error[:width - 20]}", _BRED),
+                      width))
+        print(box_row(c("Press x to return to the cluster view.", _DIM), width))
+        print(box_bottom(width))
+        return
+
+    rows = nfs4_native.aggregate_by_path(HOSTVIEW.rows)
+    print(box_top("NFSv4 VIEWS - per view path (host_view, protocol=NFS4)", width))
+    age = (time.monotonic() - HOSTVIEW.last_scrape_at
+           if HOSTVIEW.last_scrape_at else None)
+    print(box_row(c(f"source {HOSTVIEW.endpoint}   "
+                    f"{HOSTVIEW.last_bytes / 1024:.0f} KB   "
+                    f"{HOSTVIEW.last_elapsed * 1000:.0f} ms"
+                    + (f"   {age:.0f}s ago" if age is not None else "")
+                    + f"   refresh {int(HOSTVIEW.min_interval)}s", _DIM), width))
+    print(box_sep(width))
+    print(box_row(join_columns([
+        c(pad_display("View / path", 34, "<"), _BOLD),
+        c(pad_display("Tenant", 14, "<"), _BOLD),
+        c(pad_display("Hosts", 7, ">"), _BOLD),
+        c(pad_display("IOPS", 11, ">"), _BOLD),
+        c(pad_display("Read/s", 10, ">"), _BOLD),
+        c(pad_display("Write/s", 10, ">"), _BOLD),
+        c(pad_display("BW", 12, ">"), _BOLD),
+        c(pad_display(f"Avg {_MUS}", 11, ">"), _BOLD),
+    ], " "), width))
+    print(box_sep(width))
+    if not rows:
+        print(box_row(c("No NFS4 view series reported by the exporter.", _DIM),
+                      width))
+    for row in rows:
+        bw_text, _ = format_throughput_mbs(raw_bw_to_mb_sec(row["bw"]))
+        print(box_row(join_columns([
+            c(pad_display(str(row["path"])[:34], 34, "<"), _BCYAN),
+            c(pad_display(str(row["tenant"])[:14], 14, "<"), _DIM),
+            c(pad_display(str(row["client_count"]), 7, ">"), _BWHITE),
+            c(pad_display(_fmt_rate(row["iops"]), 11, ">"), _GREEN),
+            c(pad_display(_fmt_rate(row["read_iops"]), 10, ">"), _CYAN),
+            c(pad_display(_fmt_rate(row["write_iops"]), 10, ">"), _YELLOW),
+            c(pad_display(bw_text if row["bw"] else "-", 12, ">"), _CYAN),
+            c(pad_display(_fmt_us(row["latency_us"]), 11, ">"), _BGREEN),
+        ], " "), width))
+    print(box_row(c("Aggregated from per-host exporter series. ViewMetrics "
+                    "(monitor API) does not report this NFSv4 activity.",
+                    _DIM), width))
+    print(box_bottom(width))
+
+
 def _render_exporter_panels(width):
     if EXPORTER_STATUS:
-        print(box_top("NATIVE NFSv4 TELEMETRY", width))
+        title = {"hosts": "NFSv4 HOSTS", "view": "NFSv4 VIEWS"}.get(
+            EXPORTER_MODE, "NATIVE NFSv4 TELEMETRY")
+        print(box_top(title, width))
         print(box_row(c(EXPORTER_STATUS, _YELLOW), width))
         print(box_bottom(width))
         return
-    if EXPORTER_MODE == "client":
-        _render_client_panel(width)
+    if EXPORTER_MODE == "hosts":
+        _render_hosts_panel(width)
+    elif EXPORTER_MODE == "view":
+        _render_view_panel(width)
     else:
         _render_native_panels(width)
 
 
 def _render_drill_panel(width):
+    if DRILL_STATUS:
+        print(box_top("DRILL-DOWN", width))
+        print(box_row(c(DRILL_STATUS, _YELLOW), width))
+        print(box_bottom(width))
+        return
     dc = _DRILL_COL
     print(box_top(f"{(DRILL_MODE or '?').upper()} DRILL-DOWN", width))
     if DRILL_ERROR:
@@ -1618,24 +1707,45 @@ def _export_openmetrics():
     )
 
 
+def _set_drill_status(text):
+    global DRILL_STATUS
+    DRILL_STATUS = text
+
+
+def _set_exporter_status(text):
+    global EXPORTER_STATUS
+    EXPORTER_STATUS = text
+
+
+def switch_drill_mode(mode):
+    """Enter a monitor-backed drill behind a loading frame."""
+    exit_exporter_mode()
+    exit_drill_mode()
+
+    def _work():
+        enter_drill_mode(mode)
+        if DRILL_MODE:
+            fetch_drill_query(force=True)
+
+    vast_drill.with_loading_status(
+        _set_drill_status, render_screen, mode, _work)
+
+
 def enter_exporter_mode(mode):
     """Switch to an exporter-backed drill, scraping synchronously.
 
     The scrape costs seconds against a real VMS, so paint a status frame
     first: the user must see that opstat is working rather than hung.
     """
-    global EXPORTER_MODE, EXPORTER_STATUS
+    global EXPORTER_MODE
     exit_drill_mode()
-    label = ("client/view attribution" if mode == "client"
-             else "native NFSv4 telemetry")
-    EXPORTER_STATUS = f"Scraping {label}, stand by..."
     EXPORTER_MODE = mode
-    render_screen()
-    try:
-        collector = HOSTVIEW if mode == "client" else NFS4
-        collector.scrape(force=True)
-    finally:
-        EXPORTER_STATUS = None
+    collector = HOSTVIEW if mode in ("hosts", "view") else NFS4
+    # Not force=True: an empty collector always scrapes (scrapes == 0), but
+    # switching between the two host_view-backed drills inside the throttle
+    # window reuses the sample instead of paying for it twice. Space forces.
+    vast_drill.with_loading_status(
+        _set_exporter_status, render_screen, mode, collector.scrape)
 
 
 def exit_exporter_mode():
@@ -1645,7 +1755,7 @@ def exit_exporter_mode():
 
 def refresh_exporter(force=False):
     """Re-scrape the active exporter drill, subject to its own throttle."""
-    if EXPORTER_MODE == "client":
+    if EXPORTER_MODE in ("hosts", "view"):
         HOSTVIEW.scrape(force=force)
     elif EXPORTER_MODE == "native":
         NFS4.scrape(force=force)
@@ -1694,7 +1804,7 @@ _NAV_CONTROLS = (
     ("v", "View"),
     ("t", "Tenant"),
     ("4", "Native v4"),
-    ("h", "v4 Clients"),
+    ("h", "v4 hosts"),
     ("x", "Exit drill"),
     ("space", "Refresh"),
 )
@@ -1735,8 +1845,8 @@ def _render_frame():
         + c(f"   refresh {REFRESH_SECONDS}s", _DIM)
     )
     if EXPORTER_MODE:
-        tag = ("NFSv4 CLIENTS" if EXPORTER_MODE == "client"
-               else "NATIVE NFSv4")
+        tag = {"hosts": "NFSv4 HOSTS", "view": "NFSv4 VIEWS"}.get(
+            EXPORTER_MODE, "NATIVE NFSv4")
         title += c(f"   | {tag}", _BYELLOW)
     elif DRILL_MODE:
         title += c(f"   | {DRILL_MODE.upper()} DRILL", _BYELLOW)
@@ -1758,7 +1868,7 @@ def _render_frame():
     # visible controls at all.
     if EXPORTER_MODE or EXPORTER_STATUS:
         _render_exporter_panels(width)
-    elif DRILL_MODE:
+    elif DRILL_MODE or DRILL_STATUS:
         _render_drill_panel(width)
     else:
         _render_health_panel(LAST_ROWS, width)
@@ -2681,27 +2791,15 @@ def main():
             elif "n" in chars.lower():
                 SORT_MODE = "default"
             elif "c" in chars.lower():
-                exit_exporter_mode()
-                exit_drill_mode()
-                enter_drill_mode("cnode")
-                if DRILL_MODE:
-                    fetch_drill_query(force=True)
+                switch_drill_mode("cnode")
             elif "v" in chars.lower():
-                exit_exporter_mode()
-                exit_drill_mode()
-                enter_drill_mode("view")
-                if DRILL_MODE:
-                    fetch_drill_query(force=True)
+                enter_exporter_mode("view")
             elif "t" in chars.lower():
-                exit_exporter_mode()
-                exit_drill_mode()
-                enter_drill_mode("tenant")
-                if DRILL_MODE:
-                    fetch_drill_query(force=True)
+                switch_drill_mode("tenant")
             elif "4" in chars:
                 enter_exporter_mode("native")
             elif "h" in chars.lower():
-                enter_exporter_mode("client")
+                enter_exporter_mode("hosts")
             elif "x" in chars.lower():
                 exit_drill_mode()
                 exit_exporter_mode()

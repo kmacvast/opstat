@@ -580,3 +580,44 @@ class DrillSession:
     def batch_active(self, monitors):
         """True when *monitors* is the single-batch layout."""
         return len(monitors) == 1 and monitors[0][1] is None
+
+
+# ---------------------------------------------------------------------------
+# Drill-entry loading status
+# ---------------------------------------------------------------------------
+# Entering a drill can block for seconds against a real VMS: ranking hundreds
+# of views, creating monitors, or scraping a 276 KB exporter endpoint. The
+# message has to reach the terminal *before* that work starts, or the TUI
+# simply looks hung.
+LOADING_MESSAGES = {
+    "cnode": "Loading the cNODE drill-down, please stand by...",
+    "view": "Loading the VIEW drill-down, please stand by...",
+    "views": "Loading the NFSv4 views, please stand by...",
+    "tenant": "Loading the TENANT drill-down, please stand by...",
+    "vip": "Loading the VIP drill-down, please stand by...",
+    "host": "Loading the HOST drill-down, please stand by...",
+    "native": "Loading the NFSv4 telemetry view, please stand by...",
+    "hosts": "Loading the NFSv4 hosts view, please stand by...",
+}
+
+
+def loading_message(mode):
+    """The stand-by message for a drill mode."""
+    return LOADING_MESSAGES.get(
+        mode, f"Loading the {str(mode).upper()} drill-down, please stand by...")
+
+
+def with_loading_status(show_status, render, mode, work):
+    """Paint a loading frame, then run blocking drill initialisation.
+
+    ``show_status(text_or_None)`` sets the engine's status global and
+    ``render()`` flushes one frame. Both run before *work* so the user sees
+    progress rather than a frozen screen; the status is always cleared, even
+    if the work raises.
+    """
+    show_status(loading_message(mode))
+    try:
+        render()
+        return work()
+    finally:
+        show_status(None)
