@@ -218,4 +218,4 @@ ssh -L 8443:var203.selab.vastdata.com:443 user@jump-host
 - [README.md](README.md) - shared CLI and protocol matrix
 - [SETUP.md](SETUP.md) - install and first-run
 - [SMB_README.md](SMB_README.md) - sibling ProtoMetrics engine (SMBCommon)
-- [scripts/README.md](scripts/README.md) - S3 loadgen (`s3-loadgen`) and systemd units
+- [scripts/README-systemd.md](scripts/README-systemd.md) - S3 loadgen (`s3-loadgen`) and systemd units

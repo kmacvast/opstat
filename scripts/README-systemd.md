@@ -1,4 +1,4 @@
-# Protocol load generators
+# Protocol load generators (systemd)
 
 Lab traffic generators that exercise the same NFS, SMB, NVMe-oTCP, and S3
 paths `opstat` displays. Each protocol is a standalone bash script. On Linux
@@ -43,6 +43,7 @@ sudo systemctl restart nfs3-loadgen nfs41-loadgen smb-loadgen block-loadgen s3-l
 | [Invoke-SmbOpstatLoad.ps1](Invoke-SmbOpstatLoad.ps1) | (run on Windows) | `\\172.200.203.6\opstattest` | Same SMB opcode mix from a Windows client |
 
 Unit files: [systemd/](systemd/). Installer: [systemd/install-lab-loadgen-units.sh](systemd/install-lab-loadgen-units.sh).
+Health snapshot: [systemd/loadgen-status.sh](systemd/loadgen-status.sh).
 
 Watch the matching dashboard:
 
@@ -180,6 +181,65 @@ Check everything at once:
 systemctl is-active nfs3-loadgen nfs41-loadgen smb-loadgen block-loadgen s3-loadgen
 systemctl is-enabled nfs3-loadgen nfs41-loadgen smb-loadgen block-loadgen s3-loadgen
 ```
+
+---
+
+## Are they running and healthy?
+
+`systemctl status` only tells you the unit is up. A healthy loadgen also has
+workers (fio, nvme, aws, elbencho), live mounts, and files whose mtimes are
+moving. Run the snapshot script from a clone on the lab host:
+
+```bash
+./scripts/systemd/loadgen-status.sh
+```
+
+What "healthy" looks like:
+
+| Check | Healthy | Unhealthy |
+|-------|---------|-----------|
+| Unit `ACTIVE` | `active` | `failed`, `inactive`, `activating` looping |
+| `RESTARTS` | 0, or a small number after a crash you already fixed | climbing every few seconds |
+| nfs3 / nfs41 / smb `fio` count | >= 1 | 0 after the unit has been up > 15s |
+| block `nvme` and/or `fio` | write-zeroes/compare and a fio job | unit active but both 0 |
+| s3 `aws` and/or `elbencho` | aws CLI loops; elbencho during its 60s PUT window | neither process ever appears |
+| Mounts | NFS/CIFS lines present | `DOWN` |
+| Workdirs | `nfs3_loadgen`, `nfs41_loadgen`, `smb_loadgen` exist; listing changes | missing while the unit is active |
+| Journal errors | empty for the last 3 minutes | repeating mount, fio, or 404 storms |
+
+One-shot commands if you do not want the script:
+
+```bash
+# Unit state, PIDs, restart counters, CPU/memory
+systemctl show -p Id,ActiveState,SubState,MainPID,NRestarts,ActiveEnterTimestamp,MemoryCurrent,CPUUsageNSec \
+  nfs3-loadgen nfs41-loadgen smb-loadgen block-loadgen s3-loadgen
+
+# Processes actually doing I/O (expect fio; block also nvme; s3 also aws/elbencho)
+ps -eo pid,ppid,etime,pcpu,pmem,args | grep -E '[f]io |[n]vme |[e]lbencho|[a]ws s3' | grep -v grep
+
+# Per-unit cgroup (lists every worker systemd is tracking)
+systemctl status --no-pager nfs3-loadgen nfs41-loadgen smb-loadgen block-loadgen s3-loadgen | \
+  sed -n '/Loaded:/p;/Active:/p;/CGroup/,/^$/p'
+
+# Mounts the loadgens require
+findmnt -n /mnt/kmacs-root /mnt/nfs41test /mnt/smbtest /mnt/blockhead1 2>/dev/null
+sudo nvme list
+
+# Workdirs: files should exist and timestamps should move if you re-run ls
+sudo ls -lt /mnt/kmacs-root/nfstest/nfs3_loadgen | head
+sudo ls -lt /mnt/nfs41test/nfs41_loadgen | head
+sudo ls -lt /mnt/smbtest/smb_loadgen | head
+
+# S3 PUT engine (elbencho logs throughput here)
+tail -20 /tmp/s3-loadgen-elbencho.log
+
+# Recent failures only
+journalctl -u nfs3-loadgen -u nfs41-loadgen -u smb-loadgen -u block-loadgen -u s3-loadgen \
+  --since '10 min ago' -p err..alert --no-pager
+```
+
+fio jobs layout large files on first start, so IOPS can lag for a minute or two
+while `Laying out IO file` is in progress. Re-run the snapshot after that.
 
 ---
 

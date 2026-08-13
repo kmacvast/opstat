@@ -271,4 +271,4 @@ ssh -L 8443:var203.selab.vastdata.com:443 user@jump-host
 ./opstat --block --nvme-over-tcp --vms localhost --vms-port 8443 --user admin
 ```
 
-Lab traffic generator (systemd): [scripts/README.md](scripts/README.md) (`block-loadgen`).
+Lab traffic generator (systemd): [scripts/README-systemd.md](scripts/README-systemd.md) (`block-loadgen`).

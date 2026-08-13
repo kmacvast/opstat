@@ -290,4 +290,4 @@ nfs_v3.run()
   --csv nfs_stats.csv --log-api-calls
 ```
 
-Lab traffic generator (systemd): [scripts/README.md](scripts/README.md) (`nfs3-loadgen`).
+Lab traffic generator (systemd): [scripts/README-systemd.md](scripts/README-systemd.md) (`nfs3-loadgen`).

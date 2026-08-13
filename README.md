@@ -48,7 +48,7 @@ Live multi-protocol performance statistics for **VAST Data** clusters.
 - Scoped debug: focus on one volume (`--volumes`), SMB client (`--clients`), or S3 bucket/tenant (`--buckets` / `--tenants`)
 - Telemetry capture: `--csv` for spreadsheets, `--export-openmetrics` for pipelines
 - Remote access: SSH/Teleport tunnels with `--vms localhost --vms-port <local>`
-- Lab load: systemd units and scripts in [scripts/README.md](scripts/README.md) for NFS v3, NFS v4.1, SMB, NVMe-oTCP, and S3
+- Lab load: systemd units and scripts in [scripts/README-systemd.md](scripts/README-systemd.md) for NFS v3, NFS v4.1, SMB, NVMe-oTCP, and S3
 
 ---
 
@@ -313,7 +313,7 @@ Expected: S3 TUI; bucket drill (`b`) limited to named buckets/views.
 
 ### Lab protocol load (Linux systemd)
 
-On the client that holds the NFS/SMB/NVMe/S3 mounts, see **[scripts/README.md](scripts/README.md)**.
+On the client that holds the NFS/SMB/NVMe/S3 mounts, see **[scripts/README-systemd.md](scripts/README-systemd.md)**.
 
 ```bash
 sudo ./scripts/systemd/install-lab-loadgen-units.sh
@@ -460,7 +460,7 @@ wizard.py              # Interactive launcher
 vast_common.py         # Shared VMS helpers
 openmetrics.py         # JSON Lines exporter
 S3_README.md           # S3 protocol reference
-scripts/               # Loadgens (see scripts/README.md) and PyInstaller build helpers
+scripts/               # Loadgens (see scripts/README-systemd.md) and PyInstaller build helpers
 releases/              # Local binary build staging (not committed)
 .github/workflows/     # Tag-triggered multi-OS releases
 ```

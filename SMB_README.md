@@ -34,7 +34,7 @@ Shared CLI flags (`--vms-port`, `--refresh`, `--sample-average`, `--csv`, `--no-
 .\scripts\Invoke-SmbOpstatLoad.ps1 -NasShare '\\172.200.203.6\opstattest'
 ```
 
-Linux CIFS client and systemd: [scripts/README.md](scripts/README.md) (`smb-loadgen`).
+Linux CIFS client and systemd: [scripts/README-systemd.md](scripts/README-systemd.md) (`smb-loadgen`).
 
 ---
 
@@ -188,4 +188,4 @@ ssh -L 8443:var203.selab.vastdata.com:443 user@jump-host
 - [SMB_IMPLEMENTATION_PLAN.md](../../docs/dev/smb/SMB_IMPLEMENTATION_PLAN.md) - phased design record (dev)
 - [SMB_PHASE0_RESULTS.md](../../docs/dev/smb/SMB_PHASE0_RESULTS.md) - var203 metric catalog and API probes (dev)
 - [scripts/Invoke-SmbOpstatLoad.ps1](scripts/Invoke-SmbOpstatLoad.ps1) - Windows SMB load generator
-- [scripts/README.md](scripts/README.md) - Linux `smb-loadgen` systemd unit
+- [scripts/README-systemd.md](scripts/README-systemd.md) - Linux `smb-loadgen` systemd unit
