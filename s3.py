@@ -695,16 +695,14 @@ def _result_parts(result):
 
 
 def _latest_row(result):
+    """Values from the newest usable sample row.
+
+    VMS publishes the newest bucket while it is still filling (a real cluster
+    monitor returned 2 of 46 metrics populated), so this must not read
+    data[0] verbatim - see vast_common.latest_complete_row.
+    """
     _prop_list, data, prop_idx = _result_parts(result)
-    if not data:
-        return {}, "-"
-    row = data[0]
-    sample = row[0] if row else "-"
-    values = {}
-    for name, idx in prop_idx.items():
-        if idx < len(row):
-            values[name] = row[idx]
-    return values, sample
+    return vast_common.latest_complete_values(data, prop_idx)
 
 
 def _metric(values, suffix):
@@ -1372,40 +1370,32 @@ def _view_values_from_result(result):
     if not data:
         return {}, prop_idx, "-"
     rate_idxs = _view_rate_prop_indexes(prop_idx)
-    chosen = None
-    for row in data:
-        if rate_idxs and any(
-            idx < len(row) and row[idx] is not None
-            for idx in rate_idxs
-        ):
-            chosen = row
-            break
+    # Prefer the newest row with the *most* populated rates, not merely the
+    # first with any: on a real cluster the newest bucket often has exactly
+    # one rate filled in, which loses latency, bandwidth and the workload mix.
+    chosen = vast_common.latest_complete_row(data, rate_idxs)
     if chosen is None:
-        chosen = data[0]
+        return {}, prop_idx, "-"
     values = {name: chosen[idx] for name, idx in prop_idx.items() if idx < len(chosen)}
     sample = chosen[0] if chosen else "-"
     return values, prop_idx, sample
 
 
 def _values_from_result(result):
-    prop_list, data, prop_idx = _result_parts(result)
-    if not data:
-        return {}, prop_idx, "-"
-    row = data[0]
-    sample = row[0] if row else "-"
-    values = {}
-    for name, idx in prop_idx.items():
-        if idx < len(row):
-            values[name] = row[idx]
+    """Values from the newest usable sample row (see _latest_row)."""
+    _prop_list, data, prop_idx = _result_parts(result)
+    values, sample = vast_common.latest_complete_values(data, prop_idx)
     return values, prop_idx, sample
 
 
 def _delta_rate_from_samples(result, sum_fqn):
-    prop_list, data, prop_idx = _result_parts(result)
+    _prop_list, data, prop_idx = _result_parts(result)
     idx = prop_idx.get(sum_fqn)
-    if idx is None or len(data) < 2:
+    if idx is None:
         return None
-    newest, oldest = data[0], data[-1]
+    newest, oldest = vast_common.bounding_samples(data, idx)
+    if newest is None:
+        return None
     t_new = _parse_sample_ts(newest[0])
     t_old = _parse_sample_ts(oldest[0])
     if not t_new or not t_old:
@@ -1413,26 +1403,21 @@ def _delta_rate_from_samples(result, sum_fqn):
     dt = abs((t_new - t_old).total_seconds())
     if dt <= 0:
         return None
-    delta = as_float(newest[idx])
-    old = as_float(oldest[idx])
-    if delta is None or old is None:
-        return None
-    return max(delta - old, 0.0) / dt
+    return max(as_float(newest[idx]) - as_float(oldest[idx]), 0.0) / dt
 
 
 def _avg_from_sum_count_deltas(result, sum_fqn, count_fqn):
-    prop_list, data, prop_idx = _result_parts(result)
+    _prop_list, data, prop_idx = _result_parts(result)
     idx_s, idx_c = prop_idx.get(sum_fqn), prop_idx.get(count_fqn)
-    if idx_s is None or idx_c is None or len(data) < 2:
+    if idx_s is None or idx_c is None:
         return None
-    s_new, s_old = as_float(data[0][idx_s]), as_float(data[-1][idx_s])
-    c_new, c_old = as_float(data[0][idx_c]), as_float(data[-1][idx_c])
-    if None in (s_new, s_old, c_new, c_old):
+    newest, oldest = vast_common.bounding_samples(data, idx_s, idx_c)
+    if newest is None:
         return None
-    cnt_delta = c_new - c_old
+    cnt_delta = as_float(newest[idx_c]) - as_float(oldest[idx_c])
     if cnt_delta <= 0:
         return None
-    return (s_new - s_old) / cnt_delta
+    return (as_float(newest[idx_s]) - as_float(oldest[idx_s])) / cnt_delta
 
 
 def _weighted_us(pairs):

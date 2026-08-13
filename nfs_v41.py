@@ -408,16 +408,14 @@ def _result_parts(result):
 
 
 def _latest_row(result):
+    """Values from the newest usable sample row.
+
+    VMS publishes the newest bucket while it is still filling (a real cluster
+    monitor returned 2 of 46 metrics populated), so this must not read
+    data[0] verbatim - see vast_common.latest_complete_row.
+    """
     _prop_list, data, prop_idx = _result_parts(result)
-    if not data:
-        return {}, "-"
-    row = data[0]
-    sample = row[0] if row else "-"
-    values = {}
-    for name, idx in prop_idx.items():
-        if idx < len(row):
-            values[name] = row[idx]
-    return values, sample
+    return vast_common.latest_complete_values(data, prop_idx)
 
 
 def _metric(values, suffix):

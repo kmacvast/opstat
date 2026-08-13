@@ -261,6 +261,77 @@ def get_current_cluster_os(request_fn):
 
 
 # ---------------------------------------------------------------------------
+# Monitor sample selection
+# ---------------------------------------------------------------------------
+# Columns that are always populated and so carry no information about how
+# complete a sample row is.
+_NON_METRIC_COLUMNS = ("timestamp", "object_id")
+
+
+def metric_column_indexes(prop_idx):
+    """Indexes of the real metric columns in a monitor query result."""
+    return [idx for name, idx in prop_idx.items() if name not in _NON_METRIC_COLUMNS]
+
+
+def latest_complete_row(data, metric_indexes):
+    """Return the newest row carrying the most populated metrics, or None.
+
+    VMS publishes the newest bucket of a monitor while it is still filling.
+    On VAST OS 5.5.0.1 a cluster monitor's newest row had 2 of 46 metrics
+    populated, and a ViewMetrics row had exactly one. Taking ``data[0]``
+    verbatim therefore reports missing latency/bandwidth and a workload mix
+    skewed to whichever counter happened to land first. Rows arrive newest
+    first, so scanning in order and keeping the strictly-better score yields
+    the freshest usable sample, with every value from one instant.
+    """
+    if not data:
+        return None
+    if not metric_indexes:
+        return data[0]
+    best, best_score = data[0], -1
+    complete = len(metric_indexes)
+    for row in data:
+        score = sum(
+            1 for idx in metric_indexes if idx < len(row) and row[idx] is not None
+        )
+        if score > best_score:
+            best, best_score = row, score
+            if score == complete:
+                break
+    return best
+
+
+def latest_complete_values(data, prop_idx):
+    """Return (values_by_prop_name, sample_timestamp) for the newest usable row."""
+    if not data:
+        return {}, "-"
+    row = latest_complete_row(data, metric_column_indexes(prop_idx))
+    if row is None:
+        return {}, "-"
+    values = {name: row[idx] for name, idx in prop_idx.items() if idx < len(row)}
+    return values, (row[0] if row else "-")
+
+
+def bounding_samples(data, *indexes):
+    """Newest and oldest rows where every column in *indexes* is populated.
+
+    Cumulative-counter rates need two real readings; anchoring on
+    ``data[0]``/``data[-1]`` silently yields None (rendered "-") or a zero
+    rate whenever the newest bucket has not filled that column yet.
+    """
+    usable = []
+    for row in data:
+        for idx in indexes:
+            if idx >= len(row) or row[idx] is None:
+                break
+        else:
+            usable.append(row)
+    if len(usable) < 2:
+        return None, None
+    return usable[0], usable[-1]     # VMS orders newest first
+
+
+# ---------------------------------------------------------------------------
 # Monitor scaffolding (create / delete)
 # ---------------------------------------------------------------------------
 def create_monitor_raw(request_fn, name, prop_list, object_type, object_ids,
