@@ -167,6 +167,14 @@ DRILL_OBJECTS = []
 DRILL_MONITORS = []
 LAST_DRILL_ROWS = []
 DRILL_ERROR = None
+DRILL = None                # vast_drill.DrillSession (ranking + rank cache)
+# Rank drill candidates by real block activity: read_req + write_req are
+# cumulative BlockMetrics counters (the same semantics the headline extraction
+# derives rates from), differenced over the rank monitor's own time series.
+# topn is deliberately NOT used here: /monitors/topn/ carries no protocol
+# label (docs/decisions/D-007), so its totals mix every protocol's traffic and
+# would rank NVMe candidates by, say, their NFS load.
+_RANK_PROPS = ["BlockMetrics,read_req", "BlockMetrics,write_req"]
 STARTUP_STATUS = None       # transient per-phase message during blocking startup
 # Drill re-poll throttle: object-scoped block families publish ~1/min, so a 5 s
 # tick re-fetched identical payloads. Space bar forces a refresh.
@@ -256,6 +264,13 @@ def init_config(args):
     DRILL_OBJECTS = []
     DRILL_MONITORS = []
     LAST_DRILL_ROWS = []
+    global DRILL
+    DRILL = vast_drill.DrillSession(
+        request_fn=api_request,
+        create_monitor_fn=_create_monitor_raw,
+        delete_monitor_fn=delete_monitor,
+        max_objects=_MAX_DRILL_OBJECTS,
+    )
 
 
 def metric_names_for_op(op_key):
@@ -746,11 +761,12 @@ def _capture_cluster_os():
     CLUSTER_OS = vast_common.get_current_cluster_os(api_request)
 
 
-def _create_monitor_raw(name_suffix, prop_list, object_type, object_ids):
+def _create_monitor_raw(name_suffix, prop_list, object_type, object_ids,
+                        no_aggregation=False):
     name = f"adhoc_opstat_{name_suffix}_{int(time.time())}"
     return vast_common.create_monitor_raw(
         api_request, name, prop_list, object_type, object_ids,
-        time_frame=API_TIME_FRAME,
+        time_frame=API_TIME_FRAME, no_aggregation=no_aggregation,
     )
 
 
@@ -1260,6 +1276,106 @@ def _cleanup_drill_monitors():
     DRILL_MONITORS = []
 
 
+def _block_rank_score(sliced_result):
+    """Activity score for one candidate: read+write ops/sec from its slice.
+
+    The rank monitor carries cumulative BlockMetrics counters, so the score is
+    the per-second delta across the slice's own time series. Derived through
+    ``delta_rate_from_samples`` (bounding samples), because VMS publishes a
+    still-filling newest bucket - the newest row's counters are often null,
+    and a naive two-newest-rows delta would score every object 0.0. An object
+    without two populated samples scores 0.0 rather than being guessed at.
+    """
+    total = 0.0
+    for fqn in _RANK_PROPS:
+        rate = vast_drill.delta_rate_from_samples(sliced_result, fqn)
+        if rate:
+            total += rate
+    return total
+
+
+def _rank_drill_candidates(mode, cfg, objects):
+    """Order candidates by block activity; never by API order (head-slice).
+
+    The pre-ranking behavior - take the first ``_MAX_DRILL_OBJECTS`` objects
+    the endpoint happened to list - showed arbitrary idle objects on any
+    cluster with more than eight. Ranking is cached in the DrillSession, so
+    re-entering a drill inside the TTL costs no rank monitors at all.
+    """
+    subtitle_fields = cfg.get("subtitle_fields", ())
+    by_id = {o["id"]: o for o in objects}
+    ranked = DRILL.rank(
+        mode, objects,
+        object_type=cfg["object_type"],
+        rank_props=_RANK_PROPS,
+        score_fn=_block_rank_score,
+        time_frame=API_TIME_FRAME,
+        name_of=lambda o: _obj_name(o, cfg["name_fields"]),
+        use_topn=False,
+    )
+    selected = []
+    for item in ranked:
+        entry = {"id": item["id"], "name": item["name"]}
+        raw = by_id.get(item["id"], {})
+        for field in subtitle_fields:
+            val = raw.get(field)
+            if val:
+                entry[field] = str(val)
+        selected.append(entry)
+    return selected
+
+
+def _create_batch_drill_monitors(mode, cfg, drill_objects):
+    """One monitor per op group covering every selected object, or None.
+
+    The per-op monitor split is a real VMS constraint (counter and rate/avg
+    properties cannot share a BlockMetrics monitor - probed on a live
+    cluster), so batching happens *across objects*, not across groups. The
+    first group's response is validated as splittable per object_id before
+    committing; anything short of that tears down cleanly and reports None so
+    the caller falls back to the per-object layout.
+    """
+    object_ids = [obj["id"] for obj in drill_objects]
+    if len(object_ids) < 2:
+        return None
+    created = []
+    proto_id = None
+    try:
+        for idx, prop_list in enumerate(build_ops_monitor_groups(ops_rows=OPS)):
+            created.append(_create_monitor_raw(
+                f"{mode}_batch_{idx}", prop_list, cfg["object_type"], object_ids,
+            ))
+        proto_id = None
+        if cfg["object_type"] != "blockhost":
+            proto_id = _create_monitor_raw(
+                f"{mode}_batch_proto", build_proto_prop_list(cluster_scope_only=True),
+                cfg["object_type"], object_ids,
+            )
+        # Validate splittability once, on the first group: the response must
+        # carry an object_id column with rows for the batch's objects.
+        result = api_request("GET", f"/monitors/{created[0]}/query/")
+        _props, _data, prop_idx = _result_parts(result)
+        if "object_id" not in prop_idx:
+            raise RuntimeError("batch response has no object_id column")
+        if not any(
+            vast_drill.slice_result_for_object(result, oid).get("data")
+            for oid in object_ids
+        ):
+            raise RuntimeError("batch response is not splittable per object")
+        return [(created, proto_id, None)]
+    except RuntimeError:
+        for monitor_id in created:
+            delete_monitor(monitor_id)
+        if proto_id is not None:
+            delete_monitor(proto_id)
+        return None
+
+
+def _drill_batch_active():
+    """True when DRILL_MONITORS is the single-batch layout (name is None)."""
+    return len(DRILL_MONITORS) == 1 and DRILL_MONITORS[0][2] is None
+
+
 def enter_drill_mode(mode):
     global DRILL_MODE, DRILL_OBJECTS, DRILL_MONITORS, DRILL_ERROR, LAST_DRILL_ROWS
     cfg = _DRILL_CFG.get(mode)
@@ -1275,32 +1391,27 @@ def enter_drill_mode(mode):
     if not objects:
         DRILL_ERROR = f"No {mode} objects returned from {cfg['endpoint']}"
         return
-    valid = [o for o in objects if "id" in o][:_MAX_DRILL_OBJECTS]
-    subtitle_fields = cfg.get("subtitle_fields", ())
-    DRILL_OBJECTS = []
-    for o in valid:
-        entry = {"id": o["id"], "name": _obj_name(o, cfg["name_fields"])}
-        for field in subtitle_fields:
-            val = o.get(field)
-            if val:
-                entry[field] = str(val)
-        DRILL_OBJECTS.append(entry)
+    valid = [o for o in objects if "id" in o]
+    DRILL_OBJECTS = _rank_drill_candidates(mode, cfg, valid)
     _cleanup_drill_monitors()
-    new_monitors = []
-    for obj in DRILL_OBJECTS:
-        try:
-            ops_ids = create_ops_monitors(
-                f"{mode}_{obj['id']}", cfg["object_type"], [obj["id"]], ops_rows=OPS,
-            )
-            proto_id = None
-            if cfg["object_type"] != "blockhost":
-                proto_id = _create_monitor_raw(
-                    f"{mode}_{obj['id']}_proto", build_proto_prop_list(cluster_scope_only=True),
-                    cfg["object_type"], [obj["id"]],
+    new_monitors = _create_batch_drill_monitors(mode, cfg, DRILL_OBJECTS)
+    if new_monitors is None:
+        # Per-object fallback: the pre-batch layout, unchanged.
+        new_monitors = []
+        for obj in DRILL_OBJECTS:
+            try:
+                ops_ids = create_ops_monitors(
+                    f"{mode}_{obj['id']}", cfg["object_type"], [obj["id"]], ops_rows=OPS,
                 )
-            new_monitors.append((ops_ids, proto_id, obj["name"]))
-        except RuntimeError:
-            pass
+                proto_id = None
+                if cfg["object_type"] != "blockhost":
+                    proto_id = _create_monitor_raw(
+                        f"{mode}_{obj['id']}_proto", build_proto_prop_list(cluster_scope_only=True),
+                        cfg["object_type"], [obj["id"]],
+                    )
+                new_monitors.append((ops_ids, proto_id, obj["name"]))
+            except RuntimeError:
+                pass
     if not new_monitors:
         DRILL_ERROR = f"Could not create any {mode} monitors"
         DRILL_OBJECTS = []
@@ -1318,6 +1429,37 @@ def exit_drill_mode():
     DRILL_OBJECTS = []
     LAST_DRILL_ROWS = []
     DRILL_ERROR = None
+
+
+def _drill_row_for_object(obj_name, ops_results, proto_result, poll_time):
+    """One display row for one drill object - shared by both monitor layouts."""
+    rows, _ = build_rows_from_results(
+        ops_results, proto_result, scope=f"drill:{obj_name}",
+        poll_time=poll_time, ops_rows=OPS,
+    )
+    if not rows:
+        return None
+    total_iops = compute_data_io_iops(rows)
+    lat_pairs = []
+    for key in ("read", "write"):
+        row = next((r for r in rows if r["key"] == key), None)
+        if row:
+            ops = as_float(row.get("ops_sec"))
+            lat = as_float(row.get("avg_us"))
+            if ops is not None and lat is not None:
+                lat_pairs.append((ops, lat))
+    subtitle = next(
+        (obj.get("nqn") for obj in DRILL_OBJECTS
+         if obj["name"] == obj_name and obj.get("nqn")),
+        None,
+    )
+    return {
+        "name": obj_name,
+        "subtitle": subtitle,
+        "total_iops": total_iops,
+        "latency_us": _weighted_avg(lat_pairs) if lat_pairs else None,
+        "bw_mbs": compute_data_io_throughput_mbs(rows),
+    }
 
 
 def fetch_drill_query(force=False):
@@ -1338,45 +1480,40 @@ def fetch_drill_query(force=False):
     _DRILL_LAST_QUERY_AT = now
     poll_time = time.monotonic()
     drill_rows = []
-    for ops_ids, proto_id, obj_name in DRILL_MONITORS:
+    if _drill_batch_active():
+        # Batch layout: one query per op group + one proto query, then slice
+        # per object. Row math is identical to the per-object path - a sliced
+        # batch response has the same shape as a single-object response.
+        group_ids, proto_id, _none = DRILL_MONITORS[0]
         try:
-            scope = f"drill:{obj_name}"
-            ops_results = query_ops_monitors(ops_ids)
+            ops_results = query_ops_monitors(group_ids)
             proto_result = api_request("GET", f"/monitors/{proto_id}/query/") if proto_id else None
-            rows, _ = build_rows_from_results(
-                ops_results, proto_result, scope=scope, poll_time=poll_time, ops_rows=OPS,
-            )
-            if not rows:
-                continue
-            total_iops = compute_data_io_iops(rows)
-            read_row = next((r for r in rows if r["key"] == "read"), None)
-            write_row = next((r for r in rows if r["key"] == "write"), None)
-            lat_pairs = []
-            if read_row:
-                rops = as_float(read_row.get("ops_sec"))
-                rlat = as_float(read_row.get("avg_us"))
-                if rops is not None and rlat is not None:
-                    lat_pairs.append((rops, rlat))
-            if write_row:
-                wops = as_float(write_row.get("ops_sec"))
-                wlat = as_float(write_row.get("avg_us"))
-                if wops is not None and wlat is not None:
-                    lat_pairs.append((wops, wlat))
-            avg_lat = _weighted_avg(lat_pairs) if lat_pairs else None
-            bw = compute_data_io_throughput_mbs(rows)
-            subtitle = next(
-                (obj.get("nqn") for obj in DRILL_OBJECTS if obj["name"] == obj_name and obj.get("nqn")),
-                None,
-            )
-            drill_rows.append({
-                "name": obj_name,
-                "subtitle": subtitle,
-                "total_iops": total_iops,
-                "latency_us": avg_lat,
-                "bw_mbs": bw,
-            })
+            for obj in DRILL_OBJECTS:
+                sliced_ops = [
+                    vast_drill.slice_result_for_object(r, obj["id"])
+                    for r in ops_results
+                ]
+                sliced_proto = (
+                    vast_drill.slice_result_for_object(proto_result, obj["id"])
+                    if proto_result else None
+                )
+                row = _drill_row_for_object(
+                    obj["name"], sliced_ops, sliced_proto, poll_time)
+                if row is not None:
+                    drill_rows.append(row)
         except RuntimeError:
             pass
+    else:
+        for ops_ids, proto_id, obj_name in DRILL_MONITORS:
+            try:
+                ops_results = query_ops_monitors(ops_ids)
+                proto_result = api_request("GET", f"/monitors/{proto_id}/query/") if proto_id else None
+                row = _drill_row_for_object(
+                    obj_name, ops_results, proto_result, poll_time)
+                if row is not None:
+                    drill_rows.append(row)
+            except RuntimeError:
+                pass
     LAST_DRILL_ROWS = sorted(
         drill_rows,
         key=lambda r: (r["total_iops"] or 0, r["bw_mbs"] or 0),

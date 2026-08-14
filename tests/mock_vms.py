@@ -87,6 +87,19 @@ _ACTIVE_VIEW_IDS = {VIEWS[i]["id"]: rank
 _ACTIVE_TENANT_IDS = {TENANTS[i]["id"]: rank
                       for rank, i in enumerate(_ACTIVE_TENANT_INDEXES)}
 
+# Block (NVMe) activity, planted the same way: the busiest cNode is index 10
+# of 12 and the busiest VIP is index 3 of 4, so an engine that head-slices the
+# first 8 objects by API order misses the hot cNode entirely. Ranking
+# correctness is therefore observable, exactly as for views/tenants.
+_ACTIVE_BLOCK_INDEXES_CNODE = (10, 4, 1)
+_ACTIVE_BLOCK_INDEXES_VIP = (3, 0)
+_ACTIVE_BLOCK_IDS = dict(
+    [(CNODES[i]["id"], rank)
+     for rank, i in enumerate(_ACTIVE_BLOCK_INDEXES_CNODE)]
+    + [(VIPS[i]["id"], rank)
+       for rank, i in enumerate(_ACTIVE_BLOCK_INDEXES_VIP)]
+)
+
 
 # Metric names a VAST build advertises via /metrics/. The default set models
 # a cluster that exports NFSv4.1 state/session counters but no pNFS/layout
@@ -143,6 +156,10 @@ def _activity_scale(prop, object_id):
     if prop.startswith("TenantMetrics,"):
         rank = _ACTIVE_TENANT_IDS.get(object_id)
         return 0.0 if rank is None else 1.0 / (rank + 1)
+    if object_id is not None and (
+            prop.startswith("BlockMetrics,") or prop.startswith("VolumeMetrics,")):
+        rank = _ACTIVE_BLOCK_IDS.get(object_id)
+        return 0.0 if rank is None else 1.0 / (rank + 1)
     return 1.0
 
 
@@ -157,6 +174,12 @@ def _metric_value(prop, seed, t, object_id=None):
     if "__sum" in prop or "num_samples" in prop:
         # Cumulative counters: a large lifetime base plus monotonic growth
         # proportional to this object's activity, as VMS TenantMetrics do.
+        return round(base * 1_000_000.0 + t * base * 20.0 * scale, 1)
+    if prop.startswith("BlockMetrics,") and prop.endswith("_req"):
+        # BlockMetrics *_req are cumulative lifetime counters: the engine's
+        # own extraction differences them (rate_from_counter_delta /
+        # rate_from_timeseries, with counter-reset handling), so the mock
+        # publishes the matching monotonic shape rather than a gauge.
         return round(base * 1_000_000.0 + t * base * 20.0 * scale, 1)
     if scale == 0.0:
         return 0.0
