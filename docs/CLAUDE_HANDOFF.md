@@ -1,112 +1,299 @@
+Approved to delete ONLY your leaked monitor:
 
-Claude said this in his output: 
+2299  adhoc_opstat_s3_vip_55_1786663781
 
-Now the first real BEFORE measurement — SMB view drill. Startup on this cluster runs ~30 s, ranking ~24 s, so I'll hold ~90 s to also capture steady-state cadence, then graceful quit.
+Do not touch the other pre-existing/concurrent adhoc_opstat_* monitors.
 
+After deleting 2299:
 
-If we are going to have a slow startup, I'd like a message to the screen sayinf "Gathering initial metrics, this will take a few seconds" or something more approriate for that.  Of course, if he fixes the performance than its not needed.  I just dont like users sitting around staring at a screen thats doing nothing unless there is a mewssage telling them to stand by...
+1. Confirm by GET that 2299 no longer exists.
+2. Confirm none of the monitor IDs created by your own test sessions remain.
+3. Do not perform a general adhoc_opstat_* cleanup.
 
-Here is claudes full response: 
+Then proceed with the SMB/S3 drill refactor in one complete implementation pass.
 
-Approved and scoped. First, deleting only `2245`, then confirming by GET and re-inventorying the remaining pre-existing leftovers.
+You now have both mock evidence and real-cluster BEFORE measurements. Use both.
 
-Monitor `2245` is deleted and confirmed gone by GET (`2245_present=False`). But the re-inventory surfaced something important: two SMB leftovers that are **not from my runs** — `2250 adhoc_opstat_smb_headline_cmds_1786661835` and `2263 adhoc_opstat_smb_rank_view_128_1786662207`, both with timestamps *after* my run, and `rank_view_128` implies a view scan of >128 views, whereas my run only reached 3 chunks (`rank_view_0/32/64`). That means **another opstat session is active on this shared lab cluster concurrently, leaking its own monitors.** That's a real confound for cleanup verification — I must key verification on my session's exact monitor IDs, not "any smb monitor."
+REAL-CLUSTER BASELINE TO PRESERVE
 
-Let me check the API-log format to see whether created-monitor IDs are recoverable from a session's own log (needed for precise cleanup verification), then rebuild the driver.
+SMB view:
+- 145 candidates
+- 5 rank monitors
+- 18 entry API calls
+- 104 s ranking wall-clock
+- loading UI present
+- clean-q cleanup verified
 
-The API log records response bodies (so created-monitor IDs are recoverable from a session's own per-pid log) and writes `session end` on close — exactly what I need for precise, concurrency-robust cleanup verification. Now rebuilding the PTY driver to the required spec (graceful `q`, SIGTERM only as fallback, wait for full exit, never close the PTY mid-cleanup, never SIGKILL, verify exit).
+SMB tenant:
+- 35 candidates
+- 2 rank monitors
+- 9 entry API calls
+- 34 s ranking
+- cleanup verified
 
-Now the measurement orchestrator: it runs the driver, parses the session's own API log (created/deleted monitor IDs from response bodies), then does read-only GETs to count candidates and — keyed on this session's exact monitor IDs — verify none remain. This makes cleanup verification robust against the concurrent activity I found.
+S3 bucket:
+- 145 candidates
+- 5 rank monitors
+- 18 entry API calls
+- 47 s ranking
+- steady-state re-query approximately every 5 s, unthrottled
+- cleanup verified
 
-Now the first real BEFORE measurement — SMB **view** drill. Startup on this cluster runs ~30 s, ranking ~24 s, so I'll hold ~90 s to also capture steady-state cadence, then graceful quit.
+S3 tenant:
+- 35 candidates
+- 2 rank monitors
+- 9 entry API calls
+- 59 s ranking
+- cleanup verified
 
-Running longer than 180 s (likely `q` landing mid-refresh, then waiting on grace). It's backgrounded; let me check interim output.
+S3 VIP:
+- topn ranking confirmed
+- 192.168.* filtering confirmed
+- topn-only fallback remains unverified because the real cluster accepts VIP monitors
+- preserve this path exactly unless a regression test proves otherwise
 
-The improved driver works exactly to spec: **exited=True, how=clean-q, cleanup_warn=False, and all 7 session monitors (2264–2270) deleted — "still live: NONE."** Real data landed too: var203 has **145 views**, **5 rank monitors**, **104 s ranking wall-clock**. But my parser mis-identified the display monitor (it counted the startup headline monitor `2264` as a display monitor), which zeroed the entry-call-count and skewed cadence. That's a scratch-parser bug, not an opstat issue — and I can fix it and re-derive from the *existing* log without re-running the cluster.
+IMPLEMENTATION SCOPE
 
-Clean and complete for SMB view: **145 candidates, 5 rank monitors, 18-call entry, 104 s ranking wall-clock, cleanup verified NONE leftover, loading UI rendered.** (Note the real per-chunk latency is wildly variable — one chunk's query→delete took 35 s.) Ranking dominated the 90 s window so no steady-state ticks were captured; I'll get cadence from the fast-ranking **tenant** drill. Running SMB tenant now (longer window for steady-state observation):
+Port SMB and S3 view/tenant/bucket drill mechanics to vast_drill.DrillSession.
 
-The orchestrator still uses the old parse (fixed only in `reparse.py`); reparsing the tenant log for clean numbers:
+Do not broaden the work into:
+- NVMe
+- NFS
+- delegation lookup
+- exporter changes
+- headline-monitor redesign
+- cNode batching unless required for correctness
+- cleanup-interruption defect repair
 
-SMB tenant: **35 candidates, 2 rank monitors, 9-call entry, 34 s ranking, cleanup NONE.** Startup (~30 s) + ranking keeps eating the window before steady-state ticks accrue. I'll capture a definitive cadence in a longer S3 tenant run (the cadence mechanism is identical code across all four drills — `poll_tick`→`fetch_drill_query()`, no throttle). Now the S3 side — bucket first (long window for the 145-view ranking):
+The cleanup-interruption issue is separate follow-up work.
 
-S3 bucket ran clean (exited clean-q, cleanup NONE). Reparsing for detail:
+SMB
 
-S3 bucket: **145 candidates, 5 rank monitors, 18-call entry, 47 s ranking**, and crucially I captured **steady-state cadence = [2, 6, 6] s** — confirming the drill re-queries every refresh tick, unthrottled (the exact behavior the port's `should_query` throttle fixes). Now S3 tenant:
+Port:
+- view ranking
+- tenant ranking
+- drill monitor creation
+- rank caching
+- re-poll throttle
+- forced refresh
+- shared loading helper where appropriate
 
-S3 tenant: **35 candidates, 2 rank monitors, 9-call entry, 59 s ranking, cleanup NONE.** Now the S3 **VIP** verification run — I need to confirm (not change) its topn ranking, `192.168.*` filtering, and topn-only fallback. I'll inspect both the API log and the rendered screen.
+Use the proven NFSv3/NFSv4.1 vast_drill pattern.
 
-VIP ran clean (cleanup NONE) but `loading_ui=False` — I need to look directly at the log and rendered screen to verify the three VIP behaviors and whether a loading frame showed.
+S3
 
-The VIP drill was never entered — S3's startup (merged-probe + s3_metrics probe) ran longer, so the `i` key hadn't been consumed before the 70 s `q`. The log shows only headline/s3_metrics startup monitors, no `/vips/` or topn. I need a longer window. Re-running VIP with 120 s:
+Port:
+- bucket ranking
+- tenant ranking
+- drill monitor creation
+- rank caching
+- re-poll throttle
+- forced refresh
 
-VIP was entered this time (loading UI rendered), but it exited via **SIGTERM** (the `q` wasn't consumed within grace) and — importantly — left **monitor `2299` live**. That's a new leftover from my own test run, likely the very cleanup-interruption defect I flagged (SIGTERM truncating a slow drain). Let me inspect exactly what happened before I do anything: the VIP sequence, whether topn/filtering/fallback behaved, and confirm 2299.
+Do NOT route the VIP path through DrillSession unless strictly necessary.
 
-Now I understand the VIP run completely. **VIP behavior is verified and working:**
-- **topn ranking confirmed** — `GET /monitors/topn/?key=vip&limit=16` (twice: entry + one refresh).
-- **`192.168.*` filtering confirmed** — the 8 selected VIP objects (ids 55, 300, 303, 320, 381, 755, 765, 766) produced **no** `192.168.*` labels in the rendered screen.
-- **per-object monitors** (8, not batched); **topn-only fallback not triggered** (ProtoMetrics VIP monitors succeeded, so that defensive path wasn't exercised — I can't force it without a cluster that rejects VIP monitors).
+Preserve:
+- VIP topn ranking
+- 192.168.* filtering
+- topn-only fallback
+- VIP-specific refresh behavior
 
-**But this run leaked monitor `2299`** (an S3 VIP per-object monitor). The log's DELETEs stop at `2297`; `2298`/`2299` were created but the SIGTERM-path cleanup didn't delete `2299`, and — notably — **no "not deleted" warning was emitted**. This is a second, stronger data point for the cleanup-interruption defect: it happened in opstat's *own* signal cleanup (60 s grace given), not just my driver. Let me confirm current live state precisely (read-only):
+CNodes
 
-Confirmed: across **all** my runs today, exactly **one** leftover — `2299 adhoc_opstat_s3_vip_55` (mine, from the SIGTERM vip run). Every clean-`q` run verified NONE. The other 39 are pre-existing/concurrent, not mine.
+Keep SMB/S3 cNode behavior unchanged in this pass unless the port requires touching it.
 
-Recording the cleanup-interruption defect as a separate tracked item, per your instruction:
+Do not opportunistically batch cNodes just for symmetry.
 
-I now have the complete baseline. One cleanup item is pending your approval at the end.
+STARTUP / LOADING UX
 
-## REAL-CLUSTER BEFORE BASELINE
-*Cluster: var203.selab.vastdata.com (real VMS), read-only via opstat `--log-api-calls`. Counts are authoritative; wall-clock reflects this cluster's high, variable REST latency. `--s3` invocation confirmed working. Cleanup verified per run against this-session's exact monitor IDs.*
+The real-cluster measurements exposed a UX requirement that now applies beyond drill ranking.
 
-**Ranking API sequence (all four target drills, identical pattern):**
-`GET /<objects>/` → for each 32-object chunk: `POST /monitors/` (rank monitor) → `GET .../query/` → `DELETE` → then `POST` batch/display monitor → `GET .../query/`. Strictly serial. **No `/monitors/topn/` used for view/tenant/bucket ranking** (topn appears only in SMB's headline aux context and the S3 VIP path).
+Some startup paths take approximately 30 seconds before the first usable frame appears.
 
-**SMB view:** 145 candidates · 5 rank monitors (`rank_view_0/32/64/96/128`) · **entry = 18 API calls** · **ranking wall-clock = 104 s** · batch display monitor · loading UI ✔ · cleanup: **NONE leftover** (clean-q). Per-chunk latency wildly variable (one query→delete took 35 s).
+Users must not stare at an apparently frozen terminal during blocking startup work.
 
-**SMB tenant:** 35 candidates · 2 rank monitors (`0/32`) · **entry = 9 API calls** · **ranking wall-clock = 34 s** · loading UI ✔ · cleanup: **NONE leftover** (clean-q).
+Before any startup phase that can materially block before the first normal frame, paint a visible status frame first.
 
-**S3 bucket:** 145 candidates · 5 rank monitors (`rank_bucket_0..128`) · **entry = 18 API calls** · **ranking wall-clock = 47 s** · **steady-state cadence = [2, 6, 6] s** (≈1 query per refresh tick, **unthrottled**) · loading UI ✔ · cleanup: **NONE leftover** (clean-q).
+Preferred wording:
 
-**S3 tenant:** 35 candidates · 2 rank monitors (`0/32`) · **entry = 9 API calls** · **ranking wall-clock = 59 s** · loading UI ✔ · cleanup: **NONE leftover** (clean-q).
+  Gathering initial metrics, please stand by...
 
-> Steady-state cadence was cleanly captured only on S3 bucket (`[2,6,6] s`) because startup+ranking consumed the other windows; it is the **same code path** (`poll_tick → fetch_drill_query()`, no throttle) for all four, so all re-query the display monitor every refresh tick (~5 s). This is exactly what the port's `should_query` throttle changes.
+Use wording that accurately reflects the actual work being performed.
 
-**S3 VIP unchanged (verified, not modified):**
-- topn ranking **confirmed** — `GET /monitors/topn/?key=vip&limit=16` (entry + refresh).
-- `192.168.*` filtering **confirmed** — 8 selected VIPs (ids 55/300/303/320/381/755/765/766), **no `192.168.*` labels** in the rendered panel.
-- 8 per-object VIP monitors created (not batched).
-- **topn-only fallback NOT exercised** — the cluster accepted S3Common VIP monitors, so the fallback path didn't trigger. It cannot be force-verified without a cluster that rejects VIP monitors; flagged as unverified, not broken.
+For drill-specific blocking operations, retain specific messages such as:
 
-**Cleanup verification:** all four target drills (clean-q exit) → **0 this-session monitors remained**, confirmed by exact-ID `GET /monitors/`. The `2245` leak from the prior session was deleted and confirmed gone. **The VIP run exited via SIGTERM (its `q` wasn't consumed in grace) and leaked `2299`** — see below.
+  Ranking VIEW activity, please stand by...
+  Loading TENANT drill-down, please stand by...
 
-**Differences from the mock:**
-- Object counts differ: var203 has **145 views / 35 tenants** vs the mock's **429 views / 6 tenants**. So real view/bucket entry is 18 calls (5 chunks) vs the mock's 45 (14 chunks); real tenant ranking is 2 chunks (mock's 6 tenants under-represents this — real tenant ranking is genuinely multi-chunk).
-- **Real ranking pain is far worse than call count implies.** Mock loopback is ~1 ms/call; the real cluster's per-chunk query→delete ran 3–35 s, giving **104 s** of blocking "stand by" for SMB view. The mock shows the *pattern* but not the *stall*.
-- Unthrottled steady-state (~5 s cadence) confirmed on real hardware.
-- S3/SMB each create 2 startup monitors (merged-probe + fallback family), consistent with D-010.
+Do not add a visible interstitial if the corresponding work is effectively immediate after the refactor.
 
-**Newly discovered risks:**
-1. **Cleanup-interruption defect (recorded separately, task chip `task_79a317e3`).** On SIGTERM during a slow serial drain, opstat can silently leave a monitor (`2299`) with *no* "not deleted" warning. Doesn't block testing as long as runs exit via clean `q`; my driver now prefers that. Do **not** fix during the port unless it blocks testing.
-2. **Concurrent opstat sessions on this shared lab cluster** independently create/leak monitors (saw `2250`, `2263` appear mid-session; leftover count fluctuates). Cleanup verification must key on *this session's* exact monitor IDs — my harness now does.
-3. **var203 under-tests chunk scaling** (145 views → 5 chunks). The port's ranking must also be validated against a high-view cluster (var204, 429 views → ~14 chunks) to confirm the collapse to ~4 calls holds at scale.
-4. **Expected after-port:** entry ~4 calls / ~seconds (topn or one adaptive batch + cache), steady-state ~1 query per 15 s. The real 104 s → ~4 s makes the port's value larger than the mock suggested — and shows the **entry-ranking fix matters more than the throttle**.
+The desired behavior is:
+- no blank/frozen terminal during multi-second startup
+- status must reach the terminal BEFORE blocking API work
+- normal dashboard replaces it automatically when ready
+- errors must still surface cleanly
+- footer/navigation behavior must remain correct once the normal frame appears
 
----
+Prefer a shared helper/path over engine-specific duplicated status logic.
 
-**Cleanup ask (nothing else pending):** my VIP test run leaked exactly one monitor — **`2299  adhoc_opstat_s3_vip_55_1786663781`** — via the SIGTERM path. All other runs left nothing. May I delete `2299` (my own leftover), same scope as the `2245` approval? I will not touch the ~39 pre-existing/concurrent `adhoc_opstat_*` monitors.
+Investigate whether the existing with_loading_status helper can safely cover startup as well as drill entry.
 
-Stopping after the baseline as instructed — no implementation, no commits, no pushes. Awaiting your call on deleting `2299`.
+Do not introduce threading/concurrency for this.
 
+PERFORMANCE TARGET
 
-#################################################
-OPSTAT
+The goal is not merely code reuse.
 
-1/ Standaerdize on navigation keys.  For example, for Toggle VIP view some screens use v while others use i.  They all need to be the same exact character for navigation, and I prefer 'i' for VIP.  
+Measure actual before/after behavior.
 
-2/ Standardize all latency reporting into ms and triple check that you have done the math correctly. Different metrics return different units, some ms, some us, some ns, so be sure the math puts them all in ms for the user.  Exception.  If the value is sub ms, report it in us.  That is for the entire application. 
+Expected target:
 
-3/ Block:  We need to remove the Fabric count from the percentage calculation.  Its distorting the read and write percentages.  See attached image as a reference.  I want to keep the Fabric bar, but it should not be used to calculate a percentage.  Put a total count instead, not cumulative, just for the measured time window between refreshes. 
+SMB view:
+18 calls -> approximately 4 calls
 
-	Or maybe we need to talk about this first ...
+S3 bucket:
+18 calls -> approximately 4 calls
 
-	
+SMB/S3 tenant:
+9 calls -> approximately 4 calls
+
+Re-poll:
+~1 query every 5 s -> ~1 query every 15 s
+
+Re-entry:
+full rank scan -> cached rank result with no new rank monitors inside cache TTL
+
+The exact real-cluster wall-clock may vary significantly, so report both:
+- API-call count
+- measured elapsed time
+
+Do not claim a 4-second result unless the real cluster produces it.
+
+TEST-FIRST REQUIREMENTS
+
+Before changing implementation, add regression tests that fail against the current HEAD for:
+
+1. SMB view entry API-call budget.
+2. S3 bucket entry API-call budget.
+3. Ranking correctness with busy objects beyond the first 32.
+4. Rank cache on re-entry.
+5. Re-poll throttle.
+6. Space/manual refresh bypasses throttle.
+7. Batch monitor fallback.
+8. Ranking-monitor cleanup on success.
+9. Ranking/drill cleanup on error.
+10. S3 VIP topn behavior unchanged.
+11. S3 VIP 192.168.* filtering unchanged.
+12. S3 VIP topn-only fallback unchanged via mock rejection.
+13. Loading/status frame rendered before blocking drill work.
+14. Startup "Gathering initial metrics..." frame rendered before any proven blocking startup path.
+
+Prove the budget/ranking tests fail against the pre-port implementation.
+
+Do not weaken existing tests.
+
+VALIDATION
+
+After implementation:
+
+1. Run targeted SMB/S3 drill tests.
+2. Run API-efficiency tests.
+3. Run the complete ./scripts/validate.sh gate.
+4. Require:
+   - current Python green
+   - Python 3.8 green
+   - zero skips
+   - openssl-backed suites actually running
+5. Exercise SMB and S3 in a PTY against the mock.
+6. Then validate against the real VMS.
+
+REAL-VMS AFTER VALIDATION
+
+Use VAST_PASSWORD from the environment.
+
+Do not put the password in argv, logs, docs, commits, or handoff files.
+
+Run real:
+
+SMB:
+- view
+- tenant
+
+S3:
+- bucket
+- tenant
+- VIP regression sanity check
+
+For each real run capture:
+
+- startup time to first visible status
+- startup time to first normal frame
+- candidate count
+- rank API calls
+- total entry API calls
+- ranking elapsed time
+- steady-state query cadence
+- rank-cache behavior on re-entry
+- cleanup result keyed to this session's exact monitor IDs
+
+Verify no monitor created by the test session remains after clean exit.
+
+Do not use SIGKILL.
+
+Prefer clean q and wait for the process to exit fully.
+
+If SIGTERM is required, wait for cleanup to complete and verify exact monitor IDs afterward.
+
+Do not fix the cleanup-interruption defect during this work unless it prevents safe completion.
+
+DOCUMENTATION
+
+When implementation and validation are complete:
+
+- update docs/REFACTOR_HANDOFF.md
+- update any relevant decision/status documentation only if a durable decision changed
+- do not rewrite settled decision records just to record implementation progress
+- record the cleanup-interruption defect as outstanding if it is not already durable
+- record the new startup/loading UX behavior if it becomes a general invariant
+
+REPORT
+
+Give me one complete report:
+
+SMB/S3 VAST_DRILL IMPLEMENTATION AND REAL-VMS VALIDATION
+
+Cleanup of 2299:
+Files changed:
+Tests added:
+Pre-fix regression proof:
+SMB implementation:
+S3 implementation:
+S3 VIP preservation:
+Startup/loading UX:
+Mock before/after:
+Real SMB view before/after:
+Real SMB tenant before/after:
+Real S3 bucket before/after:
+Real S3 tenant before/after:
+Real S3 VIP sanity:
+Steady-state API cadence:
+Rank-cache behavior:
+Monitor cleanup:
+Validation gate:
+Python 3.8:
+Current Python:
+Known remaining risks:
+Cleanup-interruption follow-up:
+Documentation updated:
+Recommended next engineering item:
+
+Do not commit.
+Do not push.
+Do not merge.
+Do not create a PR.
+
+You may fix defects you discover that are directly caused by, or required for, this SMB/S3 drill port and startup/loading UX work.
+
+If you encounter a destructive VMS action, production-impacting change, major concurrency/architecture change, or scope expansion beyond these areas, stop and ask.
+
+Otherwise, carry this entire implementation, test, and real-VMS validation cycle through before returning.
