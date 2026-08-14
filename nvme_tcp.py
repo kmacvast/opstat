@@ -1549,8 +1549,11 @@ def _render_health_panel(rows, width):
 
     ops_s = c(f"{total_data_iops:,.2f} ops/s" if total_data_iops else "- ops/s", _BWHITE)
     if combined_lat is not None:
-        lat_ms = combined_lat / 1000.0
-        lat_s = _c_latency_text(f"{lat_ms:.2f} ms", combined_lat)
+        # Shared auto-scaling formatter: ms above 1000 µs, µs below - a
+        # sub-10 µs combined latency used to render "0.00 ms", which displays
+        # a real measurement as though it were absent (FR-B).
+        lat_text, _ = format_latency_us(combined_lat)
+        lat_s = _c_latency_text(lat_text, combined_lat)
     else:
         lat_s = c("- ms", _DIM)
     bw_s = c(f"{total_bw_gbs:.3f} GB/s" if total_bw_gbs is not None else "- GB/s", _CYAN)

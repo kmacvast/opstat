@@ -137,3 +137,67 @@ def test_nvme_help_bar_uses_canonical_controls(monkeypatch):
     # Common controls precede NVMe-specific ones (Host, Reset stats).
     assert bar.index("[q] Quit") < bar.index("[c] cNode") < bar.index("[i] VIP") < bar.index("[x] Exit drill")
     assert bar.index("[x] Exit drill") < bar.index("[h] Host")
+
+
+# ---------------------------------------------------------------------------
+# FR-B: latency unit handling (literal values)
+# ---------------------------------------------------------------------------
+def test_combined_latency_header_does_not_collapse_sub_10us_to_zero(monkeypatch):
+    """The header used to hand-format `avg_us/1000` as '%.2f ms', so a real
+    6 us combined latency displayed as '0.00 ms' - a measurement rendered as
+    absence (FR-B). It now routes through the shared auto-scaling formatter."""
+    import io
+    import sys
+    import tui_layout
+
+    tui_layout.set_color(False)
+    monkeypatch.setattr(nvme_tcp, "_COLOR", False, raising=False)
+    monkeypatch.setattr(nvme_tcp, "VOLUME_SCOPED", False, raising=False)
+    rows = [
+        {"key": "read", "label": "READ", "category": "data", "ops_sec": 100.0,
+         "avg_us": 6.0, "bw_mbs": 10.0, "avg_io_bytes": 4096.0},
+        {"key": "write", "label": "WRITE", "category": "data", "ops_sec": 50.0,
+         "avg_us": 6.0, "bw_mbs": 5.0, "avg_io_bytes": 4096.0},
+    ]
+    buf, real = io.StringIO(), sys.stdout
+    sys.stdout = buf
+    try:
+        nvme_tcp._render_health_panel(rows, 160)
+    finally:
+        sys.stdout = real
+    frame = tui_layout.strip_ansi(buf.getvalue())
+    assert "0.00 ms" not in frame, "sub-10us combined latency rendered as zero"
+    assert "6.00" in frame, "the real 6 us value is not visible"
+
+
+def test_op_row_latency_is_never_unit_converted():
+    """BlockMetrics/VolumeMetrics *_latency__avg lands in avg_us verbatim -
+    the monitor-API microsecond convention (consistent with D-003). Any
+    accidental conversion here would be a silent 1000x error. Uses a
+    rate-based op so the passthrough is observable on a single poll
+    (counter-based ops gate latency on a two-poll ops delta)."""
+    rows = [{"key": "handle_request", "label": "HANDLE REQ", "category": "fabric",
+             "ops_fqn": "BlockMetrics,handle_request_latency__rate",
+             "avg_fqn": "BlockMetrics,handle_request_latency__avg",
+             "ops_raw": 12.5, "lat_raw": 541.4, "sample": "s",
+             "series_data": None, "ops_sec": None, "avg_us": None,
+             "bw_mbs": None, "avg_io_bytes": None}]
+    nvme_tcp.apply_op_rates(rows, poll_time=100.0, scope="cluster")
+    assert rows[0]["avg_us"] == 541.4, "latency value must pass through unconverted"
+    assert rows[0]["ops_sec"] == 12.5
+
+
+def test_counter_op_latency_needs_ops_evidence_first():
+    """A counter-based op cannot show a rate (or a latency) from one poll -
+    the first sample is a baseline, not a measurement. Latency appears only
+    once an ops delta proves traffic; zero-vs-unavailable stays honest."""
+    nvme_tcp.PREV_COUNTER_STATE.clear()
+    rows = [{"key": "read", "label": "READ", "category": "data",
+             "ops_fqn": "BlockMetrics,read_req",
+             "avg_fqn": "BlockMetrics,read_latency__avg",
+             "ops_raw": 1000.0, "lat_raw": 541.4, "sample": "s",
+             "series_data": None, "ops_sec": None, "avg_us": None,
+             "bw_mbs": None, "avg_io_bytes": None}]
+    nvme_tcp.apply_op_rates(rows, poll_time=100.0, scope="cluster")
+    assert rows[0]["ops_sec"] is None
+    assert rows[0]["avg_us"] is None

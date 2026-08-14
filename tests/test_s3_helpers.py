@@ -220,13 +220,23 @@ def test_opcode_rejects_cumulative_looking_s3metrics():
     assert get_row["ops_sec"] == pytest.approx(832.0)
 
 
-def test_format_latency_ms_always_milliseconds():
+def test_format_latency_ms_prefers_milliseconds():
     text, raw = s3.format_latency_ms(811)
     assert text == "0.81 ms"
     assert raw == 811
     text, raw = s3.format_latency_ms(2770)
     assert text == "2.77 ms"
     assert s3.format_latency_ms(0) == ("-", None)
+
+
+def test_format_latency_ms_never_collapses_sub_5us_to_zero():
+    """FR-B: a real 3 µs measurement must not display as '0.00 ms'."""
+    text, raw = s3.format_latency_ms(3.0)
+    assert "0.00" not in text
+    assert "3.00" in text and raw == 3.0
+    # The 5 µs boundary itself still renders as a non-zero ms value.
+    text, _ = s3.format_latency_ms(5.0)
+    assert text == "0.01 ms"
 
 
 def test_vip_hides_192_168_addresses():

@@ -45,7 +45,7 @@ from tui_layout import (
     display_width, format_fixed_number, format_scaled_metric, join_columns,
     pad_display, truncate_display, c, set_color, set_unicode, glyph_set,
     as_float, raw_bw_to_mb_sec, format_throughput_mbs,
-    format_iops, format_block_size, format_os_release,
+    format_iops, format_block_size, format_latency_us, format_os_release,
     _RST, _BOLD, _DIM, _GREEN, _YELLOW, _CYAN,
     _BRED, _BGREEN, _BYELLOW, _BCYAN, _BWHITE,
 )
@@ -342,12 +342,21 @@ def _first_positive(*values):
 
 
 def format_latency_ms(us, active=True):
-    """Format latency for S3 TUI: always milliseconds (never µs)."""
+    """Format latency for the S3 TUI, preferring milliseconds.
+
+    S3 request latency is ordinarily ms-scale, so ms stays the display unit
+    down to 0.01 ms - but a value below 5 µs would render as ``0.00 ms``,
+    displaying a real measurement as though it were absent (FR-B). Those
+    delegate to the shared µs formatter instead; every cell carries its own
+    unit label, so a mixed column stays unambiguous.
+    """
     if not active:
         return "-", None
     us = as_float(us)
     if us is None or us <= 0:
         return "-", None
+    if us < 5.0:
+        return format_latency_us(us)
     return f"{us / 1000.0:.2f} ms", us
 
 
