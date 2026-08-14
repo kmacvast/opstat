@@ -1,256 +1,664 @@
-##########
-Add these OPSTAT FRs to the backlog and fold them in along the way as we continue to refactor and improve performance of opstat:
-  
-  1/ We need to standaerdize on the navigation shortcut keys across all protocols, to the best possible way. Some will have their unique ones like using '4' and 'h' for the NFSv4.1 path, but there are most of them in common, like 'x', 'l', 'v', 't', etc.  I want them all to have the same look and feel in every screen and the unique options added to the end of the row.  For example, for Toggle VIP view some screens use v while others use i.  They all need to be the same exact character for navigation, and I prefer 'i' for VIP.  
-  
-  2/ Help make understanding what the latency values are measured in per use, ms is preferred for latency unless there are places where its us all the time.  Triple check that you have done the math correctly, the VAST API returns different units of measure (ms,us,ns) depending on the endpoint and call. 
-  
-  3/ Block:  We need to remove the Fabric count from the percentage calculation.  Its distorting the read and write percentages. I want to keep the Fabric metrics count on a seperate bar on the screen, but it should not be used to calculate the main percentages, just read, write, and any MD if there is any.
-  
-  4/ We need to add unit testing to the repo.  We need to go back and put tests in place to catch us up to current build.  WHat I want is every time new code is going to be committed, to run the entire testing suite to build quality into the product to prevent bugs. 
+Proceed with the next major opstat refactor phase as one complete engineering work package.
 
-##########
-Claudes response:  
+I want to minimize back-and-forth. Within the scope below, investigate, implement, test, validate against the real lab cluster, update durable docs, and return one complete report.
 
-First, deleting the approved leftover `2299` and verifying my sessions are clean.
+Do not stop for routine implementation choices that are already supported by repository rules, existing patterns, tests, or real-cluster evidence.
 
-`2299` deleted and confirmed gone; no monitors from any of my test sessions remain. Cleanup complete.
+STOP only for:
+- destructive VMS actions beyond cleanup of monitors created by your own test session
+- production-impacting changes
+- credential/security concerns
+- force-push/history rewriting
+- a major concurrency/architecture change
+- a dependency/runtime change
+- scope expansion beyond this work package
+- evidence that contradicts a settled decision record
 
-Now the implementation. I'll study the proven test + engine templates thoroughly before writing anything. Reading the test scaffolding and engine main/render paths.
+Do not commit.
+Do not push.
+Do not merge.
+Do not create a PR.
+Do not tag.
 
-Clear template — SMB/S3 will mirror the NFSv41 suite. Now the loading tests, the API-efficiency fixtures/reset helpers, and the mock's VIP/topn/rejection support.
+Use the repository rules, AGENTS.md, CLAUDE.md, applicable .claude/rules, skills, decision records, and validation gate throughout.
 
-Now the API-efficiency fixtures, conftest reset helpers, mock VIP/topn/rejection support, and the SMB/S3 render/flush/main paths.
+CURRENT REAL-VMS AVAILABILITY
 
-Now conftest reset fixtures and the mock's VIP/topn/reject/counts internals.
+Treat this as current operational context:
 
-Now the mock internals — monitor creation/rejection/cap, topn (view + vip), counts/live_monitors, and how it plants busy objects.
+- var204.selab.vastdata.com is unavailable until I explicitly say otherwise.
+- Do not use var204 for testing or treat prior var204 measurements as current.
+- Use var203.selab.vastdata.com for all real-cluster validation in this work package.
+- Use VAST_PASSWORD from the environment.
+- Never put the password in argv, tracked files, docs, commits, API logs, or handoff files.
 
-Now the SMB/S3 render/flush/main paths — needed to wire drill loading through `with_loading_status` and add the startup interstitial.
+If the current handoff does not durably record var204's unavailability, add a short CURRENT ENVIRONMENT note to docs/REFACTOR_HANDOFF.md.
+Do not create a decision record for this temporary environment condition.
 
-NFSv3 builds `DRILL` in `init_config`. Now the S3 render/main/switch/drill-status equivalents so I can mirror precisely.
+CURRENT UNCOMMITTED WORK
 
-This clarifies the design — critically, `_is_batch_drill_mode` must key on the actual monitor layout (`batch_active`), not mode membership, so the batch→per-object fallback is handled correctly (as NFSv3 does). Let me read the rest of S3's fetch/poll/main to finish the picture.
+There is already a completed SMB/S3 vast_drill implementation in the working tree that has been validated against var203 but is not committed.
 
-I now have a complete, precise plan. Key design decisions, all verified against the code:
-- `_is_batch_drill_mode()` must key on the **monitor layout** (`batch_active`), not mode — so batch→per-object fallback is handled correctly (as NFSv3 does).
-- Throttle gated to `view/tenant/bucket` only — leaves **cnode and vip cadence unchanged** (honoring "keep cnode unchanged" and "preserve vip").
-- `enter_drill_mode` uses `DRILL.rank`/`DRILL.create_monitors` only for view/tenant/bucket; cnode and vip creation paths stay as-is.
-- Startup interstitial via the shared `with_loading_status` + a new `"startup"` message.
+Do not lose, revert, or rebuild that work unnecessarily.
 
-Let me record the work plan, then implement test-first.
+Before doing anything else:
 
-Starting with the small enabling changes (Task #2): the mock's `reject_object_types` flag and the vast_drill startup message.
+1. Inspect git status and current diff.
+2. Verify the working tree contains exactly the expected SMB/S3 work from the previous phase.
+3. Re-run ./scripts/validate.sh.
+4. If the existing SMB/S3 work is still green, treat it as the baseline for this phase.
+5. Do not commit it yet.
+
+The previous phase established approximately:
 
-Now the vast_drill startup message:
+SMB view:
+- 145 candidates
+- before: 18 entry calls / 104 s ranking
+- after: 7 entry calls / 9 s ranking
+- 5 serial ranking monitors collapsed to 1 batched rank monitor
+
+SMB tenant:
+- before: 9 entry calls / 34 s
+- after: 7 entry calls / 37 s
+- deterministic call-count improvement despite variable VMS latency
+
+S3 bucket:
+- before: 18 entry calls / 47 s
+- after: 7 entry calls / 45 s
+- 5 serial ranking monitors collapsed to 1 batched rank monitor
 
-Enabling changes done. Now the test-first suite (Task #1). Writing `tests/test_smb_s3_drill.py` mirroring the proven NFSv3/v41 patterns.
-
-Now proving these fail against HEAD (test-first). Running the new suite on the current implementation and saving the evidence.
-
-Let me confirm the key budget/throttle tests fail on their **assertion** (not just missing attributes), and get the pass/fail tally.
-
-Test-first confirmed: SMB view / S3 bucket entry fail cleanly at **44 calls > 6**, throttle fails on missing `force`, etc. One surprise: the VIP topn-only fallback test errors on HEAD with *"unsupported object_type: vip"* — the fallback produced no rows and fell through to the error. Since I'm preserving VIP unchanged, I must understand whether that's a mock-shape issue or a real gap before relying on that test. Let me read the VIP topn functions and the mock's `key=vip` shape.
-
-Root cause found: the mock's generic topn `block()` emits `{title, value}`, but `_vip_topn_activity_rows` reads `total/read/write` (as real VMS topn returns, per its own docstring). So the fallback correctly skips the activity-less mock rows → no rows. That's a **mock fidelity gap**, not an engine bug — and it's why this path was never exercised. I'll give the mock's `vip` topn block realistic `total/read/write` fields (additive; only the vip sub-block, which only S3 consumes).
-
-Tests written and proven to fail on HEAD. Now implementing the SMB port (Task #3). Reading SMB's imports and `init_config` to wire `DRILL` in exactly as NFSv3 does.
-
-Now applying the SMB port edits.
-
-Now construct `DRILL` in `init_config`:
-
-Now replacing SMB's chunked-scan `_rank_drill_candidates` with `DRILL.rank`. Let me get its current exact text.
-
-Now `enter_drill_mode` — route view/tenant monitor creation through `DRILL.create_monitors`, keep cnode per-object. Reading current text:
-
-Now `_is_batch_drill_mode` → layout-based:
-
-Now `fetch_drill_query` (add `force` + throttle), `switch_drill_mode`, `manual_refresh`, `poll_tick`. Locating them post-edit:
-
-Now `switch_drill_mode` → shared loading helper, plus `manual_refresh` force. Reading them:
-
-Now `poll_tick`/`manual_refresh` — force the drill query on manual refresh:
-
-Now the startup interstitial — `_render_frame` branch, `_set_startup_status`, and `initialize()`. Reading `_render_frame`:
-
-Now `_set_startup_status`, `initialize()`, and rewiring `main()`:
-
-SMB port complete. Let me run the SMB-specific tests plus globals-hygiene before moving to S3.
-
-The `-k` over-matched. Let me run just SMB tests cleanly and inspect the one SMB failure (`test_smb_ranking_cleans_up_on_query_error`).
-
-All SMB tests pass except `test_smb_ranking_cleans_up_on_query_error`, which is a **test bug**: `9006` is the drill's *display* monitor (legitimately live while the drill is active), not a leaked rank monitor. The rank monitors were correctly deleted via the `finally` path. Fixing the assertion to allow the active drill's own monitors:
-
-SMB globals-hygiene and existing SMB api-efficiency tests pass (13/13). The remaining failures are all S3/`[s3]` (not yet ported). Let me confirm every SMB test passes explicitly:
-
-`-k "smb"` matches the *filename* `test_smb_s3_drill.py`, so it can't separate SMB from S3 tests — cosmetic. Confirming SMB via explicit node IDs (including the fixed test):
-
-The filename contains both "smb" and "s3", breaking `-k` filtering entirely. I'll use explicit node IDs. Re-running the full SMB set to confirm green after the fix:
-
-All 13 SMB nodes pass. SMB port complete. Now S3 (Task #4), mirroring SMB while preserving VIP. Reading S3's imports, globals, and init_config end.
-
-S3 mirrors SMB. Applying the edits. Imports first:
-
-Now `DRILL` in `init_config` (after the scope config calls):
-
-Now S3 `_rank_drill_candidates` → `DRILL.rank`:
-
-Now S3 `enter_drill_mode` monitor-creation block — route bucket/tenant through `DRILL.create_monitors`, keep vip + cnode paths intact:
-
-Now S3 `_is_batch_drill_mode` → layout-based:
-
-Now S3 `fetch_drill_query` — add `force` + throttle for bucket/tenant, preserving both VIP branches. Reading current head:
-
-S3 `switch_drill_mode` → shared loading helper; add `_set_drill_status`. Reading current:
-
-Now S3 `poll_tick` + add `manual_refresh`:
-
-Now S3 `_render_frame` startup branch. Locating the panel branch:
-
-Now S3 `initialize()` + `main()` rewiring (including space → `manual_refresh`):
-
-Now wire S3's space key to `manual_refresh` (so force bypasses the throttle):
-
-S3 port complete. Running the full new suite plus globals-hygiene:
-
-All green. Let me run the broader affected suites to catch any regressions before the full gate.
-
-An existing test (`test_s3_helpers.py::test_build_drill_prop_lists_do_not_mix_metric_classes`) asserts `_is_batch_drill_mode("bucket") is True` — the old mode-based contract I deliberately changed to layout-based (for fallback correctness, matching NFSv3). Let me read the full test to update it correctly and visibly, not weaken it.
-
-This test's primary purpose (prop-list metric separation) is unaffected; only its two incidental `_is_batch_drill_mode(mode)` assertions encode the old mode-based contract I intentionally changed. Updating them to the new layout-based contract — strictly not weaker (it verifies the actual batch/per-object discrimination that drives fetch correctness):
-
-`test_s3_helpers.py` needs `vast_drill` imported; and I should check `test_smb_helpers.py` for the same old assertion. Let me check both and re-run.
-
-All broad suites green. S3 port complete. Now the full validation gate (Task #5), both interpreters.
-
-**Gate PASS**: 428 passed, 0 failed, 0 skipped, 0 error on **both** Python 3.14.6 and Python 3.8 (collection 400→428, floor 395, openssl-gated suites ran). Now the mock PTY exercise. Starting the standalone mock and driving both engines through startup + a drill via the safe PTY driver.
-
-Both exit clean-q with loading UI and no cleanup warnings. Let me verify the captured frames show the startup interstitial, drill panel, and footer, then stop the mock.
-
-Mock PTY confirms both engines interactively: **"Gathering initial metrics"** startup frame → **"Loading the VIEW/BUCKET"** interstitial → drill panel → footer, all present, clean-q exit. Now the real-VMS AFTER validation. Starting with SMB view (fast entry expected post-port, so clean-`q` should hold):
-
-SMB view AFTER shows only the headline monitor `2300` — no topn call, no drill monitor. The `v` keypress wasn't processed (drill never entered). Let me inspect the raw log to see what happened.
-
-The drill wasn't entered: startup+aux ran slow (~56 s, cluster-latency variance), so my `q` at 55 s collided in the input buffer with the buffered `v` and `q` won. Cleanup was clean (headline `2300` deleted, NONE leftover) — the port didn't break anything; my window was just too short. Re-running SMB view with a 100 s window so `v` is consumed well before `q`:
-
-SMB view AFTER works cleanly: **entry 18→7 calls, ranking 104 s→9 s**, 1 batched rank monitor (topn returned no usable view ranking on this cluster → one batched rank monitor, still far better than 5 serial chunks), cleanup NONE leftover. Continuing with SMB tenant, then S3 bucket/tenant/VIP:
-
-SMB tenant AFTER: entry 9→7, 1 rank monitor, cleanup NONE. Now S3 bucket and tenant:
-
-S3 didn't enter the drill again (only startup monitors `2307/2308`), and running two S3 runs together hit the 5-min cap. S3 startup is slower (merge-probe + s3_metrics probe). Let me check the timing, then run S3 individually with a longer window.
-
-One real-cluster call took **36 s** right now — latency is spiking, dragging S3 startup past 90 s so `b` and `q` collided again. SMB AFTER is already solidly captured (view 7 calls/9 s, tenant 7 calls/37 s, clean). For S3 I'll use a longer window and run each separately. S3 bucket, 140 s:
-
-S3 bucket AFTER: **entry 18→7 calls**, 1 batched rank monitor (vs 5 serial chunks), cleanup NONE. Now S3 tenant:
-
-S3 tenant AFTER: **entry 9→7, ranking 59 s→10 s**, cleanup NONE. Now the S3 VIP regression sanity check — must confirm topn ranking, filtering, per-object monitors, and clean cleanup are all preserved:
-
-**S3 VIP fully preserved**: 3 topn calls (ranking), 8 per-object monitors, **zero** `192.168.*` in the panel, unthrottled re-poll cadence (~2 s, contrasting the throttled bucket/tenant), and cleanup NONE leftover. All AFTER runs used clean-`q`, no SIGKILL. Final belt-and-suspenders sweep — confirm none of today's AFTER session monitors (id range 2300–2330) survive:
-
-No AFTER-session monitors survive (NONE in 2300–2340); the 39 remaining are pre-existing/concurrent, not mine. **All real-VMS validation complete and clean.** Marking Task #5 done and updating docs (Task #6).
-
-Adding the Startup/loading UX note before the NVMe section:
-
-Updating test counts and the new suite in the test-architecture section:
-
-Now the Known defects / outstanding-work section:
-
-Now the "Decisions still open" item #5 (SMB/S3 adopting vast_drill):
-
-Docs updated. Running the final validation gate to confirm the complete tree (code + tests + doc links) is green:
-
-Final gate PASS on both interpreters. Confirming the working-tree changes are exactly what I intended (no stray edits):
-
-Large-ish churn — let me verify no function was accidentally removed (only the intended `def`s changed):
-
-Exactly the three intended `def`s per engine were replaced; everything else edited in place; all modules compile. Let me capture concrete **mock** after-numbers for the report (fast loopback) to pair with the real-cluster numbers:
-
-All data collected. Marking the final task complete and delivering the report.
-
-# SMB/S3 VAST_DRILL IMPLEMENTATION AND REAL-VMS VALIDATION
-
-**Cleanup of 2299:** Deleted `2299 adhoc_opstat_s3_vip_55` (my only leaked monitor, approved). Confirmed gone by `GET` (`2299_present=False`); a follow-up sweep confirmed **none** of my test sessions' monitor ids (2245, 2264–2328) remain live. Did not touch the 39 pre-existing/concurrent `adhoc_opstat_*` monitors.
-
-**Files changed:**
-- `smb.py` — drill ported to `vast_drill.DrillSession`; `fetch_drill_query(force)` + throttle; `manual_refresh` forces; `switch_drill_mode` via `with_loading_status`; `initialize()` startup interstitial; `_render_frame` startup branch; `_is_batch_drill_mode` layout-based.
-- `s3.py` — same for bucket/tenant; VIP + cNode paths untouched; added `manual_refresh`, wired space to it.
-- `vast_drill.py` — added `LOADING_MESSAGES["startup"] = "Gathering initial metrics, please stand by..."` (1 line).
-- `tests/mock_vms.py` — added `state.reject_object_types` (enables the VIP topn-only fallback test); gave the `vip` topn block realistic `total/read/write` fields.
-- `tests/test_s3_helpers.py` — updated the two incidental `_is_batch_drill_mode(mode)` assertions to the new layout-based contract (visible, explained; primary prop-list coverage unchanged).
-- `tests/test_smb_s3_drill.py` — **new**, 28 tests.
-- `docs/REFACTOR_HANDOFF.md` — status, before/after, startup UX, test counts, outstanding work.
-
-**Tests added:** `tests/test_smb_s3_drill.py` (28) covering all 14 required areas: SMB view & S3 bucket entry budgets, tenant budgets, ranking of busy objects beyond the first 32, rank cache on re-entry, re-poll throttle, `space`/`manual_refresh` bypass, batch→per-object fallback, ranking cleanup on success and on query-error, VIP topn ranking / `192.168.*` filtering / topn-only fallback via mock rejection, drill loading frame, and startup "Gathering initial metrics" frame.
-
-**Pre-fix regression proof (against HEAD):** budget tests failed on their assertion — `SMB view = 44 calls`, `S3 bucket = 44 calls` (both `assert ≤ 6`); throttle/cache/fallback failed on the missing `force`/`DRILL`/`manual_refresh`/`initialize`. Saved in `prefix_proof.txt`. The ranking-correctness and VIP tests are preservation guards (pass on HEAD; the VIP topn-only fallback needed the mock fidelity fix to be exercisable at all — that gap is why the path was previously "unverified").
-
-**SMB implementation:** view/tenant → `DRILL.rank` (topn → adaptive batched rank monitors → 5-min cache) + `DRILL.create_monitors` (batch with per-object fallback). cNode unchanged (per-object, head-sliced). `fetch_drill_query` throttles view/tenant only; cNode keeps every-tick cadence.
-
-**S3 implementation:** identical for bucket/tenant. cNode and VIP creation paths left intact. Throttle gated to bucket/tenant; VIP and cNode unchanged. Both VIP `fetch_drill_query` branches (topn-only mode, and the "activity ≤ 0 → topn" fallback) preserved verbatim.
-
-**S3 VIP preservation** (real `var203` + mock): topn ranking (`GET /monitors/topn/?key=vip`, 3 calls observed), `192.168.*` filtering (0 internal IPs in the panel), 8 per-object monitors, unthrottled re-poll (~2 s cadence), topn-only fallback now exercised by a mock that rejects `object_type=vip`. Unchanged.
-
-**Startup/loading UX:** shared `initialize()` wraps auth + cluster resolution + headline-monitor creation + first fetch in `vast_drill.with_loading_status`, painting `Gathering initial metrics, please stand by...` before the first API call; `_render_frame` renders it as a framed status with the footer intact; the normal dashboard replaces it automatically. No threads. Implemented for SMB/S3 only (NFS/NVMe out of scope).
-
-**Mock before/after** (loopback counts):
-| | entry before → after | 6 rapid ticks before → after |
-|---|---|---|
-| SMB view | 45 → **4** | 6 → **0** (throttled) |
-| S3 bucket | 45 → **4** | 6 → **0** |
-| SMB/S3 tenant | 6 → 6 (already ≤1 chunk) | 6 → **0** |
-| S3 VIP | 10 → 10 (preserved) | 24 → 24 (preserved, unthrottled) |
-No leftover monitors after exit. (In the mock, topn ranks → 4-call entry.)
-
-**Real (var203; counts transfer, wall-clock is latency-dependent):**
-- **Real SMB view:** entry **18 → 7 calls**; ranking **104 s → 9 s**; 5 serial chunks → 1 batched rank monitor; 146 candidates; clean-`q`, cleanup NONE.
-- **Real SMB tenant:** entry **9 → 7**; ranking 34 s → 37 s; 2 chunks → 1 batch; 35 candidates; cleanup NONE.
-- **Real S3 bucket:** entry **18 → 7**; ranking 47 s → 45 s; 5 chunks → 1 batch; 146 candidates; cleanup NONE.
-- **Real S3 tenant:** entry **9 → 7**; ranking **59 s → 10 s**; 2 chunks → 1 batch; 35 candidates; cleanup NONE.
-- **Real S3 VIP:** unchanged/verified (above); 378 VIPs; cleanup NONE.
-
-On `var203`, topn returned no usable view/bucket ranking (few active views), so ranking fell to **one** batched rank monitor rather than the topn shortcut — hence 7 calls, not the ~4 the mock shows. Wall-clock gains track the cluster's per-call latency (a 36 s call was seen mid-pass); the deterministic wins are the call-count drop, one rank monitor instead of N serial chunks, and a cached re-entry.
-
-**Steady-state API cadence:** before = every ~5 s tick (S3 bucket measured `[2, 6, 6] s`, unthrottled). After = throttled to ~1 query / 15 s for view/tenant/bucket (unit-tested: ≤1 query across 4 ticks; mock rapid-fire = 0); VIP deliberately unchanged (real `[2,2,2,1,…] s`).
-
-**Rank-cache behavior:** re-entering the same drill inside the 5-min TTL issues **no** rank monitors and reuses the ranking (unit-tested: `≤ 2` calls on re-entry, vs a full re-scan on HEAD).
-
-**Monitor cleanup:** every real AFTER run exited via clean `q` (no SIGKILL) and left **no** monitors — verified against each session's exact monitor ids, plus a final sweep of the 2300–2340 range (NONE). The earlier `2245`/`2299` leaks were deleted and confirmed gone.
-
-**Validation gate:** `./scripts/validate.sh` → **RESULT: PASS**. `428 passed, 0 failed, 0 skipped, 0 error` on **current Python (3.14.6)** and **428 passed, 0 skipped on Python 3.8**; openssl present so the 171 mock-backed suites ran (not skipped); collection 428 (floor 395; was 400). Also: mock PTY exercise of both engines showed the startup frame → loading interstitial → drill panel → footer, clean-`q`.
-
-**Python 3.8:** green (428 passed, 0 skipped).
-**Current Python:** green (428 passed, 0 skipped, 3.14.6).
-
-**Known remaining risks:**
-- On `var203`, topn doesn't rank views/buckets, so entry is 7 (one batched rank monitor), not ~4; a high-view cluster where topn *is* usable (or the batched monitor is fast) should do better — worth a check on `var204` (429 views).
-- Real steady-state throttle cadence wasn't densely sampled (startup+ranking consumed the windows, and the cluster was latency-spiking); the throttle is authoritatively covered by unit tests and the mock, and the single display-query-per-run on the real cluster is consistent with it.
-- Startup/loading UX is SMB/S3 only; NFS/NVMe still block silently at startup.
-
-**Cleanup-interruption follow-up:** filed as a separate tracked task (chip `task_79a317e3`) — cleanup can leave a monitor behind if interrupted mid-drain, with no warning. **Not fixed here** (out of scope); it did not block testing because all runs used clean-`q` with post-run id-keyed verification. Recorded as outstanding item #1 in the handoff.
-
-**Documentation updated:** `docs/REFACTOR_HANDOFF.md` — SMB/S3 status (ported, with real before/after), new Startup/loading UX section, test count 400→428 and the new suite, outstanding-work list (drill port → resolved; cleanup-interruption → new outstanding), and open-decisions (SMB/S3 adoption settled; startup-UX promotion added). No settled `docs/decisions/` record was rewritten (none changed).
-
-**Recommended next engineering item:** **NVMe ranking and drill batching** (handoff outstanding #2) — it dominates API cost (~467+ calls/30 s, head-slices `/volumes/`, per-object monitors) and is the last engine on the pre-refactor drill path; the SMB/S3 port is now a proven template for it. Do the cluster-constraint re-verification (`BlockMetrics`/`VolumeMetrics`/`ProtoMetrics` mixing) with the probe-and-fallback pattern as part of it. Secondarily, the **cleanup-interruption defect** is a good standalone follow-up since it affects every engine's shutdown safety.
-
-Nothing was committed, pushed, merged, or turned into a PR. The working tree holds the changes (6 modified files + 1 new test file) for your review.
-
-
-##########
-I then gave this to claude too, informational for you: 
-
-The VAST cluster var204.selab.vastdata.com will be reinstalled today and not available so do whatever testing you are doing on var203.selab.vastdata.com while its offline.  I don't expect it to be back until Monday and will need to reconfigure anything I am using on it even then, so consider this permanent until I say otherwise. 
-
-Claude responded with: 
-Understood — treating var204.selab.vastdata.com as unavailable until you say otherwise, and using var203.selab.vastdata.com for all real-cluster testing. Let me record this so it persists across sessions.
-
-Also saving the real-VMS testing safety protocol the user mandated (mandatory cleanup verification, clean-`q` not SIGKILL) — that's durable guidance I referenced above:
-
-Recorded. Summary of what this means going forward:
-
-- **All real-cluster testing → var203.selab.vastdata.com.** var204 is treated as unavailable until you explicitly lift it — not just today.
-- **Nothing currently completed is affected.** The SMB/S3 drill port was already validated on var203, so the finished work stands.
-- **What is now blocked:** real-cluster validation of the **NFS v3 / v4.1** engines, since var204 was their validation cluster of record in [docs/REFACTOR_HANDOFF.md](docs/REFACTOR_HANDOFF.md) (VAST OS 5.5.0.1, 429 views). Mock coverage for those still runs; I just won't be able to do a live NFS validation pass until var204 returns. My recommended next item (NVMe ranking/batching) can be validated on var203 (`--block`), so it's unaffected.
-
-I won't present any var204 numbers as current, and I'll keep using `VAST_PASSWORD` from the environment. No code or docs changed for this — it's operational context. Ready for the next task whenever you are.
-
+S3 tenant:
+- before: 9 entry calls / 59 s
+- after: 7 entry calls / 10 s
+
+S3 VIP:
+- preserved
+- topn ranking preserved
+- 192.168.* filtering preserved
+- per-object VIP monitors preserved
+- topn-only fallback covered by mock
+- VIP cadence intentionally unchanged
+
+SMB/S3 view/tenant/bucket steady-state polling is now throttled rather than querying every ~5 s tick.
+
+The shared loading UX now includes:
+
+  Gathering initial metrics, please stand by...
+
+for SMB/S3 startup, plus drill-specific loading interstitials.
+
+PHASE 1 — DURABLY RECORD THE NEW OPSTAT FEATURE BACKLOG
+
+Create/update an appropriate backlog section in the durable project documentation.
+
+Do not invent a heavyweight issue-management system if the repo does not have one.
+
+Add these four owner-requested OPSTAT FRs:
+
+FR-A — STANDARDIZE NAVIGATION SHORTCUT KEYS
+
+Across all protocol engines, standardize common navigation shortcut keys wherever the same conceptual action exists.
+
+Examples of common actions:
+- quit
+- sort by ops
+- sort by latency
+- sort by name
+- cNode drill
+- view drill
+- tenant drill
+- exit drill
+- manual refresh
+- VIP drill/view
+
+Requirements:
+- same concept should use the same character across engines whenever practical
+- same labels, capitalization, ordering, separators, and overall visual style
+- protocol-unique options are appended after the common controls
+- NFSv4.1-specific [4] native telemetry and [h] v4 hosts remain unique additions
+- VIP should standardize on [i], not [v]
+- do not reuse one shortcut for two different concepts on different engines
+- no navigation control may disappear because of terminal-width truncation
+- preserve narrow-terminal behavior
+- unique protocol controls should not reorder the common controls
+
+Do not blindly change every engine immediately.
+Fold this into engine work as those engines are touched, and build shared helpers where that reduces divergence safely.
+
+FR-B — LATENCY UNIT CORRECTNESS AND DISPLAY
+
+Audit latency units across all metric paths as engines are touched.
+
+VAST API endpoints may return:
+- seconds
+- milliseconds
+- microseconds
+- nanoseconds
+- cumulative latency sums requiring derived units
+- endpoint-specific semantics
+
+Requirements:
+- verify source unit from code/API evidence, not assumption
+- double-check every conversion mathematically
+- distinguish native from derived values
+- avoid accidental double conversion
+- avoid displaying 0 when a small non-zero value is merely below formatting precision
+- prefer milliseconds for user-facing latency where that improves readability
+- retain microseconds where values are consistently sub-ms and ms would obscure useful detail
+- make the displayed unit obvious in headers/labels
+- use one consistent formatting policy across protocols where practical
+- add unit tests with literal source values covering ms/us/ns conversions
+- do not change a unit based only on "what looks plausible"
+
+FR-C — BLOCK FABRIC PERCENTAGE CORRECTION
+
+In BLOCK/NVMe:
+- Fabric activity count must NOT participate in the primary workload percentage denominator.
+- Primary workload percentages should be based only on actual workload categories such as READ, WRITE, and metadata if applicable.
+- Fabric metrics remain visible as their own separate bar/metric.
+- Fabric should not distort READ/WRITE percentages.
+- Verify current math before changing it.
+- Add tests proving the old denominator is wrong and the corrected denominator produces expected percentages.
+
+FR-D — TESTING / QUALITY BUILD-IN
+
+The repo now has a real test suite and ./scripts/validate.sh.
+
+Treat the FR as:
+- continue expanding tests until legacy behavior being touched is covered
+- every code commit must run the complete validation gate
+- Python 3.8 and current Python must both pass
+- zero skips
+- openssl-backed tests must actually run
+- new defects require regression tests where practical
+- API efficiency is a tested regression dimension
+- TUI navigation/render behavior is tested
+- metric conversion/unit semantics are tested
+- mock tests do not replace real-VMS validation when the semantic question requires the cluster
+
+Do not claim "unit testing was missing" anymore; the repo now has substantial coverage.
+The remaining goal is coverage expansion around legacy paths as they are refactored.
+
+PHASE 2 — INVESTIGATE THE CLEANUP-INTERRUPTION DEFECT
+
+This is now a real safety issue, reproduced more than once on var203.
+
+Observed behavior:
+- clean `q` exits delete all monitors correctly
+- SIGTERM during a slow synchronous cleanup can leave an earlier-created `adhoc_opstat_*` monitor behind
+- one observed leaked SMB headline monitor
+- one observed leaked S3 VIP per-object monitor
+- cleanup can terminate without an explicit "not deleted" warning
+- shared cluster has unrelated/concurrent opstat sessions, so verification must track exact session monitor IDs
+
+Treat this as a defect investigation and, if the root cause is safely fixable without introducing concurrency or a major lifecycle redesign, FIX IT in this work package.
+
+Requirements:
+1. Reproduce reliably in the mock before changing code if possible.
+2. Inspect:
+   - signal handlers
+   - atexit registration
+   - cleanup ordering
+   - session/log shutdown ordering
+   - monitor tracking containers
+   - timeout behavior during delete
+   - reentrancy if signal arrives while cleanup is already running
+3. Determine why cleanup can be truncated while still appearing complete.
+4. Ensure cleanup is idempotent.
+5. Ensure a second cleanup invocation cannot skip monitors because state was cleared too early.
+6. Do not use SIGKILL in tests.
+7. Do not add threads just to solve this.
+8. Add regression tests for interrupted/partial cleanup.
+9. Preserve current normal `q` behavior.
+
+If the fix requires a major signal/lifecycle redesign, STOP that sub-item, document the root cause and recommendation, and continue with NVMe work if safe.
+
+During real-VMS validation, you are approved to delete only temporary monitors created by YOUR test session if a failure leaves one behind.
+Do not sweep pre-existing/concurrent adhoc_opstat_* monitors.
+
+PHASE 3 — ESTABLISH A REAL NVMe BEFORE BASELINE ON var203
+
+Use the existing BLOCK/NVMe invocation through environment credentials.
+
+Do not put the password in argv.
+
+Use:
+- var203.selab.vastdata.com
+- the existing configured test volumes
+- opstat itself
+- --log-api-calls where useful
+
+Before implementation, measure the current real path.
+
+Capture:
+
+STARTUP
+- time to any visible output
+- time to first normal frame
+- whether user sees a blank/frozen terminal during slow startup
+- startup API-call count
+- monitor count
+
+CLUSTER REFRESH
+- monitor queries per refresh
+- total API calls over ~30 s
+- whether the documented ~467+ calls/30 s is still accurate
+- current monitor-family split
+- whether BlockMetrics/VolumeMetrics/ProtoMetrics are actually rejected when mixed on this VMS build or merely historically separated
+
+DRILL ENTRY
+- candidate volume count
+- whether it head-slices rather than ranks
+- number of drill monitors
+- entry API calls
+- wall-clock
+- monitor cleanup
+- whether drill selection chooses active volumes or merely first returned
+
+DRILL STEADY STATE
+- queries per refresh
+- any per-object explosion
+- whether manual refresh changes behavior
+
+DISPLAY / FR-C
+- current workload percentage math
+- exact denominator
+- where Fabric enters the computation
+- current Fabric bar
+- whether metadata exists as a workload category
+- literal before values sufficient to build a failing test
+
+NAVIGATION / FR-A
+- current key map
+- compare against SMB/S3/NFS common controls
+- identify conflicting/unique keys
+- identify VIP key if any
+- do not change yet until map is understood
+
+LATENCY / FR-B
+- identify every latency source used by BLOCK/NVMe
+- source metric names
+- source units
+- conversion code
+- display units
+- verify against API/catalog/known semantics
+- identify inconsistent or ambiguous conversions
+
+Monitor cleanup verification must key on exact IDs created by your session.
+
+PHASE 4 — RE-VERIFY THE NVMe MONITOR-FAMILY CONSTRAINT
+
+The prior handoff says NVMe's 8 cluster monitors per refresh are a documented VMS constraint because BlockMetrics / VolumeMetrics / ProtoMetrics cannot be mixed.
+
+Do not blindly preserve or remove that split.
+
+Probe it safely against var203.
+
+Use the same probe-and-fallback philosophy as D-010.
+
+Determine:
+- which families can coexist in one monitor
+- which cannot
+- whether rejection occurs at monitor creation or query time
+- whether object scope changes compatibility
+- whether fewer than 8 monitors can be used safely
+
+No destructive VMS action.
+Temporary probe monitors must be deleted.
+
+If real evidence confirms the split is required:
+- preserve it
+- document it
+- optimize elsewhere
+
+If real evidence shows consolidation is possible:
+- add probe-validated merge with fallback
+- never assume all VMS builds behave the same
+
+PHASE 5 — IMPLEMENT NVMe RANKING AND DRILL BATCHING
+
+Use the proven DrillSession pattern where it fits.
+
+Goals:
+- stop head-slicing `/volumes/`
+- rank by actual activity
+- batch drill monitors when the API supports it
+- add fallback when batch monitor shape cannot be split by object
+- avoid per-object monitor/query explosions
+- cache ranking
+- throttle drill polling where semantically safe
+- Space/manual refresh forces a refresh
+- preserve protocol-specific row builders and metric semantics
+- preserve cleanup
+
+Do not force `vast_drill` into NVMe if its metric families make the shared abstraction incorrect.
+Adapt or extend the shared layer only if the abstraction remains honest for NFS/SMB/S3 users.
+
+Test first.
+
+Add failing tests against the current implementation for:
+- active volume beyond first 8 not selected
+- drill entry API budget
+- per-object query explosion
+- ranking cache
+- throttle
+- manual refresh override
+- batch fallback
+- cleanup success
+- cleanup error/interruption path
+- real monitor-family constraint behavior represented in mock where appropriate
+
+PHASE 6 — IMPLEMENT BLOCK FABRIC PERCENTAGE FIX (FR-C)
+
+After proving the current denominator, correct it.
+
+Primary workload mix denominator:
+- READ
+- WRITE
+- metadata, if the BLOCK engine genuinely has a metadata workload category
+
+Fabric:
+- remains visible
+- remains separately quantified
+- does not contribute to READ/WRITE/MD percentages
+- should have a visually separate bar/section if it does not already
+
+Add literal unit tests:
+- READ-only
+- WRITE-only
+- mixed READ/WRITE
+- READ/WRITE + very large Fabric count
+- zero workload + Fabric activity
+- metadata case if applicable
+
+For zero workload + Fabric:
+- do not invent workload percentages
+- Fabric should still be visible as activity
+- primary workload mix should honestly show no workload mix
+
+PHASE 7 — STANDARDIZE NVMe NAVIGATION AS THE FIRST FR-A PORT
+
+Use NVMe as the first engine where we deliberately apply the new navigation standard.
+
+Before changing keys, construct the desired COMMON NAV ROW.
+
+Derive the common key map from existing engines, but standardize intentionally.
+
+Preferred concepts:
+- [q] Quit
+- [o] Ops
+- [l] Lat
+- [n] Name
+- [c] cNode where supported
+- [v] View where supported
+- [t] Tenant where supported
+- [i] VIP where supported
+- [x] Exit drill
+- [space] Refresh
+
+Unique protocol controls go AFTER the common set.
+
+NFSv4.1 unique controls remain:
+- [4] native NFSv4 telemetry
+- [h] v4 hosts
+
+Do not change NFS/SMB/S3 keys in this phase unless a shared helper requires a safe mechanical change.
+Record their current deviations in the backlog for later normalization.
+
+For NVMe:
+- align any common semantics with the common map now
+- preserve unique NVMe-specific controls after common controls
+- update help/footer/panel labels consistently
+- test narrow terminal rendering
+- ensure no common control is truncated away
+- avoid a key collision between sorting and drill navigation
+
+If the common row cannot fit at historical width:
+- improve shared layout/abbreviation deliberately
+- do not silently raise width until the problem disappears
+- preserve usability at narrow terminals
+
+PHASE 8 — AUDIT AND FIX NVMe LATENCY UNITS (FR-B)
+
+Trace every BLOCK/NVMe latency value from:
+API response
+→ raw unit
+→ conversion
+→ internal representation
+→ rendering
+
+For each displayed latency:
+- prove the source unit
+- prove the conversion
+- state the user-facing unit choice
+- add tests
+
+Preferred presentation:
+- milliseconds for values naturally in ms range
+- microseconds for consistently sub-ms metrics where ms destroys useful precision
+- formatting helper should avoid `0 ms` for a meaningful sub-ms value
+- ns should be converted correctly before presentation unless a specific metric is genuinely best shown in ns
+
+Examples of expected display behavior:
+- 250 µs → either `250 µs` or `0.25 ms`, depending on panel policy
+- 1,500 µs → preferably `1.50 ms`
+- 2,000,000 ns → `2.00 ms`
+- 0.4 µs should not become `0 µs`
+
+Do not retrofit all engines in this phase.
+Build shared unit helpers only if they are clearly reusable without changing existing semantics unexpectedly.
+
+Record remaining protocol latency-unit audits in the backlog.
+
+PHASE 9 — STARTUP UX FOR NVMe
+
+The real SMB/S3 tests proved startup can take tens of seconds.
+
+NVMe must not leave users staring at a blank/frozen terminal.
+
+If NVMe startup can block materially:
+- render `Gathering initial metrics, please stand by...` before blocking startup work
+- use the shared loading helper if compatible
+- status must reach the terminal first
+- errors must replace the loading state cleanly
+- normal dashboard replaces it automatically
+
+If your performance work makes first-frame startup effectively immediate, keep the mechanism but avoid unnecessary visible flicker where practical.
+
+This startup behavior is becoming a cross-protocol invariant.
+
+Do not retrofit NFS in this phase unless the shared helper change automatically and safely applies.
+
+PHASE 10 — TESTING / QUALITY EXPANSION (FR-D)
+
+Add the necessary NVMe coverage.
+
+At minimum cover:
+- ranking correctness
+- call budgets
+- batching
+- fallback
+- throttle
+- manual refresh
+- cleanup
+- cleanup interruption if fixed
+- Fabric percentage math
+- Fabric-only activity
+- navigation key map
+- footer ordering
+- narrow terminal rendering
+- latency conversion
+- latency formatting
+- startup loading interstitial
+- no regression to cluster headline behavior
+- monitor-family probe/fallback if implemented
+
+Use the real-cluster findings to improve mock fidelity where needed.
+
+Do not weaken existing tests.
+
+Then run:
+./scripts/validate.sh
+
+Require:
+- current Python PASS
+- Python 3.8 PASS
+- zero skipped
+- openssl suites actually run
+- documentation links valid
+
+PHASE 11 — REAL-VMS AFTER VALIDATION ON var203
+
+After the mock/full gate is green, validate the actual implementation on var203.
+
+Use only the real cluster currently authorized:
+var203.selab.vastdata.com
+
+Do not use var204.
+
+Measure BEFORE versus AFTER:
+
+STARTUP
+- visible loading status timing
+- first normal frame
+- API calls
+
+CLUSTER
+- monitor count
+- queries/refresh
+- total calls/30 s
+- any monitor-family fallback
+
+DRILL
+- candidate count
+- selected active volumes
+- entry API calls
+- wall-clock
+- monitor count
+- steady-state cadence
+- rank-cache re-entry
+- manual refresh
+
+DISPLAY
+- READ/WRITE/MD percentages
+- separate Fabric bar
+- latency units and representative displayed values
+- navigation/footer behavior
+- narrow terminal behavior if practical
+
+CLEANUP
+- clean q
+- full process exit
+- exact monitor IDs created by this session
+- none left live afterward
+
+If the cleanup-interruption fix was implemented:
+- safely reproduce the old SIGTERM scenario
+- verify all exact session monitors are removed
+- never SIGKILL
+
+PHASE 12 — UPDATE DURABLE DOCUMENTATION
+
+Update docs/REFACTOR_HANDOFF.md with:
+- SMB/S3 now complete if that was not already recorded
+- var204 unavailable until owner restores it
+- FR backlog and current status
+- NVMe before/after
+- cleanup-interruption status
+- testing count
+- startup UX status
+- navigation-standardization status
+- latency-audit status
+- remaining work
+
+Create a new decision record only if a genuinely durable architectural decision was made.
+
+Good candidates, only if evidence justifies them:
+- standardized navigation contract
+- shared latency presentation policy
+- NVMe monitor-family compatibility policy
+- cleanup lifecycle contract
+
+Do not rewrite existing decision records merely to add implementation status.
+
+PHASE 13 — PREPARE EXTERNAL HANDOFF
+
+At the end, create/update:
+
+docs/CLAUDE_HANDOFF.md
+
+This is specifically for transferring the result to ChatGPT through an approved external workflow.
+
+Keep it concise but complete.
+
+Include:
+- branch / HEAD
+- current uncommitted state
+- objective
+- exact changes
+- real-VMS evidence
+- mock/test evidence
+- before/after API counts
+- Fabric percentage correction
+- navigation decisions
+- latency-unit findings
+- cleanup findings
+- validation counts
+- known risks
+- open questions
+- recommended next step
+
+Do not include:
+- passwords
+- tokens
+- auth data
+- raw proprietary logs
+- unnecessary internal environment detail
+
+FINAL REPORT
+
+Return one complete report:
+
+OPSTAT NVMe / SAFETY / UX REFACTOR STATUS
+
+Starting state:
+Existing SMB/S3 work verification:
+FR backlog recorded:
+var204 operational note:
+Cleanup-interruption root cause:
+Cleanup-interruption fix:
+NVMe real BEFORE:
+NVMe family-mixing probe:
+NVMe implementation:
+Fabric percentage fix:
+Navigation standardization:
+Latency audit:
+Startup/loading UX:
+Tests added:
+Mock before/after:
+Real NVMe before/after:
+API calls/30s before/after:
+Drill entry before/after:
+Monitor count before/after:
+Cleanup validation:
+Validation gate:
+Python 3.8:
+Current Python:
+Files changed:
+Docs updated:
+Decision records added:
+Known risks:
+Outstanding FR work:
+Recommended next engineering milestone:
+External handoff file:
+
+Do not commit.
+Do not push.
+Do not merge.
+Do not create a PR.
+
+You may make all normal code/test/doc changes necessary to complete this full work package.
+
+If a directly-related defect is discovered, fix it in this same pass when safe and testable.
+
+Only stop early for the hard-stop conditions stated at the beginning.
