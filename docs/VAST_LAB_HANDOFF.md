@@ -1,97 +1,109 @@
-Yes. I got ahead of you. You are still on the personal laptop (seeker) right now. The continuation work has been pushed, so there is nothing more you need to do there.
+Absolutely. For the work laptop, you do not need to run the var203 validator. The work laptop’s job is to sync the published branch and verify the code/test state there. The real-VMS validation belongs on the Linux lab server.
 
-Here is the exact sequence from where you are.
+WORK LAPTOP
 
-PERSONAL LAPTOP — seeker
-
-Do nothing else. Claude already pushed the continuation branch to:
-
-4c449cc04ebf07869357b87d6c482e876b20cf29
-
-You can close the terminal/session. The baton is on GitHub now.
-
-⸻
-
-SWITCH TO WORK LAPTOP — macbook
-
-Everything below is run on the WORK LAPTOP.
-
-1. Go to the repo and make sure you’re not carrying anything
+1. Go to the repo and make sure you don’t have local work
 
 cd ~/git/opstat
 git status --short
-git branch --show-current
 
-git status --short should print nothing.
+If that prints anything, stop there and show me the output before doing the checkout/merge.
 
-2. Fetch the continuation work from GitHub
+If it is clean, continue.
 
-git fetch origin
+2. Fetch the published branch
 
-3. Switch to the continuation branch
+git fetch origin refactor/tui-performance-local-continuation-wip
 
-You already had this branch on the work laptop, so:
+Then:
 
-git switch refactor/tui-performance-local-continuation-wip
-
-Then safely fast-forward it:
-
+git checkout refactor/tui-performance-local-continuation-wip
 git merge --ff-only origin/refactor/tui-performance-local-continuation-wip
 
-4. Verify that the work laptop now has the exact version we want
+3. Verify you landed on exactly the published version
 
-echo "===== WORK LAPTOP READY ====="
-git branch --show-current
 git rev-parse HEAD
+
+It must print:
+
+25220c24afb9e45de9b8193d30a503ded9e4a9af
+
+Then verify the recent history:
+
+git log -6 --oneline
+
+The top four commits should be:
+
+25220c2 docs: reconcile round-2 var203 evidence
+23a5e45 validation: state-aware lab driver and merge-legality probes
+eb65cde input: honor every queued keystroke in all five engines
+5a41b46 nav: wrap the footer legend instead of truncating it
+
+4. Verify the work laptop tree is clean
+
 git status --short
-git log -7 --oneline --decorate
 
-You want:
+Expected: no output.
 
-refactor/tui-performance-local-continuation-wip
-4c449cc04ebf07869357b87d6c482e876b20cf29
+5. Run the full validation gate
 
-And git status --short should be empty.
-
-5. Run the gate on the work laptop
+On the work laptop:
 
 ./scripts/validate.sh
 
-Expected:
+The published baseline we’re expecting is:
 
-511 collected
-511 passed
+563 collected
+563 passed
+0 failed
 0 skipped
 
-on both interpreters.
+on both the current Python and Python 3.8, plus:
 
-Stop there and paste me the output.
+276 relative documentation links OK
+
+The important final line is:
+
+RESULT: PASS
+
+This may take a while, so coffee protocol is authorized. ☕
+
+6. Run the focused regression suites
+
+After the full gate passes:
+
+pytest -q \
+  tests/test_render_navigation.py \
+  tests/test_nvme_drill.py \
+  tests/test_nvme_tcp.py \
+  tests/test_key_dispatch.py
+
+Expected:
+
+233 passed
+
+These specifically cover the work we just published: footer navigation, queued-key handling, NVMe drill behavior, and related navigation contracts.
+
+7. Final work-laptop state check
+
+echo
+echo "===== WORK LAPTOP FINAL STATE ====="
+git branch --show-current
+git rev-parse HEAD
+git status --short
+
+Expected:
+
+===== WORK LAPTOP FINAL STATE =====
+refactor/tui-performance-local-continuation-wip
+25220c24afb9e45de9b8193d30a503ded9e4a9af
+
+And then nothing from git status --short.
 
 ⸻
 
-AFTER THAT — Linux lab server
+At that point the three-machine state is cleanly separated:
 
-Don’t do this part yet. Once we verify the work laptop is clean at 4c449cc, we’ll move the exact same branch onto the Linux lab server and run the unattended var203 validator there.
+Personal MacBook: synced to 25220c2, and you have personally visually verified the footer fix. Work laptop: the steps above establish that the published branch also passes from your normal development environment. Linux lab server: separately sync it to 25220c2 and run the new real-var203 validator with the block and NFSv4.1 load generators active.
 
-So the machine flow is now:
-
-PERSONAL LAPTOP / seeker
-    |
-    | DONE: code committed + pushed
-    v
-GitHub @ 4c449cc
-    |
-    | YOU ARE DOING THIS NEXT
-    v
-WORK LAPTOP / macbook
-    |
-    | verify branch + run 511-test gate
-    v
-LINUX LAB SERVER
-    |
-    | pull same 4c449cc
-    | run unattended validator
-    v
-var203
-
-Right now: switch to the work laptop and run Steps 1–5 above.
+Once the work laptop finishes ./scripts/validate.sh, paste me that output. We can record the work-laptop validation before moving on to the second var203 run.
