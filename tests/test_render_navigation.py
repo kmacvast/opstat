@@ -37,9 +37,22 @@ def render_frame(module, columns=200, lines=40):
 
 @pytest.fixture
 def v41(monkeypatch):
-    """nfs_v41 primed with plausible rendered state, no VMS needed."""
+    """nfs_v41 primed with plausible rendered state, no VMS needed.
+
+    The exporter drill panels read the module-global NFS4 / HOSTVIEW
+    collectors, which init_config normally constructs. This fixture builds
+    the same collector objects itself (never scraped, so they render their
+    warm-up/empty states) rather than depending on another test having run
+    init_config first - these tests must pass in isolation, not just in
+    full-suite order.
+    """
+    import nfs4_native
     import nfs_v41
 
+    monkeypatch.setattr(
+        nfs_v41, "NFS4", nfs4_native.Nfs4Collector(lambda *a, **k: ""))
+    monkeypatch.setattr(
+        nfs_v41, "HOSTVIEW", nfs4_native.HostViewCollector(lambda *a, **k: ""))
     tui_layout.set_color(False)
     nfs_v41._COLOR = False
     nfs_v41.VMS, nfs_v41.PORT = "10.0.0.1", 443

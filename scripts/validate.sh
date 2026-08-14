@@ -33,7 +33,13 @@ cd "$REPO_ROOT" || exit 2
 # Minimum number of tests expected to collect. A much smaller green run means
 # suites are silently skipping. If tests are legitimately added or removed,
 # update this floor in the same change and say so in the report.
-MIN_TESTS=395
+#
+# The floor sits ~8% below the current collection count rather than exactly at
+# it: ordinary reorganization (merging parametrize cases, folding duplicate
+# tests) should not trip the gate, but losing any whole suite must - the
+# smallest suite this guards is worth ~8 tests, and the openssl-gated block is
+# ~180. History: 395 when the suite collected 400; raised with the suite at 504.
+MIN_TESTS=465
 
 FAST=0
 ALLOW_MISSING_OPENSSL=0
