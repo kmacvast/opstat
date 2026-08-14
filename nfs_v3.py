@@ -1839,21 +1839,27 @@ def render_screen():
     vast_common.flush_frame(buf.getvalue())
 
 
-def _footer_keys():
-    """The htop-style navigation key legend (owned by the common render path)."""
-    return (
-        c("  ", _DIM)
-        + c("[spc]", _BWHITE) + c("refresh  ", _DIM)
-        + c("r", _BWHITE) + c("pc  ", _DIM)
-        + c("o", _BWHITE) + c("ps  ", _DIM)
-        + c("l", _BWHITE) + c("at  ", _DIM)
-        + c("w", _BWHITE) + c("ork  ", _DIM)
-        + c("c", _BWHITE) + c("Node  ", _DIM)
-        + c("v", _BWHITE) + c("iew  ", _DIM)
-        + c("t", _BWHITE) + c("enant  ", _DIM)
-        + c("x", _BWHITE) + c("=cluster  ", _DIM)
-        + c("q", _BWHITE) + c("uit", _DIM)
-    )
+# Canonical common controls first (FR-A contract in vast_drill), then the
+# NFSv3-specific sort keys: [r] sort by RPC count, [w] sort by workload share.
+# This replaced the original htop-style legend (`q`uit / [spc]refresh /
+# x=cluster) so every engine reads the same way; the keys themselves are
+# unchanged.
+_NAV_CONTROLS = vast_drill.nav_controls(
+    ("q", "o", "l", "c", "v", "t", "x", "space"),
+    extra=(("r", "RPC"), ("w", "Work")),
+)
+
+
+def _footer_keys(width=None):
+    """The navigation key legend (owned by the common render path).
+
+    Truncated to the terminal width so a narrow terminal shortens the control
+    list legibly instead of wrapping it into the frame above.
+    """
+    legend = c("  ", _DIM) + vast_drill.nav_legend(_NAV_CONTROLS)
+    if width is not None:
+        legend = truncate_display(legend, width)
+    return legend
 
 
 def _render_frame():
@@ -1893,7 +1899,7 @@ def _render_frame():
             print(c(f"  Waiting for data…  VMS={VMS}:{PORT}"
                     f"  cluster={CLUSTER_NAME or '?'}", _DIM))
         print(c(_H * width, _DIM))
-        print(_footer_keys(), flush=True)
+        print(_footer_keys(width), flush=True)
         return
 
     total_ops        = sum(as_float(r["ops_sec"]) or 0 for r in rows)
@@ -1928,7 +1934,7 @@ def _render_frame():
     )
     print(c(_H * width, _DIM))
     print(foot)
-    print(_footer_keys(), flush=True)
+    print(_footer_keys(width), flush=True)
 
 
 # ---------------------------------------------------------------------------

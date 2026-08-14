@@ -151,7 +151,7 @@ def test_footer_survives_drill_error_and_status_panels(v41):
 # The other engines draw their own footers; guard them against the same bug.
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("engine_name,expected", [
-    ("nfs_v3", ["q", "x"]),
+    ("nfs_v3", ["[q]", "[x] Exit drill"]),
     ("smb", ["[q]", "[x]"]),
     ("s3", ["[q]", "[x]"]),
 ])
@@ -194,7 +194,7 @@ def test_other_engines_keep_controls_visible_in_drill_mode(engine_name, expected
 # guards against. Fails on that pre-change code.
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("engine_name,token", [
-    ("nfs_v3", "quit"),
+    ("nfs_v3", "[q]"),
     ("nvme_tcp", "[q]"),
 ])
 @pytest.mark.parametrize("columns", [200, 120, 80, 40])
@@ -217,7 +217,7 @@ def test_waiting_frame_keeps_the_footer(engine_name, token, columns):
 
 
 @pytest.mark.parametrize("engine_name,token", [
-    ("nfs_v3", "quit"),
+    ("nfs_v3", "[q]"),
     ("nfs_v41", "[q]"),
     ("smb", "[q]"),
     ("s3", "[q]"),
@@ -291,3 +291,81 @@ def test_exporter_drills_never_drop_the_footer(v41, mode, columns):
     finally:
         v41.EXPORTER_MODE = None
     assert "[q]" in frame
+
+
+# ---------------------------------------------------------------------------
+# FR-A: the canonical cross-protocol navigation contract.
+# Same concept -> same key, same label, same relative order, in every engine.
+# Protocol-specific controls come after the common set. VIP is never [v];
+# exit-drill is never [p] (the old NVMe bindings that survived in help text
+# after the keys themselves changed).
+# ---------------------------------------------------------------------------
+ENGINE_MODULES = ["nfs_v3", "nfs_v41", "smb", "s3", "nvme_tcp"]
+
+
+def _controls(engine_name):
+    import importlib
+
+    return importlib.import_module(engine_name)._NAV_CONTROLS
+
+
+@pytest.mark.parametrize("engine_name", ENGINE_MODULES)
+def test_common_controls_use_canonical_keys_labels_and_order(engine_name):
+    import vast_drill
+
+    canonical = dict(vast_drill.CANONICAL_CONTROLS)
+    order = {k: i for i, (k, _l) in enumerate(vast_drill.CANONICAL_CONTROLS)}
+    controls = _controls(engine_name)
+    common = [(k, l) for k, l in controls if k in canonical]
+    # Canonical labels, exactly.
+    for key, label in common:
+        assert label == canonical[key], (
+            f"{engine_name} labels [{key}] as {label!r}, contract says {canonical[key]!r}")
+    # Canonical relative order.
+    keys = [k for k, _l in common]
+    assert keys == sorted(keys, key=order.get), (
+        f"{engine_name} common controls out of canonical order: {keys}")
+    # Protocol-specific controls strictly after the common set.
+    tail = [(k, l) for k, l in controls if k not in canonical]
+    assert list(controls) == common + tail, (
+        f"{engine_name} interleaves protocol-specific controls with common ones")
+
+
+@pytest.mark.parametrize("engine_name", ENGINE_MODULES)
+def test_vip_is_never_v_and_exit_is_never_p(engine_name):
+    for key, label in _controls(engine_name):
+        if key == "v":
+            assert label == "View", f"{engine_name} binds [v] to {label!r}; v means View"
+        assert key != "p", f"{engine_name} still advertises the retired [p] binding"
+        if label == "VIP":
+            assert key == "i", f"{engine_name} binds VIP to [{key}]; VIP is [i]"
+        if label == "Exit drill":
+            assert key == "x", f"{engine_name} binds exit-drill to [{key}]; exit is [x]"
+
+
+def test_every_engine_shares_one_quit_exit_refresh_triple():
+    """The three controls every engine has must be identical everywhere."""
+    for engine_name in ENGINE_MODULES:
+        controls = dict(_controls(engine_name))
+        assert controls.get("q") == "Quit", engine_name
+        assert controls.get("x") == "Exit drill", engine_name
+        assert controls.get("space") == "Refresh", engine_name
+
+
+@pytest.mark.parametrize("engine_name,token", [
+    ("nfs_v3", "[space] Refresh"),
+    ("nfs_v41", "[space] Refresh"),
+    ("smb", "[space] Refresh"),
+    ("s3", "[space] Refresh"),
+])
+def test_shared_legend_renders_in_engine_footers(engine_name, token):
+    """The rendered footer text comes from the shared legend renderer."""
+    import importlib
+
+    import vast_drill
+
+    module = importlib.import_module(engine_name)
+    tui_layout.set_color(False)
+    legend = tui_layout.strip_ansi(vast_drill.nav_legend(module._NAV_CONTROLS))
+    assert token in legend
+    assert "|" in legend

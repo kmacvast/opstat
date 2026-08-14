@@ -2217,6 +2217,15 @@ def render_screen():
     vast_common.flush_frame(buf.getvalue())
 
 
+# Canonical common controls (FR-A contract in vast_drill); SMB adds nothing
+# protocol-specific.
+_NAV_CONTROLS = vast_drill.nav_controls(("q", "c", "v", "t", "x", "space"))
+
+
+def _nav_legend():
+    return vast_drill.nav_legend(_NAV_CONTROLS)
+
+
 def _render_frame():
     width = min(shutil.get_terminal_size((120, 40)).columns, 120)
     title = (
@@ -2255,15 +2264,7 @@ def _render_frame():
         print()
         _render_opcode_workflow_panel(LAST_ROWS, width)
         print()
-    print(box_row(
-        c("[q]", _BWHITE) + c(" Quit ", _DIM)
-        + c("|", _DIM) + c("[c]", _BWHITE) + c(" cNode ", _DIM)
-        + c("|", _DIM) + c("[v]", _BWHITE) + c(" View ", _DIM)
-        + c("|", _DIM) + c("[t]", _BWHITE) + c(" Tenant ", _DIM)
-        + c("|", _DIM) + c("[x]", _BWHITE) + c(" Exit drill ", _DIM)
-        + c("|", _DIM) + c("[space]", _BWHITE) + c(" Refresh", _DIM),
-        width,
-    ), flush=True)
+    print(box_row(_nav_legend(), width), flush=True)
 
 
 setup_keyboard = vast_common.setup_keyboard

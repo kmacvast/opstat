@@ -1706,20 +1706,17 @@ def _render_path_table(width):
     print(box_bottom(width))
 
 
+# Canonical common controls first (FR-A contract in vast_drill), then the
+# NVMe-specific controls: [h] blockhost drill, [r] session-stats reset.
+_NAV_CONTROLS = vast_drill.nav_controls(
+    ("q", "c", "i", "x", "space"),
+    extra=(("h", "Host"), ("r", "Reset stats")),
+)
+
+
 def _render_help_bar(width):
-    # Common controls first (shared canonical order q / c / i / x / space),
-    # then NVMe-specific controls (Host drill, Reset stats).
-    legend = (
-        c("[q]", _BWHITE) + c(" Quit ", _DIM)
-        + c("|", _DIM) + c("[c]", _BWHITE) + c(" cNode ", _DIM)
-        + c("|", _DIM) + c("[i]", _BWHITE) + c(" VIP ", _DIM)
-        + c("|", _DIM) + c("[x]", _BWHITE) + c(" Exit drill ", _DIM)
-        + c("|", _DIM) + c("[space]", _BWHITE) + c(" Refresh ", _DIM)
-        + c("|", _DIM) + c("[h]", _BWHITE) + c(" Host ", _DIM)
-        + c("|", _DIM) + c("[r]", _BWHITE) + c(" Reset stats", _DIM)
-    )
     print(c(_H * width, _DIM))
-    print(c("  ", _DIM) + legend, flush=True)
+    print(c("  ", _DIM) + vast_drill.nav_legend(_NAV_CONTROLS), flush=True)
 
 
 def poll_tick():
@@ -1833,10 +1830,11 @@ def discover_metrics():
         print(f"  - {item}")
 
     print("\n[ Path Drill-Down ]")
-    print("  v key -> toggle VIP path view")
+    print("  i key -> toggle VIP path view")
     print("  c key -> toggle cNode path view")
     print("  h key -> toggle block host initiator view")
-    print("  p key -> return to main operations table")
+    print("  x key -> exit drill, return to main operations table")
+    print("  space -> forced (un-throttled) refresh")
     print("\n[ Volume Scoping ]")
     print("  --volume NAME / --volumes a,b  -> object_type=volume VolumeMetrics monitors")
     print("  Volume scope uses VolumeMetrics,*_latency__rate for IOPS (not BlockMetrics read_req)")

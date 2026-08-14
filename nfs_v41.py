@@ -1821,18 +1821,11 @@ def render_screen():
     vast_common.flush_frame(buf.getvalue())
 
 
-_NAV_CONTROLS = (
-    ("q", "Quit"),
-    ("o", "Ops"),
-    ("l", "Lat"),
-    ("n", "Name"),
-    ("c", "cNode"),
-    ("v", "View"),
-    ("t", "Tenant"),
-    ("4", "Native v4"),
-    ("h", "v4 hosts"),
-    ("x", "Exit drill"),
-    ("space", "Refresh"),
+# Canonical common controls first (FR-A contract in vast_drill), then the
+# NFSv4.1-specific exporter drills.
+_NAV_CONTROLS = vast_drill.nav_controls(
+    ("q", "o", "l", "n", "c", "v", "t", "x", "space"),
+    extra=(("4", "Native v4"), ("h", "v4 hosts")),
 )
 
 # Never let a narrow terminal collapse the frame to the point where the
@@ -1855,12 +1848,7 @@ def _frame_width():
 
 def _render_nav_footer(width):
     """Application navigation bar, shown in every mode including drill-downs."""
-    parts = []
-    for key, label in _NAV_CONTROLS:
-        if parts:
-            parts.append(c("|", _DIM))
-        parts.append(c(f"[{key}]", _BWHITE) + c(f" {label} ", _DIM))
-    print(box_row("".join(parts), width), flush=True)
+    print(box_row(vast_drill.nav_legend(_NAV_CONTROLS), width), flush=True)
 
 
 def _render_frame():

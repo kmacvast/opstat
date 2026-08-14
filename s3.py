@@ -2143,6 +2143,21 @@ def render_screen():
     vast_common.flush_frame(buf.getvalue())
 
 
+# Canonical common controls first (FR-A contract in vast_drill). [b] Bucket is
+# S3's protocol-specific drill key and is appended after the common set per the
+# contract - it is deliberately NOT presented in the [v] View slot even though
+# the bucket drill is backed by the same ViewMetrics family, because the key a
+# user presses is [b] and the label must match the key.
+_NAV_CONTROLS = vast_drill.nav_controls(
+    ("q", "c", "t", "i", "x", "space"),
+    extra=(("b", "Bucket"),),
+)
+
+
+def _nav_legend():
+    return vast_drill.nav_legend(_NAV_CONTROLS)
+
+
 def _render_frame():
     width = min(shutil.get_terminal_size((120, 40)).columns, 120)
     title = (
@@ -2182,16 +2197,7 @@ def _render_frame():
         print()
         _render_rest_panel(LAST_ROWS, width)
         print()
-    print(box_row(
-        c("[q]", _BWHITE) + c(" Quit ", _DIM)
-        + c("|", _DIM) + c("[c]", _BWHITE) + c(" cNode ", _DIM)
-        + c("|", _DIM) + c("[b]", _BWHITE) + c(" Bucket ", _DIM)
-        + c("|", _DIM) + c("[t]", _BWHITE) + c(" Tenant ", _DIM)
-        + c("|", _DIM) + c("[i]", _BWHITE) + c(" VIP ", _DIM)
-        + c("|", _DIM) + c("[x]", _BWHITE) + c(" Exit drill ", _DIM)
-        + c("|", _DIM) + c("[space]", _BWHITE) + c(" Refresh", _DIM),
-        width,
-    ), flush=True)
+    print(box_row(_nav_legend(), width), flush=True)
 
 
 setup_keyboard = vast_common.setup_keyboard

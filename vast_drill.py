@@ -21,6 +21,7 @@ import time
 import urllib.parse
 from datetime import datetime
 
+import tui_layout
 import vast_common
 from tui_layout import as_float, raw_bw_to_gb_sec
 
@@ -580,6 +581,69 @@ class DrillSession:
     def batch_active(self, monitors):
         """True when *monitors* is the single-batch layout."""
         return len(monitors) == 1 and monitors[0][1] is None
+
+
+# ---------------------------------------------------------------------------
+# Canonical navigation contract (FR-A)
+# ---------------------------------------------------------------------------
+# Same conceptual action -> same key, same label, same relative order in every
+# engine's footer. Protocol-specific controls are appended AFTER the common
+# set. Two bindings are load-bearing prohibitions: VIP is [i] (never [v], which
+# means the View drill), and exit-drill is [x] (never [p], an old NVMe binding
+# that survived into help text after the key itself changed).
+#
+# An engine advertises only the subset it actually supports - the contract
+# standardizes what exists, it does not invent controls.
+CANONICAL_CONTROLS = (
+    ("q", "Quit"),
+    ("o", "Ops"),
+    ("l", "Lat"),
+    ("n", "Name"),
+    ("c", "cNode"),
+    ("v", "View"),
+    ("t", "Tenant"),
+    ("i", "VIP"),
+    ("x", "Exit drill"),
+    ("space", "Refresh"),
+)
+
+_CANONICAL_ORDER = {key: idx for idx, (key, _label) in enumerate(CANONICAL_CONTROLS)}
+_CANONICAL_LABELS = dict(CANONICAL_CONTROLS)
+
+
+def nav_controls(common, extra=()):
+    """Build an engine's footer control list from the canonical contract.
+
+    ``common`` names the canonical keys the engine supports; they come back in
+    canonical order with canonical labels regardless of the order given.
+    ``extra`` is the engine's protocol-specific ``(key, label)`` tuples,
+    appended after the common set. A non-canonical key in ``common`` is a
+    programming error and raises immediately rather than rendering a footer
+    that silently diverges from the contract.
+    """
+    unknown = [key for key in common if key not in _CANONICAL_ORDER]
+    if unknown:
+        raise ValueError("non-canonical nav keys: %s" % ", ".join(unknown))
+    ordered = sorted(set(common), key=_CANONICAL_ORDER.get)
+    return tuple((key, _CANONICAL_LABELS[key]) for key in ordered) + tuple(extra)
+
+
+def nav_legend(controls):
+    """Render ``[key] Label | [key] Label ...`` footer text from control tuples.
+
+    One shared renderer so the look (brackets, pipes, spacing, dim/bright
+    split) cannot drift between engines. Engines wrap the returned string in
+    their own frame furniture (``box_row`` or a plain line).
+    """
+    parts = []
+    for key, label in controls:
+        if parts:
+            parts.append(tui_layout.c("|", tui_layout._DIM))
+        parts.append(
+            tui_layout.c("[%s]" % key, tui_layout._BWHITE)
+            + tui_layout.c(" %s " % label, tui_layout._DIM)
+        )
+    return "".join(parts).rstrip()
 
 
 # ---------------------------------------------------------------------------

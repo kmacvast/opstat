@@ -187,15 +187,18 @@ latency > 2,000 µs or write latency > 5,000 µs; otherwise **HEALTHY**.
 
 ## Interactive Views & Keybinds
 
-> **Important:** On block storage, **`v` means VIP**, not NFS View. NFS view drill-down
-> exists only in NFS v3/v4.1 modules.
+Keys follow the cross-protocol contract (same concept, same key, in every
+engine): VIP is **`i`** everywhere, exit-drill is **`x`** everywhere, and
+`space` forces a refresh. (`v` and `p` were the historical NVMe bindings and
+are no longer bound.)
 
 | Key | Action |
 |-----|--------|
-| **`h`** | **Toggle ranked Host Initiator list** - block hosts from `/blockhosts/` (`object_type=blockhost`). Shows host name, NQN subtitle, IOPS, throughput, weighted latency. |
-| **`v`** | **Toggle Virtual IP (VIP) performance list** - per-VIP stats from `/vips/` (`object_type=vip`). Surfaces front-end multipath imbalance. |
 | **`c`** | **Toggle per-cNode transport path list** - per-cNode stats from `/cnodes/` (`object_type=cnode`). |
-| `p` | Return to main operations table (exit drill-down) |
+| **`i`** | **Toggle Virtual IP (VIP) performance list** - per-VIP stats from `/vips/` (`object_type=vip`). Surfaces front-end multipath imbalance. |
+| `x` | Exit drill-down, return to main operations table |
+| `space` | Forced (un-throttled) refresh of dashboard and drill |
+| **`h`** | **Toggle ranked Host Initiator list** - block hosts from `/blockhosts/` (`object_type=blockhost`). Shows host name, NQN subtitle, IOPS, throughput, weighted latency. |
 | `r` | Reset session stats and delta baselines |
 | `q` | Quit - tears down all VMS monitors |
 
