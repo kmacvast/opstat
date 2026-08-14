@@ -2518,6 +2518,24 @@ def initialize():
     ])
 
 
+def _dispatch_key(key):
+    """Handle one navigation key (see vast_drill.dispatch_queued_keys).
+
+    Returns "rendered" when the action painted already, "refresh" when a
+    repaint is owed after the queued batch drains, None for an unbound key.
+    """
+    if key == " ":
+        vast_common.guarded_poll(manual_refresh, render_screen)
+        return "rendered"
+    if key in ("c", "v", "t"):
+        switch_drill_mode({"c": "cnode", "v": "view", "t": "tenant"}[key])
+        return "refresh"
+    if key == "x":
+        exit_drill_mode()
+        return "refresh"
+    return None
+
+
 def main():
     """Entry point after init_config."""
     global HEADLINE_MONITOR_ID, CLUSTER_ID, CLUSTER_NAME
@@ -2538,19 +2556,9 @@ def main():
         if chars:
             if "\x03" in chars or "q" in chars.lower():
                 break
-            if "c" in chars.lower():
-                switch_drill_mode("cnode")
-            elif "v" in chars.lower():
-                switch_drill_mode("view")
-            elif "t" in chars.lower():
-                switch_drill_mode("tenant")
-            elif "x" in chars.lower():
-                exit_drill_mode()
-            elif " " in chars:
-                vast_common.guarded_poll(manual_refresh, render_screen)
+            # Every queued key, in arrival order - see vast_drill.
+            if vast_drill.dispatch_queued_keys(chars, _dispatch_key, render_screen):
                 next_refresh = time.time() + REFRESH_SECONDS
-                continue
-            render_screen()
             continue
 
         now = time.time()

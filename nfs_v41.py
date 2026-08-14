@@ -2792,6 +2792,32 @@ def create_headline_monitors():
     _init_state_monitor(candidates=state_candidates, pnfs=pnfs_candidates)
 
 
+def _dispatch_key(key):
+    """Handle one navigation key (see vast_drill.dispatch_queued_keys).
+
+    Returns "rendered" when the action painted already, "refresh" when a
+    repaint is owed after the queued batch drains, None for an unbound key.
+    """
+    global SORT_MODE
+    if key == " ":
+        vast_common.guarded_poll(manual_refresh, render_screen)
+        return "rendered"
+    if key in ("o", "l", "n"):
+        SORT_MODE = {"o": "ops", "l": "latency", "n": "default"}[key]
+        return "refresh"
+    if key in ("c", "t"):
+        switch_drill_mode({"c": "cnode", "t": "tenant"}[key])
+        return "refresh"
+    if key in ("v", "4", "h"):
+        enter_exporter_mode({"v": "view", "4": "native", "h": "hosts"}[key])
+        return "refresh"
+    if key == "x":
+        exit_drill_mode()
+        exit_exporter_mode()
+        return "refresh"
+    return None
+
+
 def main():
     global DATA_MONITOR_ID, META_MONITOR_ID, SUPPLEMENT_MONITOR_ID, BW_MONITOR_ID
     global CLUSTER_ID, CLUSTER_NAME, SORT_MODE
@@ -2813,30 +2839,9 @@ def main():
         if chars:
             if "\x03" in chars or "q" in chars.lower():
                 break
-            if "o" in chars.lower():
-                SORT_MODE = "ops"
-            elif "l" in chars.lower():
-                SORT_MODE = "latency"
-            elif "n" in chars.lower():
-                SORT_MODE = "default"
-            elif "c" in chars.lower():
-                switch_drill_mode("cnode")
-            elif "v" in chars.lower():
-                enter_exporter_mode("view")
-            elif "t" in chars.lower():
-                switch_drill_mode("tenant")
-            elif "4" in chars:
-                enter_exporter_mode("native")
-            elif "h" in chars.lower():
-                enter_exporter_mode("hosts")
-            elif "x" in chars.lower():
-                exit_drill_mode()
-                exit_exporter_mode()
-            elif " " in chars:
-                vast_common.guarded_poll(manual_refresh, render_screen)
+            # Every queued key, in arrival order - see vast_drill.
+            if vast_drill.dispatch_queued_keys(chars, _dispatch_key, render_screen):
                 next_refresh = time.time() + REFRESH_SECONDS
-                continue
-            render_screen()
             continue
 
         now = time.time()

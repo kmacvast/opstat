@@ -284,3 +284,81 @@ def test_cnode_batch_engages_when_the_response_really_splits(nvme):
     assert engine.DRILL_ERROR is None
     assert engine._drill_batch_active(), (
         "cnode batch must engage when the response splits per object_id")
+
+
+# ---------------------------------------------------------------------------
+# Key dispatch: every queued key is honored in arrival order.
+#
+# Observed on var203: poll cycles blocked 30-80 s, several keys queued in one
+# read, and the old single-action-per-read handling let a buffered space
+# swallow "x" and "i" - the drill could not be exited until quit, VIP was
+# never entered, and the drill monitors survived until shutdown.
+# ---------------------------------------------------------------------------
+def test_queued_keys_are_all_dispatched_in_order(nvme):
+    engine, vms = nvme
+    engine.enter_drill_mode("cnode")
+    assert engine.DRILL_MODE == "cnode"
+    # The exact buffered sequence from the real run: space, then x, then i,
+    # read as one chars batch. Every action must fire, in order.
+    for key in " xi":
+        engine._dispatch_key(key)
+    assert engine.DRILL_MODE == "vip", (
+        "buffered x/i were dropped; drill stuck in %r" % engine.DRILL_MODE)
+
+
+def test_x_after_long_poll_actually_exits_and_cleans_up(nvme):
+    engine, vms = nvme
+    engine.enter_drill_mode("cnode")
+    drill_ids = set()
+    for ids, proto, _name in engine.DRILL_MONITORS:
+        drill_ids.update(int(i) for i in ids)
+        if proto is not None:
+            drill_ids.add(int(proto))
+    engine._dispatch_key("x")
+    assert engine.DRILL_MODE is None
+    live = set(vms.live_monitors())
+    leaked = drill_ids & live
+    assert not leaked, f"x left drill monitors behind: {sorted(leaked)}"
+
+
+def test_same_mode_key_toggles_out(nvme):
+    engine, _vms = nvme
+    engine._dispatch_key("c")
+    assert engine.DRILL_MODE == "cnode"
+    engine._dispatch_key("c")
+    assert engine.DRILL_MODE is None
+
+
+def test_unbound_key_costs_nothing(nvme):
+    engine, vms = nvme
+    vms.reset_calls()
+    assert engine._dispatch_key("z") is None
+    assert vms.calls() == []
+
+
+# ---------------------------------------------------------------------------
+# Drill entry paints a loading frame before the blocking work (the entry
+# against var203 blocked ~2 minutes with a frozen frame - NVMe was the one
+# engine without the interstitial).
+# ---------------------------------------------------------------------------
+def test_drill_entry_paints_loading_frame_before_work(nvme, monkeypatch):
+    engine, _vms = nvme
+    events = []
+    real_render = engine.render_screen
+    real_enter = engine.enter_drill_mode
+
+    monkeypatch.setattr(engine, "render_screen",
+                        lambda: events.append(("render", engine.DRILL_STATUS)))
+    monkeypatch.setattr(engine, "enter_drill_mode",
+                        lambda mode: events.append(("work", mode)) or real_enter(mode))
+    engine._dispatch_key("c")
+    monkeypatch.setattr(engine, "render_screen", real_render)
+
+    assert ("work", "cnode") in events
+    first_render = next(e for e in events if e[0] == "render")
+    work_idx = events.index(("work", "cnode"))
+    assert events.index(first_render) < work_idx, (
+        "no frame rendered before the blocking drill entry")
+    assert first_render[1], "loading status was empty in the pre-work frame"
+    assert "stand by" in first_render[1]
+    assert engine.DRILL_STATUS is None, "loading status not cleared"

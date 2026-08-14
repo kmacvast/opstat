@@ -176,6 +176,7 @@ DRILL = None                # vast_drill.DrillSession (ranking + rank cache)
 # would rank NVMe candidates by, say, their NFS load.
 _RANK_PROPS = ["BlockMetrics,read_req", "BlockMetrics,write_req"]
 STARTUP_STATUS = None       # transient per-phase message during blocking startup
+DRILL_STATUS = None         # transient "Loading..." message during drill entry
 # Drill re-poll throttle: object-scoped block families publish ~1/min, so a 5 s
 # tick re-fetched identical payloads. Space bar forces a refresh.
 _DRILL_MIN_QUERY_INTERVAL = 15.0
@@ -1422,6 +1423,58 @@ def enter_drill_mode(mode):
     LAST_DRILL_ROWS = []
 
 
+def _set_drill_status(text):
+    global DRILL_STATUS
+    DRILL_STATUS = text
+
+
+def _dispatch_key(key):
+    """Handle one navigation key. Returns what the main loop owes the screen.
+
+    ``"rendered"`` - the action already painted (and re-armed the refresh
+    timer); ``"refresh"`` - a re-render is needed once the batch of queued
+    keys is drained; ``None`` - the key is unbound and costs nothing.
+    Exactly one action per key, so keys queued during a long blocking poll
+    are all honored in arrival order instead of all-but-one being dropped.
+    """
+    if key == " ":
+        # Forced (un-throttled) refresh, standardized across engines.
+        vast_common.guarded_poll(manual_refresh, render_screen)
+        return "rendered"
+    if key == "r":
+        reset_session_stats()
+        return "refresh"
+    if key == "x":
+        exit_drill_mode()
+        return "refresh"
+    if key in ("i", "c", "h"):
+        mode = {"i": "vip", "c": "cnode", "h": "host"}[key]
+        if DRILL_MODE == mode:
+            exit_drill_mode()
+        else:
+            exit_drill_mode()
+            _enter_drill_with_status(mode)
+        return "refresh"
+    return None
+
+
+def _enter_drill_with_status(mode):
+    """Drill entry behind a painted loading frame.
+
+    Entry against var203 blocked for ~2 minutes (ranking + batch creation at
+    2.5-38 s per call) with the previous frame frozen on screen - the exact
+    hang-looking defect the shared helper exists to prevent. Ordering is
+    status -> render -> work -> clear-in-finally, then the caller renders the
+    finished panel.
+    """
+    def work():
+        enter_drill_mode(mode)
+        if DRILL_MODE:
+            fetch_drill_query(force=True)
+
+    vast_drill.with_loading_status(_set_drill_status, render_screen, mode, work)
+
+
 def exit_drill_mode():
     global DRILL_MODE, DRILL_OBJECTS, LAST_DRILL_ROWS, DRILL_ERROR
     _cleanup_drill_monitors()
@@ -1915,9 +1968,11 @@ def _render_frame():
 
     # Startup / waiting frame: keep the help bar (footer) - never a bare early
     # return that drops the navigation controls.
-    if STARTUP_STATUS or not rows:
+    if STARTUP_STATUS or DRILL_STATUS or not rows:
         if STARTUP_STATUS:
             print(c("  " + STARTUP_STATUS, _BYELLOW))
+        elif DRILL_STATUS:
+            print(c("  " + DRILL_STATUS, _BYELLOW))
         else:
             print(c(f"  Waiting for data…  VMS={VMS}:{PORT}"
                     f"  cluster={CLUSTER_NAME or '-'}", _DIM))
@@ -2028,47 +2083,13 @@ def main():
         now = time.time()
         chars = check_keypress()
         if chars:
-            ch = chars.lower()
-            if "\x03" in chars or "q" in ch:
+            if "\x03" in chars or "q" in chars.lower():
                 break
-            refresh_needed = True
-            if " " in chars:
-                # Space: forced (un-throttled) refresh, standardized across engines.
-                vast_common.guarded_poll(manual_refresh, render_screen)
+            # Every queued key, in arrival order - see vast_drill. A real
+            # var203 run showed a buffered space swallowing the queued "x"
+            # and "i" under the old single-action-per-read handling.
+            if vast_drill.dispatch_queued_keys(chars, _dispatch_key, render_screen):
                 next_refresh_time = time.time() + REFRESH_SECONDS
-                continue
-            elif "r" in ch:
-                reset_session_stats()
-            elif "x" in ch:
-                exit_drill_mode()
-            elif "i" in ch:
-                if DRILL_MODE == "vip":
-                    exit_drill_mode()
-                else:
-                    exit_drill_mode()
-                    enter_drill_mode("vip")
-                    if DRILL_MODE:
-                        fetch_drill_query(force=True)
-            elif "c" in ch:
-                if DRILL_MODE == "cnode":
-                    exit_drill_mode()
-                else:
-                    exit_drill_mode()
-                    enter_drill_mode("cnode")
-                    if DRILL_MODE:
-                        fetch_drill_query(force=True)
-            elif "h" in ch:
-                if DRILL_MODE == "host":
-                    exit_drill_mode()
-                else:
-                    exit_drill_mode()
-                    enter_drill_mode("host")
-                    if DRILL_MODE:
-                        fetch_drill_query(force=True)
-            else:
-                refresh_needed = False
-            if refresh_needed:
-                render_screen()
             continue
         if now >= next_refresh_time:
             vast_common.guarded_poll(poll_tick, render_screen)

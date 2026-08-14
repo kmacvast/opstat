@@ -691,6 +691,40 @@ def nav_legend_lines(controls, width):
     return lines or [""]
 
 
+def dispatch_queued_keys(chars, dispatch, render):
+    """Dispatch every queued key in arrival order - one action per key.
+
+    ``check_keypress`` returns the whole pending buffer, and keys are only
+    read between poll cycles; on a slow cluster one cycle blocks 30-80 s, so
+    several keystrokes routinely arrive in one read. Every engine used to
+    fire ONE action per read and silently discard the rest - a real lab run
+    showed a buffered space swallowing the queued ``x`` and ``i``, leaving
+    the user unable to leave a drill until quit.
+
+    ``dispatch(key)`` performs one key's action and returns ``"rendered"``
+    (the action already painted - e.g. a forced refresh), ``"refresh"`` (a
+    repaint is owed once the batch drains), or ``None`` (unbound key). The
+    single deferred repaint means a burst of queued keys costs one frame,
+    not one per key.
+
+    Returns True when any action already rendered, so the caller re-arms its
+    refresh timer. Quit handling stays in the caller: scanning for ``q``
+    before dispatch preserves quit-from-anywhere-in-the-buffer semantics.
+    """
+    rendered = False
+    refresh_needed = False
+    for key in chars.lower():
+        outcome = dispatch(key)
+        if outcome == "rendered":
+            rendered = True
+            refresh_needed = False
+        elif outcome == "refresh":
+            refresh_needed = True
+    if refresh_needed:
+        render()
+    return rendered
+
+
 # ---------------------------------------------------------------------------
 # Drill-entry loading status
 # ---------------------------------------------------------------------------

@@ -2061,6 +2061,28 @@ def initialize():
     ])
 
 
+def _dispatch_key(key):
+    """Handle one navigation key (see vast_drill.dispatch_queued_keys).
+
+    Returns "rendered" when the action painted already, "refresh" when a
+    repaint is owed after the queued batch drains, None for an unbound key.
+    """
+    global SORT_MODE
+    if key == " ":
+        vast_common.guarded_poll(manual_refresh, render_screen)
+        return "rendered"
+    if key in ("r", "o", "l", "w"):
+        SORT_MODE = {"r": "rpc", "o": "ops", "l": "latency", "w": "workload"}[key]
+        return "refresh"
+    if key in ("c", "v", "t"):
+        switch_drill_mode({"c": "cnode", "v": "view", "t": "tenant"}[key])
+        return "refresh"
+    if key == "x":
+        exit_drill_mode()
+        return "refresh"
+    return None
+
+
 def main():
     global RPC_MONITOR_ID, BW_MONITOR_ID, CLUSTER_ID, CLUSTER_NAME, SORT_MODE, DRILL_ERROR
 
@@ -2084,38 +2106,11 @@ def main():
         chars = check_keypress()
 
         if chars:
-            ch = chars.lower()
-
-            if "\x03" in chars or "q" in ch:
+            if "\x03" in chars or "q" in chars.lower():
                 break
-
-            refresh_needed = True
-
-            if "r" in ch:
-                SORT_MODE = "rpc"
-            elif "o" in ch:
-                SORT_MODE = "ops"
-            elif "l" in ch:
-                SORT_MODE = "latency"
-            elif "w" in ch:
-                SORT_MODE = "workload"
-            elif "c" in ch:
-                switch_drill_mode("cnode")
-            elif "v" in ch:
-                switch_drill_mode("view")
-            elif "t" in ch:
-                switch_drill_mode("tenant")
-            elif "x" in ch:
-                exit_drill_mode()
-            elif " " in chars:
-                vast_common.guarded_poll(manual_refresh, render_screen)
+            # Every queued key, in arrival order - see vast_drill.
+            if vast_drill.dispatch_queued_keys(chars, _dispatch_key, render_screen):
                 next_refresh_time = time.time() + REFRESH_SECONDS
-                refresh_needed = False  # guarded_poll already rendered
-            else:
-                refresh_needed = False
-
-            if refresh_needed:
-                render_screen()
             continue
 
         if now >= next_refresh_time:
