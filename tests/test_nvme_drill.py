@@ -12,11 +12,14 @@ same semantics the headline extraction uses (rate_from_timeseries). topn is
 deliberately not used: it has no protocol label (docs/decisions/D-007), so it
 would rank NVMe candidates by all-protocol traffic.
 
-Whether a real VMS accepts multi-object_id BlockMetrics/ProtoMetrics monitors
-at cnode/vip/blockhost scope is NOT proven by these tests - the mock models
-the documented batch shape (object_id column). The engine validates
-splittability at entry and falls back to the per-object layout, and the
-work-laptop validation package carries the real-cluster probe.
+A var203 probe (VAST OS 5.5.0.1) has since established what a real VMS does,
+and it is scope-dependent: at ``object_type=cnode`` a multi-object_id
+BlockMetrics monitor is created, queried and splits correctly (120 rows per
+object for ids [4, 3]), while at ``=vip`` and ``=blockhost`` the very same
+shape is created and queried successfully but yields **no per-object rows**.
+Creation succeeding is therefore not evidence a batch layout is usable, which
+is why the engine validates the response before committing to one. See
+docs/decisions/D-013.
 """
 
 from __future__ import annotations
@@ -205,3 +208,79 @@ def test_drill_cleanup_leaves_no_monitors(nvme, constrained):
     engine.cleanup()
     engine._CLEANED_UP = False
     assert vms.live_monitors() == {}, "monitors leaked after drill cleanup"
+
+
+# ---------------------------------------------------------------------------
+# Real var203 shape: the batch is ACCEPTED and QUERIED but is not splittable.
+#
+# This is the case the earlier fallback test did not cover. There, creation was
+# refused outright (max_object_ids=1). On var203 the vip and blockhost batches
+# were created successfully AND queried successfully - they simply carried no
+# usable per-object rows, while cnode with the identical shape split fine.
+# An engine that treated a successful create as proof of a working batch would
+# have rendered an empty or fabricated panel on two of three NVMe drill modes.
+#
+# The exact var203 response shape is not yet distinguished (the probe recorded
+# rows-per-object = 0 without separating "no object_id column" from "column
+# present, no matching rows"), so both are modelled and both must fall back.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("shape", ["no_object_id", "no_matching_rows"])
+@pytest.mark.parametrize("mode,object_type", [("vip", "vip"), ("cnode", "cnode")])
+def test_unsplittable_batch_falls_back_and_still_shows_real_rows(
+        nvme, shape, mode, object_type):
+    engine, vms = nvme
+    vms.state.batch_unsplittable = {object_type: shape}
+    try:
+        engine.enter_drill_mode(mode)
+        assert engine.DRILL_ERROR is None, engine.DRILL_ERROR
+        assert not engine._drill_batch_active(), (
+            "committed to a batch whose response carries no per-object rows")
+        # Fallback tuples carry the object name; the batch tuple carries None.
+        assert engine.DRILL_MONITORS
+        assert all(name is not None for _ids, _proto, name in engine.DRILL_MONITORS)
+
+        # Two ticks: BlockMetrics req counters are cumulative, so the first
+        # poll only baselines the per-scope counter state.
+        engine.fetch_drill_query(force=True)
+        engine.fetch_drill_query(force=True)
+        rows = engine.LAST_DRILL_ROWS
+        assert rows, "fallback produced no drill rows"
+        # Rows must be real per-object measurements, not one aggregate smeared
+        # across every object or a row per object with identical values.
+        assert len({r["name"] for r in rows}) == len(rows), "duplicate object rows"
+        assert any(r["total_iops"] for r in rows), "no object reported any activity"
+    finally:
+        vms.state.batch_unsplittable = {}
+
+
+@pytest.mark.parametrize("shape", ["no_object_id", "no_matching_rows"])
+def test_rejected_batch_monitors_are_torn_down(nvme, shape):
+    """The probe attempt must not leak the monitors it created."""
+    engine, vms = nvme
+    vms.state.batch_unsplittable = {"vip": shape}
+    try:
+        engine.enter_drill_mode("vip")
+        live = set(vms.live_monitors())
+        held = set()
+        for ids, proto, _name in engine.DRILL_MONITORS:
+            held.update(int(i) for i in ids)
+            if proto is not None:
+                held.add(int(proto))
+        orphaned = live - held - set(engine.OPS_MONITOR_IDS) - {engine.PROTO_MONITOR_ID}
+        orphaned.discard(None)
+        assert not orphaned, f"rejected batch left monitors behind: {sorted(orphaned)}"
+        engine.exit_drill_mode()
+    finally:
+        vms.state.batch_unsplittable = {}
+    engine.cleanup()
+    engine._CLEANED_UP = False
+    assert vms.live_monitors() == {}, "monitors leaked after unsplittable-batch entry"
+
+
+def test_cnode_batch_engages_when_the_response_really_splits(nvme):
+    """The var203 cnode result: object_id column with rows per object."""
+    engine, _vms = nvme
+    engine.enter_drill_mode("cnode")
+    assert engine.DRILL_ERROR is None
+    assert engine._drill_batch_active(), (
+        "cnode batch must engage when the response splits per object_id")

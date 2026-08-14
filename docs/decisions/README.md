@@ -40,3 +40,4 @@ record says so.
 | [D-010](D-010-merged-monitors-are-probe-validated-with-fallback.md) | Merged headline monitors are probe-validated with a fallback | API efficiency |
 | [D-011](D-011-newest-complete-sample-scoped-per-family.md) | Select the newest *complete* sample, scoped per metric family | Telemetry correctness |
 | [D-012](D-012-terminology-v4-hosts.md) | The NFSv4 client-attribution drill is called "v4 hosts" | Terminology |
+| [D-013](D-013-nvme-drill-batching-is-scope-dependent.md) | NVMe drill batching is scope-dependent and must be response-validated | API efficiency |

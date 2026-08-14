@@ -360,6 +360,17 @@ class _State:
         # that does not support a monitor scope at all (e.g. object_type=vip),
         # so an engine's scope-specific fallback path is exercised.
         self.reject_object_types = ()
+        # Observed on var203 (VAST OS 5.5.0.1): a multi-object_id monitor at
+        # object_type=vip / =blockhost is CREATED and QUERIED successfully but
+        # its response carries no usable per-object rows, while the same shape
+        # at object_type=cnode splits correctly. Creation succeeding is
+        # therefore not evidence that a batch layout is usable, and an engine
+        # must validate the response before committing to one.
+        # Maps object_type -> "no_object_id" (response omits the column) or
+        # "no_matching_rows" (column present, no rows for the requested ids).
+        # The exact var203 shape is not yet distinguished, so both are
+        # modelled and both must force the per-object fallback.
+        self.batch_unsplittable = {}
         # Reproduce observed VMS 5.5.0.1 behavior: the newest bucket of an
         # object-scoped monitor is still filling, so every property except
         # the ones listed here comes back null in that row. Set to None to
@@ -631,7 +642,18 @@ class _Handler(BaseHTTPRequestHandler):
         ] if self.state.unsupported_prop_prefixes else mon["prop_list"]
         object_ids = mon["object_ids"] or [None]
         batch = len(object_ids) > 1
-        prop_list = ["timestamp"] + (["object_id"] if batch else []) + props
+        # A batch this "cluster build" accepts but cannot actually split. The
+        # request succeeds; the response is simply unusable per object.
+        unsplittable = (
+            self.state.batch_unsplittable.get(mon.get("object_type"))
+            if batch else None
+        )
+        if unsplittable == "no_matching_rows":
+            # object_id column present, but every row belongs to an id the
+            # caller did not ask for, so each requested id slices to zero rows.
+            object_ids = [-1]
+        batch_column = batch and unsplittable != "no_object_id"
+        prop_list = ["timestamp"] + (["object_id"] if batch_column else []) + props
 
         now = time.time() - self.state.t0
         partial = self.state.partial_newest_props
@@ -645,7 +667,7 @@ class _Handler(BaseHTTPRequestHandler):
             for oid in object_ids:
                 seed = 0 if oid is None else (int(oid) if str(oid).isdigit() else 0)
                 row = [stamp]
-                if batch:
+                if batch_column:
                     row.append(oid)
                 for p in props:
                     # The newest bucket is still filling on a real VMS: only
