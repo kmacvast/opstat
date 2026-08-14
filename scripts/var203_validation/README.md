@@ -1,8 +1,31 @@
 # var203 validation package — continuation pass
 
-One work-laptop trip that answers every remaining live-cluster dependency of
-the uncommitted continuation pass (FR-A/B/C, NVMe ranking + batching, startup/
-shutdown UX). Target **var203.selab.vastdata.com only**; var204 is unavailable.
+One trip that answers every remaining live-cluster dependency of the
+continuation pass (FR-A/B/C, NVMe ranking + batching, startup/shutdown UX).
+Target **var203.selab.vastdata.com only**; var204 is unavailable.
+
+> ## Run this on the Linux lab host, not a tethered laptop
+>
+> **One command does everything below, unattended:**
+>
+> ```bash
+> python3 scripts/var203_validation/run_var203_validation.py
+> ```
+>
+> It drives `opstat` through a PTY itself — no key-pressing, no timing by
+> hand — and writes `/tmp/opstat-var203-validation.txt`. Use it in preference
+> to the manual steps; the steps remain here as the specification of what it
+> checks and as a fallback if the driver cannot run.
+>
+> **Wall-clock is only trustworthy from a host near the cluster.** The report
+> stamps its own hostname so a run over a distorted network path can be
+> discounted. API-call counts, monitor layout, `object_id` behaviour and
+> cleanup results stay valid regardless of network quality.
+>
+> Round 1 already established the batch/splittability results — see
+> [D-013](../../docs/decisions/D-013-nvme-drill-batching-is-scope-dependent.md).
+> What is still outstanding: real drill **cost**, startup/shutdown UX, the
+> Fabric screen, navigation under a real terminal, and the latency units.
 
 Safety, for every step below: credentials come from `VAST_PASSWORD` /
 `VAST_TOKEN` in the environment (never argv); nothing modifies VMS
@@ -126,3 +149,60 @@ frame never wraps into garbage.
   "REAL-VMS VALIDATION PENDING" to validated.
 - The logical commit breakdown (already proposed) — commit after, not before,
   the evidence returns.
+
+---
+
+## The automated driver (`run_var203_validation.py`)
+
+Preferred over the manual steps above. Same safety contract, executed rather
+than remembered.
+
+```bash
+cd ~/git/opstat
+export VAST_PASSWORD=...                 # or VAST_TOKEN; never argv
+python3 scripts/var203_validation/run_var203_validation.py
+```
+
+Useful flags: `--skip-others` (NVMe only), `--skip-probe` (probes already
+run), `--cadence-window 60` (longer idle observation), `--vms` / `--user`.
+
+**What it does, in order**
+
+1. Prerequisites: repo root, branch/HEAD, Python version, `opstat` present,
+   credential present (presence only — the value is never printed or logged),
+   DNS + TCP reachability. Refuses to touch the cluster if any fail.
+2. Reports committed loadgen unit state. It **never** starts them: that needs
+   privilege and changes machine state, so it prints what to run instead.
+3. Runs `probe_var203.py` and folds its `PROBE:` verdicts into the report.
+4. NVMe session: startup phase timings, footer, Fabric/workload frame
+   excerpt, then the `c` / `i` / `h` drills — per-drill entry API calls
+   (keypress → panel rendered), monitors created, batch-vs-per-object layout
+   read from the monitor **names**, idle cadence, and a forced-refresh check.
+5. Navigation: the canonical legend, plus proof that the retired bindings are
+   dead — `p` must not exit a drill and `v` must not open VIP. An unbound key
+   produces no repaint at all, so the driver forces one with `space` and reads
+   the resulting frame rather than inferring from silence.
+6. Clean `q`, cleanup frame, exit code, and per-id cleanup verification.
+7. Short startup/footer/clean-`q` checks for SMB, S3, NFSv3 and NFSv4.1.
+
+**Cleanup accounting.** Monitor ids come from the session's own API log
+(`POST /monitors/` response bodies), and each is verified individually with a
+`GET` where **404 is proof of deletion**. It never lists-and-deletes: other
+sessions' `adhoc_opstat_*` monitors exist on this shared cluster and must
+never be touched or counted against the run.
+
+**Termination.** `q` is the exit path. If a session does not exit within the
+drain budget it gets one SIGTERM and the PTY is deliberately held open so the
+monitor drain can finish — closing it mid-drain is what truncated cleanup
+historically. **SIGKILL is never sent.**
+
+**Bring back:** `/tmp/opstat-var203-validation.txt`,
+`/tmp/opstat-var203-probe.txt`, and the `/tmp/opstat-api-*.log` files it
+names. Do not commit any of them — they carry cluster identifiers.
+
+### Known behaviour when something is unavailable
+
+A drill whose panel never renders is reported `FAIL` with the panel title it
+waited for, and the run continues. That is how the driver behaves against the
+mock for the `h` (blockhost) drill, which the mock deliberately does not
+model — against a real cluster it should open.

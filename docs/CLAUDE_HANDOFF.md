@@ -90,9 +90,36 @@ Implementation deliberately not attempted without live evidence:
    Displays unchanged and marked UNVERIFIED until compared against a known-µs
    metric under load.
 
-Every remaining live dependency is scripted in
-[../scripts/var203_validation/](../scripts/var203_validation/) — one
-work-laptop trip answers all of it.
+## Settled by round 1 of real-VMS validation (2026-08-14)
+
+- **NVMe batch layout is scope-dependent** — [D-013](decisions/D-013-nvme-drill-batching-is-scope-dependent.md).
+  `cnode` batches and splits per `object_id`; `vip` and `blockhost` accept
+  creation *and* query yet return no per-object rows, so the engine's run-time
+  splittability check falls them back to per-object. Regression coverage now
+  reproduces both unsplittable shapes; removing the check fails four tests.
+- **Rank monitors work at `cnode` scope** — real per-object `read_req` deltas
+  (1062.353/s vs 0.0/s), so a measured zero is distinguishable from no data.
+- **Exact-id cleanup works** — six probe monitors created, all six verified
+  deleted per id.
+- **Latency units remain UNVERIFIED.** The reference metric returned 0 in that
+  window, so 488.99 from BlockMetrics proves nothing on its own. No display
+  behaviour was changed on the strength of it.
+
+Round 1 ran over a tethered link, so **all wall-clock from it was discarded**;
+counts, shapes and cleanup results were kept.
+
+## Remaining live dependencies
+
+One command on the Linux lab host answers the rest, unattended:
+
+```bash
+python3 scripts/var203_validation/run_var203_validation.py
+```
+
+It drives `opstat` through a PTY (startup/shutdown UX, drill entry cost and
+cadence, ranking, navigation, Fabric screen, per-id cleanup) and writes
+`/tmp/opstat-var203-validation.txt`. See
+[../scripts/var203_validation/](../scripts/var203_validation/README.md).
 
 ## Outstanding work (not started)
 

@@ -428,11 +428,19 @@ Mock-measured budgets (counts transfer to a real cluster; wall-clock does not):
   by the family-mixing probe result (open-decision №3): all-BlockMetrics-ops
   in one monitor is rejected at query time, and cross-family behavior is
   build-inconsistent.
-- Whether a real VMS accepts **multi-`object_id` BlockMetrics/ProtoMetrics
-  monitors at cnode/vip/blockhost scope is unproven** — the mock models the
-  documented batch shape, the engine probes and falls back at entry, and the
-  work-laptop package carries the real probe. Until then the batch layout is
-  IMPLEMENTED / REAL-VMS VALIDATION PENDING.
+- **Batch acceptance is now settled and is scope-dependent** — see
+  [D-013](decisions/D-013-nvme-drill-batching-is-scope-dependent.md). A var203
+  probe returned: `cnode` create/query/**splittable** PASS (ids `[4, 3]`, 120
+  rows each); `vip` and `blockhost` create PASS, query PASS, **splittable
+  FAIL** (0 rows per object, ids `[755,55,56,57]` and `[1,2,3,4]`). So a
+  successful create proves nothing, and the run-time validation is load-
+  bearing rather than defensive. `cnode` gets the batch layout on this
+  cluster; `vip`/`blockhost` fall back to per-object and keep their old cost.
+  Rank monitors are accepted at `cnode` scope (`read_req` deltas: object 4 =
+  1062.353/s, object 3 = 0.0/s), so activity ranking is viable there.
+  Regression coverage reproduces both unsplittable response shapes.
+  **Still pending:** the real drill *cost* of the fallback on `vip`/
+  `blockhost`, and the blockhost drill end-to-end.
 - `/blockhosts/` is **deliberately not modeled in the mock** (no real API
   evidence for its response shape); the host drill shares the cnode/vip code
   path and is exercised only on a real cluster.
@@ -619,6 +627,7 @@ Reopening one is an L1 decision: new evidence plus explicit approval.
 | [D-010](decisions/D-010-merged-monitors-are-probe-validated-with-fallback.md) | Merged headline monitors are probe-validated with fallback |
 | [D-011](decisions/D-011-newest-complete-sample-scoped-per-family.md) | Newest *complete* sample, scoped per metric family |
 | [D-012](decisions/D-012-terminology-v4-hosts.md) | Terminology is "v4 hosts" |
+| [D-013](decisions/D-013-nvme-drill-batching-is-scope-dependent.md) | NVMe drill batching is scope-dependent and must be response-validated |
 
 ## Decisions still open
 
