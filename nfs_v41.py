@@ -1847,8 +1847,13 @@ def _frame_width():
 
 
 def _render_nav_footer(width):
-    """Application navigation bar, shown in every mode including drill-downs."""
-    print(box_row(vast_drill.nav_legend(_NAV_CONTROLS), width), flush=True)
+    """Application navigation bar, shown in every mode including drill-downs.
+
+    Wrapped, never truncated: every supported control stays discoverable at
+    any width (box_row's inner width is the frame width minus the borders).
+    """
+    for line in vast_drill.nav_legend_lines(_NAV_CONTROLS, max(width - 4, 12)):
+        print(box_row(line, width), flush=True)
 
 
 def _render_frame():

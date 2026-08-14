@@ -2222,8 +2222,9 @@ def render_screen():
 _NAV_CONTROLS = vast_drill.nav_controls(("q", "c", "v", "t", "x", "space"))
 
 
-def _nav_legend():
-    return vast_drill.nav_legend(_NAV_CONTROLS)
+def _nav_legend_lines(width):
+    """Wrapped legend lines: controls wrap, they are never dropped."""
+    return vast_drill.nav_legend_lines(_NAV_CONTROLS, max(width - 4, 12))
 
 
 def _render_frame():
@@ -2264,7 +2265,8 @@ def _render_frame():
         print()
         _render_opcode_workflow_panel(LAST_ROWS, width)
         print()
-    print(box_row(_nav_legend(), width), flush=True)
+    for _line in _nav_legend_lines(width):
+        print(box_row(_line, width), flush=True)
 
 
 setup_keyboard = vast_common.setup_keyboard

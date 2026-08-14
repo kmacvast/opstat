@@ -382,3 +382,85 @@ def test_shared_legend_renders_in_engine_footers(engine_name, token):
     legend = tui_layout.strip_ansi(vast_drill.nav_legend(module._NAV_CONTROLS))
     assert token in legend
     assert "|" in legend
+
+
+# ---------------------------------------------------------------------------
+# FR-A regression: the footer must WRAP, never silently drop controls.
+#
+# Observed on a real laptop terminal: the footer showed only
+#   [q] Quit |[o] Ops |[l] Lat
+# while c/v/t/x still worked - right-truncation made working controls
+# undiscoverable. The legend now wraps onto continuation lines; a control an
+# engine supports must be visible at any ordinary width.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("engine_name", ENGINE_MODULES)
+@pytest.mark.parametrize("columns", [200, 100, 80, 60])
+def test_every_supported_control_is_visible_at_width(engine_name, columns):
+    import importlib
+
+    module = importlib.import_module(engine_name)
+    tui_layout.set_color(False)
+    module._COLOR = False
+    module.VMS, module.PORT = "10.0.0.1", 443
+    module.CLUSTER_NAME = "c1"
+    module.REFRESH_SECONDS = 5
+    module.DRILL_MODE = None
+    module.LAST_ROWS = []
+    # The startup frame goes through the same footer-owning render path as
+    # the live dashboard, without needing full per-engine row state.
+    module.STARTUP_STATUS = "Connecting to 10.0.0.1:443, please stand by..."
+    try:
+        frame = render_frame(module, columns=columns)
+    finally:
+        module.STARTUP_STATUS = None
+    for key, label in module._NAV_CONTROLS:
+        assert f"[{key}]" in frame, (
+            f"{engine_name}: control [{key}] {label} invisible at "
+            f"{columns} columns - a working key must stay discoverable")
+
+
+def test_the_observed_qol_truncation_cannot_recur():
+    """Literal repro of the field report: q/o/l visible, c/v/t/x gone.
+
+    At 30 columns the old single-line renderer truncated NFSv3's legend to
+    exactly the reported '[q] Quit |[o] Ops |[l] Lat' prefix. The wrapped
+    renderer must keep every control visible at that same width.
+    """
+    import vast_drill
+
+    import nfs_v3
+
+    tui_layout.set_color(False)
+    nfs_v3._COLOR = False
+    # The defective rendering, reconstructed: one line, right-truncated.
+    old_style = tui_layout.truncate_display(
+        tui_layout.strip_ansi(vast_drill.nav_legend(nfs_v3._NAV_CONTROLS)), 28)
+    assert "[q]" in old_style and "[o]" in old_style and "[l]" in old_style
+    assert "[c]" not in old_style, "repro no longer reproduces the field report"
+    # The fixed rendering at the same width: everything survives, wrapped.
+    lines = [tui_layout.strip_ansi(l)
+             for l in vast_drill.nav_legend_lines(nfs_v3._NAV_CONTROLS, 28)]
+    joined = " ".join(lines)
+    for key, _label in nfs_v3._NAV_CONTROLS:
+        assert f"[{key}]" in joined, f"[{key}] dropped at 28 columns"
+    for line in lines:
+        assert tui_layout.display_width(line) <= 28
+
+
+def test_nav_legend_lines_packs_greedily_and_never_drops():
+    import vast_drill
+
+    tui_layout.set_color(False)
+    controls = vast_drill.CANONICAL_CONTROLS
+    for width in (200, 120, 76, 40, 20, 8):
+        lines = [tui_layout.strip_ansi(l)
+                 for l in vast_drill.nav_legend_lines(controls, width)]
+        joined = " ".join(lines)
+        for key, _label in controls:
+            assert f"[{key}]" in joined, (key, width)
+    # Wide enough for everything -> exactly one line, identical content to
+    # the unwrapped legend.
+    one = vast_drill.nav_legend_lines(controls, 500)
+    assert len(one) == 1
+    assert tui_layout.strip_ansi(one[0]) == tui_layout.strip_ansi(
+        vast_drill.nav_legend(controls))

@@ -1856,7 +1856,8 @@ _NAV_CONTROLS = vast_drill.nav_controls(
 
 def _render_help_bar(width):
     print(c(_H * width, _DIM))
-    print(c("  ", _DIM) + vast_drill.nav_legend(_NAV_CONTROLS), flush=True)
+    for line in vast_drill.nav_legend_lines(_NAV_CONTROLS, max(width - 2, 12)):
+        print(c("  ", _DIM) + line, flush=True)
 
 
 def poll_tick():

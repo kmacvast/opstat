@@ -1853,13 +1853,15 @@ _NAV_CONTROLS = vast_drill.nav_controls(
 def _footer_keys(width=None):
     """The navigation key legend (owned by the common render path).
 
-    Truncated to the terminal width so a narrow terminal shortens the control
-    list legibly instead of wrapping it into the frame above.
+    Wrapped to the terminal width rather than truncated: right-truncation
+    silently dropped controls (a real laptop terminal showed only q/o/l while
+    c/v/t/x still worked), and a control that works must stay discoverable.
     """
-    legend = c("  ", _DIM) + vast_drill.nav_legend(_NAV_CONTROLS)
-    if width is not None:
-        legend = truncate_display(legend, width)
-    return legend
+    inner = None if width is None else max(width - 2, 12)
+    return "\n".join(
+        c("  ", _DIM) + line
+        for line in vast_drill.nav_legend_lines(_NAV_CONTROLS, inner)
+    )
 
 
 def _render_frame():

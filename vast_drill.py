@@ -634,6 +634,12 @@ def nav_legend(controls):
     One shared renderer so the look (brackets, pipes, spacing, dim/bright
     split) cannot drift between engines. Engines wrap the returned string in
     their own frame furniture (``box_row`` or a plain line).
+
+    On any terminal narrower than the full legend, use
+    :func:`nav_legend_lines` instead - truncating this single line drops
+    controls from the right, which shipped as a real defect: an ordinary
+    laptop terminal showed only ``[q] Quit |[o] Ops |[l] Lat`` while c/v/t/x
+    still worked but were undiscoverable.
     """
     parts = []
     for key, label in controls:
@@ -644,6 +650,45 @@ def nav_legend(controls):
             + tui_layout.c(" %s " % label, tui_layout._DIM)
         )
     return "".join(parts).rstrip()
+
+
+def nav_legend_lines(controls, width):
+    """Render the footer legend wrapped to *width*, never dropping a control.
+
+    Returns a list of rendered lines. Controls are packed greedily in their
+    canonical order and wrap onto continuation lines when the next segment
+    would not fit - a control the engine supports must stay discoverable at
+    any width, because the key keeps working whether or not it is shown. At
+    pathologically narrow widths each line carries at least one control and
+    the frame furniture may truncate it, but a control is only ever shortened,
+    never silently omitted.
+    """
+    if width is None or width <= 0:
+        return [nav_legend(controls)]
+    lines = []
+    line_parts = []
+    line_width = 0
+    for key, label in controls:
+        # A rendered segment is "[k] Label " (trailing space) and the join is
+        # a bare "|", so a continuation costs the pipe plus the segment and
+        # its trailing space; the final line loses one space to rstrip.
+        seg_width = tui_layout.display_width("[%s] %s" % (key, label)) + 1
+        sep_width = 1 if line_parts else 0
+        if line_parts and line_width + sep_width + seg_width - 1 > width:
+            lines.append("".join(line_parts).rstrip())
+            line_parts = []
+            line_width = 0
+            sep_width = 0
+        if line_parts:
+            line_parts.append(tui_layout.c("|", tui_layout._DIM))
+        line_parts.append(
+            tui_layout.c("[%s]" % key, tui_layout._BWHITE)
+            + tui_layout.c(" %s " % label, tui_layout._DIM)
+        )
+        line_width += sep_width + seg_width
+    if line_parts:
+        lines.append("".join(line_parts).rstrip())
+    return lines or [""]
 
 
 # ---------------------------------------------------------------------------
