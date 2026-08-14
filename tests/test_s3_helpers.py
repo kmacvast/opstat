@@ -3,6 +3,7 @@
 import pytest
 
 import s3
+import vast_drill
 
 
 @pytest.fixture(autouse=True)
@@ -79,8 +80,13 @@ def test_build_drill_prop_lists_do_not_mix_metric_classes():
     assert all(p.startswith("TenantMetrics,") for p in tenant_props)
     cnode_props = s3.build_drill_prop_list("cnode")
     assert any("S3Common" in p or "proto_name=S3" in p for p in cnode_props)
-    assert s3._is_batch_drill_mode("bucket") is True
-    assert s3._is_batch_drill_mode("cnode") is False
+    # Post vast_drill port: batch-vs-per-object is decided by the actual monitor
+    # layout (so a batch that falls back to per-object is queried correctly),
+    # not by the mode name. One monitor with a None name is the batch layout;
+    # per-object monitors (each named) are not.
+    assert vast_drill.DrillSession.batch_active(None, [(1, None)]) is True
+    assert vast_drill.DrillSession.batch_active(
+        None, [(1, "a"), (2, "b")]) is False
 
 
 def test_build_rows_from_results_component_mix():

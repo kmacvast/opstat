@@ -590,6 +590,7 @@ class DrillSession:
 # message has to reach the terminal *before* that work starts, or the TUI
 # simply looks hung.
 LOADING_MESSAGES = {
+    "startup": "Gathering initial metrics, please stand by...",
     "cnode": "Loading the cNODE drill-down, please stand by...",
     "view": "Loading the VIEW drill-down, please stand by...",
     "views": "Loading the NFSv4 views, please stand by...",
@@ -619,5 +620,29 @@ def with_loading_status(show_status, render, mode, work):
     try:
         render()
         return work()
+    finally:
+        show_status(None)
+
+
+def with_startup_status(show_status, render, steps):
+    """Run each blocking startup step behind its own status frame.
+
+    ``steps`` is a sequence of ``(message, work)`` pairs run in order. For each
+    step the status is set, one frame is rendered, *then* the blocking work
+    runs — so the terminal shows what the process is waiting on before it
+    blocks, and the message visibly changes as startup progresses (the engines
+    are single-threaded, so this frame-per-phase is the progress signal; there
+    is no spinner).
+
+    ``message`` may be a string or a zero-argument callable returning one, so a
+    later step can name the cluster once an earlier step has resolved it (the
+    cluster name is unknown until the first call returns). The status is cleared
+    in a ``finally`` so it never survives startup, including when a step raises.
+    """
+    try:
+        for message, work in steps:
+            show_status(message() if callable(message) else message)
+            render()
+            work()
     finally:
         show_status(None)

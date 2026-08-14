@@ -333,6 +333,10 @@ class _State:
         # Prop-name prefixes that make POST /monitors/ fail outright, for
         # engines whose fallback path reacts to a rejected create.
         self.reject_prop_prefixes = ()
+        # object_type values POST /monitors/ rejects outright. Models a build
+        # that does not support a monitor scope at all (e.g. object_type=vip),
+        # so an engine's scope-specific fallback path is exercised.
+        self.reject_object_types = ()
         # Reproduce observed VMS 5.5.0.1 behavior: the newest bucket of an
         # object-scoped monitor is still filling, so every property except
         # the ones listed here comes back null in that row. Set to None to
@@ -454,13 +458,21 @@ class _Handler(BaseHTTPRequestHandler):
             def block(prefix):
                 return [{"title": f"{prefix}{i}", "value": 1000.0 - i * 37}
                         for i in range(10)]
+
+            # Real VMS topn rows carry {title, total, read, write}; the vip
+            # topn-only fallback reads those, so model them for vip. External
+            # (non-192.168) titles so the fallback survives IP filtering.
+            def vip_block(scale):
+                return [{"title": f"10.1.0.{i + 1}", "total": scale - i * 40,
+                         "read": scale * 0.6 - i * 24, "write": scale * 0.4 - i * 16}
+                        for i in range(8)]
             return self._send({"data": {
                 "client": {"md_iops": block("10.2.0."), "iops": block("10.2.0."),
                            "bw": block("10.2.0."), "latency": block("10.2.0.")},
                 "view": {"md_iops": block("/view/"), "iops": block("/view/"),
                          "bw": block("/view/")},
-                "vip": {"iops": block("10.1.0."), "bw": block("10.1.0."),
-                        "latency": block("10.1.0.")},
+                "vip": {"iops": vip_block(500.0), "bw": vip_block(120.0),
+                        "latency": vip_block(800.0)},
                 "user": {"md_iops": block("user")},
             }})
 
@@ -552,6 +564,10 @@ class _Handler(BaseHTTPRequestHandler):
             for p in payload.get("prop_list") or []:
                 if str(p).startswith(tuple(self.state.reject_prop_prefixes)):
                     return self._error(400, f"unsupported metric: {p}")
+        if self.state.reject_object_types and \
+                payload.get("object_type") in self.state.reject_object_types:
+            return self._error(
+                400, f"unsupported object_type: {payload.get('object_type')}")
         cap = self.state.max_object_ids
         if cap is not None and len(payload.get("object_ids") or []) > cap:
             return self._error(400, f"too many object_ids (max {cap})")

@@ -188,6 +188,63 @@ def test_other_engines_keep_controls_visible_in_drill_mode(engine_name, expected
 
 
 # ---------------------------------------------------------------------------
+# Startup / waiting frame: the pre-data frame must own the footer too.
+# nfs_v3 and nvme_tcp used a bare `print("Waiting for data…"); return` that
+# bypassed the footer entirely - the exact early-return pattern this suite
+# guards against. Fails on that pre-change code.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("engine_name,token", [
+    ("nfs_v3", "quit"),
+    ("nvme_tcp", "[q]"),
+])
+@pytest.mark.parametrize("columns", [200, 120, 80, 40])
+def test_waiting_frame_keeps_the_footer(engine_name, token, columns):
+    import importlib
+
+    module = importlib.import_module(engine_name)
+    tui_layout.set_color(False)
+    module._COLOR = False
+    module.VMS, module.PORT = "10.0.0.1", 443
+    module.CLUSTER_NAME = "c1"
+    module.REFRESH_SECONDS = 5
+    module.DRILL_MODE = None
+    module.LAST_ROWS = []          # no data yet -> the waiting frame
+    if hasattr(module, "STARTUP_STATUS"):
+        module.STARTUP_STATUS = None
+    frame = render_frame(module, columns=columns)
+    assert token in frame, (
+        f"{engine_name} waiting frame dropped the footer token {token!r} at {columns}c")
+
+
+@pytest.mark.parametrize("engine_name,token", [
+    ("nfs_v3", "quit"),
+    ("nfs_v41", "[q]"),
+    ("smb", "[q]"),
+    ("s3", "[q]"),
+    ("nvme_tcp", "[q]"),
+])
+def test_startup_status_frame_keeps_the_footer(engine_name, token):
+    """The startup interstitial frame must render the nav footer too."""
+    import importlib
+
+    module = importlib.import_module(engine_name)
+    tui_layout.set_color(False)
+    module._COLOR = False
+    module.VMS, module.PORT = "10.0.0.1", 443
+    module.CLUSTER_NAME = None      # earliest phase: cluster not resolved yet
+    module.REFRESH_SECONDS = 5
+    module.DRILL_MODE = None
+    module.LAST_ROWS = []
+    module.STARTUP_STATUS = "Connecting to 10.0.0.1:443, please stand by..."
+    try:
+        frame = render_frame(module)
+    finally:
+        module.STARTUP_STATUS = None
+    assert "Connecting to 10.0.0.1:443" in frame, f"{engine_name} lost the startup message"
+    assert token in frame, f"{engine_name} startup frame dropped the footer token {token!r}"
+
+
+# ---------------------------------------------------------------------------
 # Exporter-backed drills (native NFSv4 / client attribution)
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("mode", EXPORTER_MODES)

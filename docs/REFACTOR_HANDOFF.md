@@ -40,6 +40,22 @@ telemetry investigation that turned into new functionality.
 
 ---
 
+## Current environment
+
+**Real-VMS validation cluster: `var203.selab.vastdata.com`.** Use it for all
+real-cluster work.
+
+**`var204.selab.vastdata.com` is unavailable** (being reinstalled; expected back
+~2026-08-17 but will need reconfiguration). Treat it as unavailable until the
+repository owner explicitly says otherwise, and **do not treat prior var204
+measurements as current** — the NFSv3/NFSv4.1 real-cluster numbers below were
+taken on var204 and cannot be re-verified live until it returns (mock coverage
+still runs). This is a temporary operational condition, not a decision record.
+
+Auth for real-cluster runs comes from the `VAST_PASSWORD` / `VAST_TOKEN`
+environment variables — never on the command line, in tracked files, in API
+logs, or in this handoff.
+
 ## Repository / branch baseline
 
 | Item | Value at time of writing |
@@ -272,14 +288,100 @@ corrected sample selection (`_latest_row`, `_values_from_result`,
 `_delta_rate_from_samples`, `_avg_from_sum_count_deltas` all route through the
 shared selector).
 
-**Not done:** both still rank view/tenant candidates with the **32-object
-chunked serial scan** (`_DRILL_PROBE_LIMIT` in `smb.py` and `s3.py`) — the same
-path that cost 47 s on NFSv3. Porting them to `vast_drill.DrillSession` is a
-direct lift; neither imports `vast_drill` yet.
+**Done — view/tenant/bucket drill ported to `vast_drill.DrillSession`** (this
+effort, real-VMS validated on `var203.selab.vastdata.com`; changes are in the
+working tree, not yet committed). Both engines now import `vast_drill` and route
+the view/tenant (SMB) and bucket/tenant (S3) drills through `DrillSession.rank`
+(topn → adaptive batched rank monitors → cached) and `DrillSession.create_monitors`
+(batch with automatic per-object fallback). `_is_batch_drill_mode` is now keyed
+on the actual monitor layout (`batch_active`), not the mode, so a batch that
+falls back to per-object is queried correctly. `fetch_drill_query(force=False)`
+throttles view/tenant/bucket re-polls via `DRILL.should_query`; the space bar
+(`manual_refresh`) forces. Loading interstitial and startup frame now go through
+`vast_drill.with_loading_status` (see *Startup / loading UX* below).
 
-Neither has been validated against the real cluster during this effort.
+Real before → after (`var203`, high and variable REST latency; counts transfer,
+wall-clock does not):
+
+```text
+                 entry API calls    ranking wall-clock    rank monitors
+  SMB view       18 → 7             104 s → 9 s           5 chunks → 1 batch
+  SMB tenant      9 → 7              34 s → 37 s          2 chunks → 1 batch
+  S3  bucket     18 → 7              47 s → 45 s          5 chunks → 1 batch
+  S3  tenant      9 → 7              59 s → 10 s          2 chunks → 1 batch
+```
+
+topn returned no usable view/bucket ranking on this cluster (few active views),
+so ranking fell to **one** batched rank monitor rather than the topn shortcut —
+still far better than the pre-port serial chunk-per-32 scan, and re-entry inside
+the cache TTL now issues **no** rank monitors. Wall-clock gains vary with the
+cluster's per-call latency (one call was observed taking 36 s during this pass);
+the deterministic win is the call-count drop and the rank cache. All runs exited
+cleanly (`q`) with **no leaked monitors**, verified against each session's exact
+monitor ids.
+
+**cNode drill unchanged** (still per-object, head-sliced) by design — not batched
+opportunistically. **S3 VIP unchanged** and re-verified on the real cluster: topn
+ranking, `192.168.*` filtering, per-object monitors, unthrottled re-poll, and the
+topn-only fallback (now exercised by a mock that rejects `object_type=vip`).
 
 ---
+
+## Startup / loading UX
+
+Real-cluster runs exposed a startup window of ~30–90 s (auth, cluster
+resolution, headline-monitor creation/probe, first sample fetch, aux context)
+during which the terminal showed nothing. SMB and S3 now paint a
+`Gathering initial metrics, please stand by...` status frame **before** that
+blocking work via `vast_drill.with_loading_status` (a new `"startup"` entry in
+`LOADING_MESSAGES`), through a shared `initialize()` helper called from `main()`.
+The status reaches the terminal before the first API call; the normal dashboard
+replaces it automatically when ready; the footer renders correctly once the
+normal frame appears. No threads were introduced.
+
+This is a candidate general invariant ("no blank/frozen terminal during
+multi-second startup; status before blocking work; shared helper").
+
+**Now implemented in all five engines** (FR-D / Phase 9). Each `main()` calls a
+uniform `initialize()` that runs three phases through the shared
+`vast_drill.with_startup_status(show_status, render, steps)` helper — a frame is
+painted before each blocking step, and the message changes as startup
+progresses (single-threaded, so the message change *is* the progress signal;
+no spinner):
+
+1. `Connecting to {VMS}:{PORT}, please stand by...` — before `get_current_cluster`
+   (the cluster name is unknown this early, so the host is named, not the cluster).
+2. `Preparing metrics on {CLUSTER_NAME}, please stand by...` — before monitor creation.
+3. `Gathering initial metrics, please stand by...` — before the first query.
+
+The status is cleared once the first real frame renders, and in a `finally` on
+the error path. Each engine gained a `STARTUP_STATUS` global + `_set_startup_status`
+(globals-hygiene compliant), and the startup/waiting frame now renders through
+the footer-owning common path. The `nfs_v3` and `nvme_tcp` `_render_frame`
+functions previously did a bare `print("Waiting for data…"); return` that
+bypassed the navigation footer — that flat early return is gone; both now render
+title + status + footer. `tests/test_startup_loading.py` (ordering + clear-on-
+error, per engine) and new waiting/startup footer cases in
+`tests/test_render_navigation.py` guard it.
+
+**Mock/unit-verified only.** The actual startup appearance on var203 is
+unverified this pass (no real run backed it); real-cluster verification is the
+owner's step. Consider promoting the invariant to
+[.claude/rules/tui-behavior.md](../.claude/rules/tui-behavior.md).
+
+**Out of scope, recorded here for follow-up:**
+- **Quit-time cleanup frame.** `drain_monitors` now blocks signals during the
+  drain, so a slow quit is also a silent multi-second wait — it should get its
+  own `Cleaning up N monitors, please stand by...` frame. Separate change.
+- **`signal.pthread_sigmask` Windows guard.** The cleanup fix's sigmask call is
+  POSIX-only. `release.yml` builds `opstat-windows-x86_64.exe` but `test.yml` is
+  Linux-only, so CI never exercises Windows. The call is already `getattr`-guarded
+  (absent on Windows → skipped), but the Windows build path is untested.
+- **Exporter footer tests are order-dependent.** `test_render_navigation.py`'s
+  exporter-drill tests rely on an earlier test (`test_drill_loading`) having
+  called `init_config` to set the `HOSTVIEW`/`NFS4` collectors; run in isolation
+  (`-k exporter`) they error on `HOSTVIEW.error` (None). Pre-existing; not this
+  change. The v41 fixture should set those collectors itself.
 
 ## NVMe / block status
 
@@ -332,11 +434,14 @@ ranking correctness.
 
 ## Test architecture
 
-400 tests, green on Python 3.8 and 3.12.
+428 tests, green on Python 3.8 and the current interpreter (validated on 3.14.6
+and 3.8 this pass). The SMB/S3 drill port added `tests/test_smb_s3_drill.py`
+(28 tests).
 
 | Suite | Tests | Covers |
 |---|---|---|
 | `test_render_navigation.py` | 122 | Footer present in every mode and width; frame never exceeds terminal; other engines guarded |
+| `test_smb_s3_drill.py` | 28 | SMB/S3 view/tenant/bucket drill port: entry budget, ranking >32, rank cache, throttle, force bypass, batch fallback, cleanup (success + query-error), VIP topn/filtering/topn-only fallback, drill+startup loading frames |
 | `test_nfs41_discovery.py` | 63 | Catalog reader, op detection, concept scan, prop probe, evidence-gated panels, all discovery report sections |
 | `test_drill_semantics.py` | 38 | Partial-newest-sample defects, ranking correctness, entry call budgets, cNode batching, throttle |
 | `test_nfs4_native.py` | 29 | Exporter parsing, warm-up, rate/latency derivation, counter reset, host_view filtering, cost isolation |
@@ -396,10 +501,14 @@ Verified against the repository at the time of writing.
 
 ### Outstanding
 
-1. **SMB and S3 view/tenant ranking** still use the 32-object chunked serial
-   scan. Direct port to `vast_drill.DrillSession`.
-2. **NVMe ranking and drill batching.** Head-slices `/volumes/`; per-object
-   drill monitors; ~467+ calls per 30 s session.
+1. **NVMe ranking and drill batching.** cNode/host/VIP drills head-slice the
+   object list to the first 8 (`enter_drill_mode`, no activity ranking) and
+   create several monitors per object (per-op BlockMetrics + proto), a
+   per-object query explosion with no throttle or forced refresh. Port the
+   ranking/throttle/cache/force parts of `vast_drill` (the *display* monitors
+   must stay multi-family — see the family-split finding below). ~467+ calls per
+   30 s session. **Not yet done** — real BEFORE baseline captured (headline uses
+   8 monitors: 5 per-op BlockMetrics + 1 fabric + 1 proto + volume).
 3. **NFSv3 VIEW drill** still uses `ViewMetrics`. The NFSv4.1 rebuild on
    `host_view` may be portable — `host_view` carries `protocol=NFS3`.
 4. **Delegation diagnostic** not implemented. Needs a path-entry interaction.
@@ -427,6 +536,27 @@ Verified against the repository at the time of writing.
 - Cluster vs cNode reconciliation — proven exact (100.00%).
 - NFSv4.1 drill-down never displaying data (missing `global DRILL_MONITORS`) —
   fixed; an AST hygiene test prevents recurrence.
+- SMB/S3 view/tenant/bucket ranking on the 32-object chunked serial scan —
+  ported to `vast_drill.DrillSession` (entry 18 → 7 calls; rank cache on
+  re-entry; throttled re-poll), real-VMS validated. `tests/test_smb_s3_drill.py`
+  guards it.
+- **Monitor cleanup interrupted mid-drain** (leaked an `adhoc_opstat_*` monitor
+  on SIGTERM/SIGHUP during the slow drain, no warning; seen twice on var203) —
+  **fixed.** Root cause: `cleanup()` set its `_CLEANED_UP` guard *before* the
+  drain, and a re-entrant signal `sys.exit`ed out of the loop. Fix:
+  `vast_common.drain_monitors` now blocks SIGINT/SIGTERM/SIGHUP for the drain's
+  duration (deferred, not lost — clean exit still happens after every monitor is
+  gone), and every engine sets `_CLEANED_UP` only after the drain completes so
+  an interrupted cleanup is retried by the atexit backstop. No threads.
+  `tests/test_cleanup_lifecycle.py` guards it. **Caveat:** `SIGKILL` cannot be
+  blocked, so a hard kill (e.g. a harness timeout killing the process group)
+  can still orphan a monitor — verify cleanup by exact session ids after
+  automated runs.
+- **NVMe fabric percentage (FR-C)** — Fabric/admin ops were in the workload-mix
+  denominator, shrinking real read/write percentages (an 80/20 read/write mix
+  rendered 16%/4% under fabric load). Fixed: read/write/reclaim are now shares
+  of the actual I/O workload (fabric excluded); Fabric is shown separately as a
+  share of all activity. `tests/test_nvme_tcp.py` covers it with literal values.
 - Bandwidth lost to mixed-family row scoring — fixed; regression test proven
   against the prior commit.
 
@@ -460,9 +590,25 @@ These are **not** settled and do not belong in `decisions/` until they are.
 1. Whether the multi-second synchronous scrape is acceptable, or whether
    background threading is warranted. Needs real-cluster judgement.
 2. Whether to port the exporter-backed view rebuild to NFSv3.
-3. Whether NVMe's monitor split is a genuine VMS constraint or historical.
+3. ~~Whether NVMe's monitor split is a genuine VMS constraint or historical.~~
+   **Probed on var203 (2026-08-14):** the split is substantially *required*, but
+   for a subtler reason than the code comment states. Putting all BlockMetrics
+   ops in one monitor is **rejected at query time** ("can't mix pr[operties]") —
+   counters and rate/avg props cannot share a monitor — so the per-op BlockMetrics
+   split stands. Cross-family results were inconsistent/build-specific
+   (BlockMetrics+ProtoMetrics queried fine with data; ProtoMetrics+VolumeMetrics
+   rejected "metrics not …"; all-three queried fine), so cross-family
+   consolidation is **not clearly safe**. Decision: preserve the split, optimize
+   the drill instead. The comment claiming "BlockMetrics and ProtoMetrics cannot
+   be mixed" is imprecise and should be reworded when the engine is next touched.
+   Any future merge must be probe-validated with fallback (D-010 philosophy) and
+   never assumed across builds.
 4. Whether to implement the delegation lookup, and with what interaction.
-5. Whether SMB/S3 should adopt `vast_drill` wholesale or incrementally.
+5. ~~Whether SMB/S3 should adopt `vast_drill` wholesale or incrementally.~~
+   **Settled:** view/tenant/bucket drills ported to `vast_drill.DrillSession`;
+   cNode and S3 VIP left on their existing paths deliberately. See SMB/S3 status.
+6. Whether the startup/loading-UX pattern (status frame before blocking startup)
+   should be promoted to a general invariant and adopted by the NFS/NVMe engines.
 
 ---
 
@@ -533,6 +679,67 @@ and S3.
 - Terminal captures of any panel that looks wrong.
 
 ---
+
+## Feature backlog (owner-requested FRs)
+
+Lightweight backlog — no external issue tracker. Status is updated in place as
+each FR is folded into engine work.
+
+### FR-A — Standardize navigation shortcut keys
+Same conceptual action → same key, label, capitalization, ordering, separators
+and style across all engines; protocol-unique controls appended **after** the
+common set; no control lost to width truncation; narrow-terminal behavior
+preserved. Common concepts: `[q]` Quit, `[o]` Ops, `[l]` Lat, `[n]` Name,
+`[c]` cNode, `[v]` View, `[t]` Tenant, `[i]` VIP, `[x]` Exit drill,
+`[space]` Refresh. NFSv4.1 keeps unique `[4]` native telemetry and `[h]` v4
+hosts. **VIP standardizes on `[i]`, never `[v]`.** No key means two concepts on
+different engines. Fold in per-engine as engines are touched; build shared
+helpers where they reduce divergence safely.
+- **Status: NOT STARTED.** Contract defined here. NVMe was the intended first
+  port but is not yet done — its current footer/keys have not been changed.
+  Per-engine deviations to be recorded under *Navigation deviations* below as
+  each engine is audited.
+
+### FR-B — Latency unit correctness and display
+Verify each latency's **source unit from code/API evidence** (VAST returns
+s / ms / µs / ns / cumulative sums by endpoint), check every conversion
+mathematically, distinguish native vs derived, avoid double conversion, never
+render `0` for a meaningful sub-precision value. Prefer ms for user-facing
+latency where it reads better; keep µs where values are consistently sub-ms.
+Make the unit obvious in labels; one consistent policy across protocols where
+practical; unit tests with literal ms/µs/ns source values.
+- **Status: AUDITED (code), fix NOT applied.** NVMe latency trace: source props
+  are BlockMetrics/VolumeMetrics `*_latency__avg`; `apply_op_rates` assigns them
+  straight to `avg_us` with **no conversion** (assumes microseconds, the
+  monitor-API convention consistent with D-003); combined latency renders as
+  `avg_us / 1000 → "%.2f ms"`, per-op via `format_latency_us`. Gaps to close:
+  (1) confirm the µs source assumption against a known-unit metric on the real
+  cluster; (2) `"%.2f ms"` renders `0.00 ms` for sub-10 µs values — prefer a
+  formatter that drops to µs below ~1 ms. No code changed yet.
+
+### FR-C — Block fabric percentage correction
+BLOCK/NVMe: Fabric activity must **not** be in the primary workload-mix
+denominator (READ/WRITE/metadata only). Fabric stays visible as its own
+metric/bar. Verify current math first; tests proving the old denominator is
+wrong and the new one is right.
+- **Status: DONE.** `block_workload_mix` now excludes fabric/admin from the
+  read/write/reclaim denominator; Fabric renders as a separate "of all activity"
+  indicator. `tests/test_nvme_tcp.py` covers read-only/write-only/mixed/
+  mixed+large-fabric/reclaim/zero-workload+fabric/idle with literal values. Not
+  yet screen-verified on the real cluster (pending the NVMe AFTER pass).
+
+### FR-D — Testing / quality build-in
+The repo has a real suite and `./scripts/validate.sh`; unit testing is **no
+longer missing**. Goal is coverage expansion around legacy paths as they are
+refactored: every change runs the full gate (3.8 + current, zero skips,
+openssl suites actually run); new defects get regression tests; API efficiency,
+TUI render/nav, and metric/unit semantics are tested dimensions; the mock does
+not replace real-VMS validation for cluster-only semantic questions.
+- **Status:** ongoing; NVMe coverage added this phase.
+
+### Navigation deviations to normalize later (FR-A)
+Recorded as engines are audited; do not change NFS/SMB/S3 keys until their turn.
+- *(populated as each engine is audited — see NVMe audit this phase.)*
 
 ## How to resume
 

@@ -23,6 +23,7 @@ from datetime import datetime
 import openmetrics
 import vast_api_log
 import vast_common
+import vast_drill
 from tui_layout import (
     display_width, join_columns, pad_display, format_fixed_number,
     format_scaled_metric, truncate_display, c, set_color, set_unicode, glyph_set,
@@ -166,6 +167,11 @@ DRILL_OBJECTS = []
 DRILL_MONITORS = []
 LAST_DRILL_ROWS = []
 DRILL_ERROR = None
+STARTUP_STATUS = None       # transient per-phase message during blocking startup
+# Drill re-poll throttle: object-scoped block families publish ~1/min, so a 5 s
+# tick re-fetched identical payloads. Space bar forces a refresh.
+_DRILL_MIN_QUERY_INTERVAL = 15.0
+_DRILL_LAST_QUERY_AT = 0.0
 RUN_STARTED_AT = None
 RUN_STATS = {}
 _COLOR = False
@@ -807,9 +813,19 @@ def cleanup():
     global _CLEANED_UP
     if _CLEANED_UP:
         return
-    _CLEANED_UP = True
     restore_terminal()
+    # Shutdown feedback: the drain is a slow synchronous DELETE loop (and blocks
+    # signals), so announce it truthfully before blocking rather than leaving a
+    # silent pause. Count is known up front; no fake progress.
+    _pending = vast_common.pending_monitor_count()
+    if _pending:
+        print(vast_common.cleanup_message(_pending), file=sys.stderr, flush=True)
     vast_common.drain_monitors(delete_monitor)
+    # Set the guard only after the drain actually completes, so an interrupted
+    # or failed cleanup is retried by the atexit/finally backstop instead of
+    # being skipped. drain_monitors blocks signals internally, so it is not
+    # itself interruptible mid-loop.
+    _CLEANED_UP = True
     vast_api_log.close()
     openmetrics.close()
     for monitor_id, detail in vast_common.failed_deletes():
@@ -1022,16 +1038,30 @@ def _ops_for_keys(rows, keys):
 
 
 def block_workload_mix(rows):
-    """Return (read_pct, write_pct, reclaim_pct, fabric_pct) of total ops."""
-    total = sum(as_float(r["ops_sec"]) or 0 for r in rows)
-    if total <= 0:
-        return 0.0, 0.0, 0.0, 0.0
-    return (
-        _ops_for_keys(rows, _READ_MIX_KEYS) / total * 100,
-        _ops_for_keys(rows, _WRITE_MIX_KEYS) / total * 100,
-        _ops_for_keys(rows, _RECLAIM_MIX_KEYS) / total * 100,
-        _ops_for_keys(rows, _FABRIC_MIX_KEYS) / total * 100,
-    )
+    """Return (read_pct, write_pct, reclaim_pct, fabric_pct).
+
+    read/write/reclaim are shares of the actual I/O **workload** (read + write +
+    reclaim). Fabric and admin overhead are excluded from that denominator, so a
+    burst of fabric traffic can no longer shrink a real read/write mix (an 80/20
+    read/write workload used to render 16%/4% once fabric ops swamped the total).
+    read + write + reclaim therefore sum to 100 whenever any workload exists, and
+    are all 0 when there is none.
+
+    fabric_pct is reported separately, as fabric's share of *all* activity
+    (workload + fabric), so it stays visible and quantified without competing in
+    the workload denominator.
+    """
+    read_ops = _ops_for_keys(rows, _READ_MIX_KEYS)
+    write_ops = _ops_for_keys(rows, _WRITE_MIX_KEYS)
+    reclaim_ops = _ops_for_keys(rows, _RECLAIM_MIX_KEYS)
+    fabric_ops = _ops_for_keys(rows, _FABRIC_MIX_KEYS)
+    workload = read_ops + write_ops + reclaim_ops
+    total = workload + fabric_ops
+    read_pct = read_ops / workload * 100 if workload > 0 else 0.0
+    write_pct = write_ops / workload * 100 if workload > 0 else 0.0
+    reclaim_pct = reclaim_ops / workload * 100 if workload > 0 else 0.0
+    fabric_pct = fabric_ops / total * 100 if total > 0 else 0.0
+    return read_pct, write_pct, reclaim_pct, fabric_pct
 
 
 def cluster_delta_summary(deltas):
@@ -1290,8 +1320,22 @@ def exit_drill_mode():
     DRILL_ERROR = None
 
 
-def fetch_drill_query():
-    global LAST_DRILL_ROWS
+def fetch_drill_query(force=False):
+    """Re-query the active drill monitors, throttled unless *force*.
+
+    Object-scoped block families publish a new sample ~1/min, so re-querying the
+    per-object drill monitors on every 5 s tick just re-fetched identical
+    payloads. The space bar (manual_refresh) passes force=True. The cluster
+    headline panel keeps its own every-tick cadence in poll_tick.
+    """
+    global LAST_DRILL_ROWS, _DRILL_LAST_QUERY_AT
+    if not DRILL_MODE:
+        return
+    now = time.monotonic()
+    if (not force and LAST_DRILL_ROWS
+            and now - _DRILL_LAST_QUERY_AT < _DRILL_MIN_QUERY_INTERVAL):
+        return
+    _DRILL_LAST_QUERY_AT = now
     poll_time = time.monotonic()
     drill_rows = []
     for ops_ids, proto_id, obj_name in DRILL_MONITORS:
@@ -1520,10 +1564,14 @@ def _render_health_panel(rows, width):
 
     print(box_row(c("Workload  ", _DIM) + c(workload_type, _YELLOW), width))
 
+    # Workload mix: read/write/reclaim as shares of actual I/O (sum to 100%).
     print(box_row(c(f"{'Read':<10}", _DIM) + workload_bar(read_pct, 22, _BCYAN), width))
     print(box_row(c(f"{'Write':<10}", _DIM) + workload_bar(write_pct, 22, _BYELLOW), width))
     print(box_row(c(f"{'Reclaim':<10}", _DIM) + workload_bar(reclaim_pct, 22, _BMAGENTA), width))
-    print(box_row(c(f"{'Fabric':<10}", _DIM) + workload_bar(fabric_pct, 22, _BBLUE), width))
+    # Fabric/admin overhead is a separate indicator, not part of the workload
+    # mix above; shown as a share of all activity so it never distorts read/write.
+    print(box_row(c(f"{'Fabric':<10}", _DIM) + workload_bar(fabric_pct, 22, _BBLUE)
+                  + c("  of all activity", _DIM), width))
 
     if deltas:
         parts = []
@@ -1659,18 +1707,16 @@ def _render_path_table(width):
 
 
 def _render_help_bar(width):
+    # Common controls first (shared canonical order q / c / i / x / space),
+    # then NVMe-specific controls (Host drill, Reset stats).
     legend = (
         c("[q]", _BWHITE) + c(" Quit ", _DIM)
-        + c(" | ", _DIM)
-        + c("[r]", _BWHITE) + c(" Reset Stats ", _DIM)
-        + c(" | ", _DIM)
-        + c("[v]", _BWHITE) + c(" Toggle VIP View ", _DIM)
-        + c(" | ", _DIM)
-        + c("[c]", _BWHITE) + c(" Toggle cNode View ", _DIM)
-        + c(" | ", _DIM)
-        + c("[h]", _BWHITE) + c(" Toggle Host View ", _DIM)
-        + c(" | ", _DIM)
-        + c("[p]", _BWHITE) + c(" Return to Main", _DIM)
+        + c("|", _DIM) + c("[c]", _BWHITE) + c(" cNode ", _DIM)
+        + c("|", _DIM) + c("[i]", _BWHITE) + c(" VIP ", _DIM)
+        + c("|", _DIM) + c("[x]", _BWHITE) + c(" Exit drill ", _DIM)
+        + c("|", _DIM) + c("[space]", _BWHITE) + c(" Refresh ", _DIM)
+        + c("|", _DIM) + c("[h]", _BWHITE) + c(" Host ", _DIM)
+        + c("|", _DIM) + c("[r]", _BWHITE) + c(" Reset stats", _DIM)
     )
     print(c(_H * width, _DIM))
     print(c("  ", _DIM) + legend, flush=True)
@@ -1681,6 +1727,13 @@ def poll_tick():
     fetch_monitor_query()
     if DRILL_MODE:
         fetch_drill_query()
+
+
+def manual_refresh():
+    """Space-bar refresh: cluster monitors plus a forced (un-throttled) drill query."""
+    fetch_monitor_query()
+    if DRILL_MODE:
+        fetch_drill_query(force=True)
 
 
 def render_screen():
@@ -1697,10 +1750,6 @@ def render_screen():
 
 def _render_frame():
     rows = LAST_ROWS
-    if not rows:
-        print(f"Waiting for data…  VMS={VMS}:{PORT}  cluster={CLUSTER_NAME}")
-        return
-
     width = min(shutil.get_terminal_size((120, 40)).columns, 120)
 
     title = (
@@ -1725,6 +1774,17 @@ def _render_frame():
         meta += c(f"   {os_label}", _DIM)
     print(c("  ", _DIM) + meta)
     print(c(_H * width, _DIM))
+
+    # Startup / waiting frame: keep the help bar (footer) - never a bare early
+    # return that drops the navigation controls.
+    if STARTUP_STATUS or not rows:
+        if STARTUP_STATUS:
+            print(c("  " + STARTUP_STATUS, _BYELLOW))
+        else:
+            print(c(f"  Waiting for data…  VMS={VMS}:{PORT}"
+                    f"  cluster={CLUSTER_NAME or '-'}", _DIM))
+        _render_help_bar(width)
+        return
 
     if DRILL_MODE in ("vip", "cnode", "host"):
         _render_health_panel(rows, width)
@@ -1783,6 +1843,32 @@ def discover_metrics():
     print("\nUse --no-color when piping output.\n")
 
 
+def _set_startup_status(text):
+    global STARTUP_STATUS
+    STARTUP_STATUS = text
+
+
+def initialize():
+    """Blocking startup behind per-phase status frames (see vast_drill)."""
+    def _connect():
+        global CLUSTER_ID, CLUSTER_NAME
+        CLUSTER_ID, CLUSTER_NAME = get_current_cluster()
+        _capture_cluster_os()
+
+    def _prepare():
+        configure_volume_scope(ARGS)
+        create_cluster_monitors()
+
+    def _gather():
+        fetch_monitor_query()
+
+    vast_drill.with_startup_status(_set_startup_status, render_screen, [
+        (f"Connecting to {VMS}:{PORT}, please stand by...", _connect),
+        (lambda: f"Preparing metrics on {CLUSTER_NAME or VMS}, please stand by...", _prepare),
+        ("Gathering initial metrics, please stand by...", _gather),
+    ])
+
+
 def main():
     global OPS_MONITOR_IDS, PROTO_MONITOR_ID, CLUSTER_ID, CLUSTER_NAME, DRILL_ERROR
 
@@ -1795,11 +1881,7 @@ def main():
 
     ensure_csv_file()
     setup_keyboard()
-    CLUSTER_ID, CLUSTER_NAME = get_current_cluster()
-    _capture_cluster_os()
-    configure_volume_scope(ARGS)
-    create_cluster_monitors()
-    fetch_monitor_query()
+    initialize()
     render_screen()
 
     next_refresh_time = time.time() + REFRESH_SECONDS
@@ -1811,18 +1893,23 @@ def main():
             if "\x03" in chars or "q" in ch:
                 break
             refresh_needed = True
-            if "r" in ch:
+            if " " in chars:
+                # Space: forced (un-throttled) refresh, standardized across engines.
+                vast_common.guarded_poll(manual_refresh, render_screen)
+                next_refresh_time = time.time() + REFRESH_SECONDS
+                continue
+            elif "r" in ch:
                 reset_session_stats()
-            elif "p" in ch:
+            elif "x" in ch:
                 exit_drill_mode()
-            elif "v" in ch:
+            elif "i" in ch:
                 if DRILL_MODE == "vip":
                     exit_drill_mode()
                 else:
                     exit_drill_mode()
                     enter_drill_mode("vip")
                     if DRILL_MODE:
-                        fetch_drill_query()
+                        fetch_drill_query(force=True)
             elif "c" in ch:
                 if DRILL_MODE == "cnode":
                     exit_drill_mode()
@@ -1830,7 +1917,7 @@ def main():
                     exit_drill_mode()
                     enter_drill_mode("cnode")
                     if DRILL_MODE:
-                        fetch_drill_query()
+                        fetch_drill_query(force=True)
             elif "h" in ch:
                 if DRILL_MODE == "host":
                     exit_drill_mode()
@@ -1838,7 +1925,7 @@ def main():
                     exit_drill_mode()
                     enter_drill_mode("host")
                     if DRILL_MODE:
-                        fetch_drill_query()
+                        fetch_drill_query(force=True)
             else:
                 refresh_needed = False
             if refresh_needed:

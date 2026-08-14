@@ -272,6 +272,7 @@ LAST_ROWS = {"data": [], "stateful": [], "state": [], "pnfs": [],
 LAST_SAMPLE = "-"
 DRILL_MODE = DRILL_ERROR = None
 DRILL_STATUS = None         # transient "Loading..." message during drill setup
+STARTUP_STATUS = None       # transient per-phase message during blocking startup
 DRILL_OBJECTS = []
 DRILL_MONITORS = []
 LAST_DRILL_ROWS = []
@@ -1712,6 +1713,31 @@ def _set_drill_status(text):
     DRILL_STATUS = text
 
 
+def _set_startup_status(text):
+    global STARTUP_STATUS
+    STARTUP_STATUS = text
+
+
+def initialize():
+    """Blocking startup behind per-phase status frames (see vast_drill)."""
+    def _connect():
+        global CLUSTER_ID, CLUSTER_NAME
+        CLUSTER_ID, CLUSTER_NAME = get_current_cluster()
+        _capture_cluster_os()
+
+    def _prepare():
+        create_headline_monitors()
+
+    def _gather():
+        fetch_monitor_query()
+
+    vast_drill.with_startup_status(_set_startup_status, render_screen, [
+        (f"Connecting to {VMS}:{PORT}, please stand by...", _connect),
+        (lambda: f"Preparing metrics on {CLUSTER_NAME or VMS}, please stand by...", _prepare),
+        ("Gathering initial metrics, please stand by...", _gather),
+    ])
+
+
 def _set_exporter_status(text):
     global EXPORTER_STATUS
     EXPORTER_STATUS = text
@@ -1841,7 +1867,7 @@ def _render_frame():
     width = _frame_width()
     title = (
         c("  VAST NFSv41", _BCYAN) + c(" opstat", _BWHITE) + c(f" v{VERSION}", _DIM)
-        + f"   VMS {c(f'{VMS}:{PORT}', _BWHITE)}   cluster {c(CLUSTER_NAME, _BWHITE)}"
+        + f"   VMS {c(f'{VMS}:{PORT}', _BWHITE)}   cluster {c(CLUSTER_NAME or '?', _BWHITE)}"
         + c(f"   refresh {REFRESH_SECONDS}s", _DIM)
     )
     if EXPORTER_MODE:
@@ -1866,7 +1892,11 @@ def _render_frame():
     # rendered by this common path for every mode - a drill panel returning
     # early used to take the footer with it, leaving drill modes with no
     # visible controls at all.
-    if EXPORTER_MODE or EXPORTER_STATUS:
+    if STARTUP_STATUS:
+        print(box_top("STARTING", width))
+        print(box_row(c(STARTUP_STATUS, _YELLOW), width))
+        print(box_bottom(width))
+    elif EXPORTER_MODE or EXPORTER_STATUS:
         _render_exporter_panels(width)
     elif DRILL_MODE or DRILL_STATUS:
         _render_drill_panel(width)
@@ -2607,9 +2637,19 @@ def cleanup():
     global _CLEANED_UP
     if _CLEANED_UP:
         return
-    _CLEANED_UP = True
     restore_terminal()
+    # Shutdown feedback: the drain is a slow synchronous DELETE loop (and blocks
+    # signals), so announce it truthfully before blocking rather than leaving a
+    # silent pause. Count is known up front; no fake progress.
+    _pending = vast_common.pending_monitor_count()
+    if _pending:
+        print(vast_common.cleanup_message(_pending), file=sys.stderr, flush=True)
     vast_common.drain_monitors(delete_monitor)
+    # Set the guard only after the drain actually completes, so an interrupted
+    # or failed cleanup is retried by the atexit/finally backstop instead of
+    # being skipped. drain_monitors blocks signals internally, so it is not
+    # itself interruptible mid-loop.
+    _CLEANED_UP = True
     vast_api_log.close()
     openmetrics.close()
     for monitor_id, detail in vast_common.failed_deletes():
@@ -2771,11 +2811,7 @@ def main():
         return 0
 
     setup_keyboard()
-    CLUSTER_ID, CLUSTER_NAME = get_current_cluster()
-    _capture_cluster_os()
-    create_headline_monitors()
-
-    fetch_monitor_query()
+    initialize()
     render_screen()
     next_refresh = time.time() + REFRESH_SECONDS
 

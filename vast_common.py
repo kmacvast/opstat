@@ -514,10 +514,47 @@ def forget_monitor(monitor_id):
 
 
 def drain_monitors(delete_fn):
-    """Delete every still-registered monitor using engine-supplied delete_fn."""
-    for monitor_id in list(_CREATED_MONITORS):
-        delete_fn(monitor_id)
-        _CREATED_MONITORS.discard(monitor_id)
+    """Delete every still-registered monitor using engine-supplied delete_fn.
+
+    The drain is a slow synchronous DELETE loop (~1 s per monitor on a real
+    cluster). Termination signals are blocked for its duration so a SIGTERM,
+    a second SIGINT, or a PTY hang-up SIGHUP arriving mid-drain cannot re-enter
+    the signal handler and ``sys.exit`` out of the loop, orphaning the monitors
+    it had not yet reached. Any such signal is deferred and delivered once the
+    mask is restored, so a clean shutdown still happens — after every monitor is
+    gone. The previous mask is always restored, so this is safe to call from
+    tests that keep running.
+    """
+    block = getattr(signal, "pthread_sigmask", None)
+    term_sigs = [getattr(signal, n) for n in ("SIGINT", "SIGTERM", "SIGHUP")
+                 if hasattr(signal, n)]
+    previous_mask = None
+    if block is not None and term_sigs:
+        try:
+            previous_mask = block(signal.SIG_BLOCK, term_sigs)
+        except (ValueError, OSError):
+            previous_mask = None
+    try:
+        for monitor_id in list(_CREATED_MONITORS):
+            delete_fn(monitor_id)
+            _CREATED_MONITORS.discard(monitor_id)
+    finally:
+        if previous_mask is not None:
+            try:
+                block(signal.SIG_SETMASK, previous_mask)
+            except (ValueError, OSError):
+                pass
+
+
+def pending_monitor_count():
+    """How many session monitors are still registered (awaiting teardown)."""
+    return len(_CREATED_MONITORS)
+
+
+def cleanup_message(count):
+    """Truthful shutdown banner for the monitor drain (no fake progress)."""
+    noun = "monitor" if count == 1 else "monitors"
+    return "Cleaning up %d temporary %s, please stand by..." % (count, noun)
 
 
 def record_failed_delete(monitor_id, detail):
