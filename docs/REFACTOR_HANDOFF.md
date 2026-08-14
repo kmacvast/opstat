@@ -60,19 +60,17 @@ logs, or in this handoff.
 
 | Item | Value at time of writing |
 |---|---|
-| Branch | `refactor/tui-performance` |
+| Branch | `refactor/tui-performance-local-continuation-wip` |
 | Base | `main` @ `77549f06` (unchanged throughout) |
-| Commits ahead of `main` | 22 |
-| HEAD | `9c6d6e5` — *NFSv4.1: loading interstitial, exporter-backed VIEW drill, presentation fixes* |
-| Published on origin | up to `9c091d0`; **`9c6d6e5` was local-only when this was written** |
-| Tests | 400 collected, all passing on Python 3.8 and 3.12 |
+| WIP checkpoint | `779cd6e` — *wip: preserve interrupted opstat refactor state* (work-laptop snapshot; also on `handoff/work-laptop-wip-20260814`) |
+| HEAD | `03f72a2` + a large **uncommitted** working tree (this continuation pass: FR-A/FR-B, NVMe ranking+batching, exporter-fixture fix, docs) |
+| Tests | 504 collected, all passing, 0 skipped, on Python 3.8 and the current interpreter |
 
 Determine the live state rather than trusting the table:
 
 ```bash
 git rev-parse --abbrev-ref HEAD
 git rev-parse HEAD
-git rev-parse origin/refactor/tui-performance
 git log --oneline --reverse origin/main..HEAD
 git status --short
 ```
@@ -365,43 +363,81 @@ error, per engine) and new waiting/startup footer cases in
 `tests/test_render_navigation.py` guard it.
 
 **Mock/unit-verified only.** The actual startup appearance on var203 is
-unverified this pass (no real run backed it); real-cluster verification is the
-owner's step. Consider promoting the invariant to
+unverified; real-cluster verification is the owner's step (in the work-laptop
+validation package). The invariant is now recorded in
 [.claude/rules/tui-behavior.md](../.claude/rules/tui-behavior.md).
 
-**Out of scope, recorded here for follow-up:**
-- **Quit-time cleanup frame.** `drain_monitors` now blocks signals during the
-  drain, so a slow quit is also a silent multi-second wait — it should get its
-  own `Cleaning up N monitors, please stand by...` frame. Separate change.
+**Shutdown feedback is implemented too.** `cleanup()` in every engine prints
+`Cleaning up N temporary monitors, please stand by...`
+(`vast_common.cleanup_message` / `pending_monitor_count`) to stderr before the
+slow, signal-blocking drain, so a multi-second quit is announced rather than
+silent. `tests/test_cleanup_lifecycle.py` covers the message and the count.
+
+**Still open, recorded here for follow-up:**
 - **`signal.pthread_sigmask` Windows guard.** The cleanup fix's sigmask call is
   POSIX-only. `release.yml` builds `opstat-windows-x86_64.exe` but `test.yml` is
-  Linux-only, so CI never exercises Windows. The call is already `getattr`-guarded
+  Linux-only, so CI never exercises Windows. The call is `getattr`-guarded
   (absent on Windows → skipped), but the Windows build path is untested.
-- **Exporter footer tests are order-dependent.** `test_render_navigation.py`'s
-  exporter-drill tests rely on an earlier test (`test_drill_loading`) having
-  called `init_config` to set the `HOSTVIEW`/`NFS4` collectors; run in isolation
-  (`-k exporter`) they error on `HOSTVIEW.error` (None). Pre-existing; not this
-  change. The v41 fixture should set those collectors itself.
+
+*(Resolved since first written: the exporter footer tests' order-dependence is
+fixed — the `v41` fixture now constructs the `NFS4`/`HOSTVIEW` collectors
+itself, and `pytest tests/test_render_navigation.py -k exporter` passes in
+isolation.)*
 
 ## NVMe / block status
 
-**Least refactored engine.**
+**Done (earlier passes):** keep-alive transport, single `/clusters/` fetch,
+event-driven loop, corrected sample selection, drill re-poll throttle (15 s,
+space forces), FR-C fabric-percentage correction, FR-A navigation (`[i]` VIP /
+`[x]` exit / `[space]` refresh).
 
-**Done:** keep-alive transport, single `/clusters/` fetch, event-driven loop,
-corrected sample selection.
+**Done (this pass) — drill ranking and batching, mock-proven, REAL-VMS
+VALIDATION PENDING:**
 
-**Not done:**
-- No candidate ranking — `nvme_tcp.py` head-slices `/volumes/`
-  (`[:_MAX_DRILL_OBJECTS]`), the exact defect fixed elsewhere.
-- Per-object drill monitors, not batched.
-- Does not import `vast_drill`.
+- **Ranking by activity.** `enter_drill_mode` no longer head-slices the first
+  8 objects by API order. Candidates (cnode/vip/blockhost) are ranked through
+  `vast_drill.DrillSession.rank` with a single batched rank monitor carrying
+  `BlockMetrics,read_req` + `write_req` (both cumulative counters, same
+  family), scored per object by differencing over the monitor's own time
+  series via `delta_rate_from_samples` — the bounding-samples derivation,
+  because the newest bucket is partially filled. **topn is deliberately not
+  used**: it has no protocol label ([D-007](decisions/D-007-topn-is-unusable-for-protocol-attribution.md)),
+  so it would rank NVMe candidates by all-protocol traffic. Ranking is cached
+  (5 min TTL); re-entry creates no rank monitors.
+- **Batched display monitors.** The per-op monitor *group split is preserved*
+  (a real constraint — see open-decision №3 below), but each group now covers
+  every selected object in one monitor, validated splittable-by-`object_id`
+  at entry and **falling back to the per-object layout** when the cluster
+  refuses. Cleanup covers both layouts; `tests/test_nvme_drill.py`
+  (11 tests) proves ranking, budgets, fallback and cleanup, and was proven
+  failing against the pre-change code (busy cNode at mock index 10 of 12 was
+  never selected; entry cost 65 calls).
 
-**Known API cost:** NVMe dominates every measurement — ~467–507 calls in a 30 s
-session versus 19–27 for the NFS engines, from 8 cluster monitors queried per
-refresh. `NVMe_TCP_README.md` documents that VMS cannot mix
-`BlockMetrics`/`VolumeMetrics`/`ProtoMetrics` in one monitor, so the split is at
-least partly a real constraint — but it has not been re-verified, and the
-ranking and per-object drill issues are independent of it.
+Mock-measured budgets (counts transfer to a real cluster; wall-clock does not):
+
+```text
+                              before      after
+  cnode drill entry calls     65          13    (re-entry in TTL: 10)
+  drill queries per re-poll   64          8     (one per op group + proto)
+  startup calls / monitors    9 / 8       9 / 8 (headline unchanged)
+  cluster queries per tick    8           8     (family split is real)
+```
+
+**Not done / constraints:**
+- The **headline** still queries 8 monitors per tick. Consolidation is blocked
+  by the family-mixing probe result (open-decision №3): all-BlockMetrics-ops
+  in one monitor is rejected at query time, and cross-family behavior is
+  build-inconsistent.
+- Whether a real VMS accepts **multi-`object_id` BlockMetrics/ProtoMetrics
+  monitors at cnode/vip/blockhost scope is unproven** — the mock models the
+  documented batch shape, the engine probes and falls back at entry, and the
+  work-laptop package carries the real probe. Until then the batch layout is
+  IMPLEMENTED / REAL-VMS VALIDATION PENDING.
+- `/blockhosts/` is **deliberately not modeled in the mock** (no real API
+  evidence for its response shape); the host drill shares the cnode/vip code
+  path and is exercised only on a real cluster.
+- `--volumes` scoping unchanged (its VolumeMetrics monitors were already
+  per-scope).
 
 ---
 
@@ -434,24 +470,26 @@ ranking correctness.
 
 ## Test architecture
 
-428 tests, green on Python 3.8 and the current interpreter (validated on 3.14.6
-and 3.8 this pass). The SMB/S3 drill port added `tests/test_smb_s3_drill.py`
-(28 tests).
+504 tests, green on Python 3.8 and the current interpreter, 0 skipped
+(re-derive with `./scripts/validate.sh`; the gate's collection floor is 465).
 
 | Suite | Tests | Covers |
 |---|---|---|
-| `test_render_navigation.py` | 122 | Footer present in every mode and width; frame never exceeds terminal; other engines guarded |
-| `test_smb_s3_drill.py` | 28 | SMB/S3 view/tenant/bucket drill port: entry budget, ranking >32, rank cache, throttle, force bypass, batch fallback, cleanup (success + query-error), VIP topn/filtering/topn-only fallback, drill+startup loading frames |
+| `test_render_navigation.py` | 150 | Footer present in every mode and width; frame never exceeds terminal; waiting/startup frames; **FR-A canonical navigation contract across all five engines**; exporter drills (self-initializing fixture — passes in isolation) |
 | `test_nfs41_discovery.py` | 63 | Catalog reader, op detection, concept scan, prop probe, evidence-gated panels, all discovery report sections |
 | `test_drill_semantics.py` | 38 | Partial-newest-sample defects, ranking correctness, entry call budgets, cNode batching, throttle |
 | `test_nfs4_native.py` | 29 | Exporter parsing, warm-up, rate/latency derivation, counter reset, host_view filtering, cost isolation |
+| `test_smb_s3_drill.py` | 28 | SMB/S3 view/tenant/bucket drill port: entry budget, ranking >32, rank cache, throttle, force bypass, batch fallback, cleanup (success + query-error), VIP topn/filtering/topn-only fallback, drill+startup loading frames |
 | `test_vast_common.py` | 23 | Shared helpers |
 | `test_api_efficiency.py` | 22 | Keep-alive reuse and retry, startup budget, merged-monitor budgets and fallbacks |
-| `test_s3_helpers.py` | 20 | S3 helpers |
+| `test_s3_helpers.py` | 21 | S3 helpers incl. FR-B ms/µs formatter boundaries |
 | `test_drill_loading.py` | 19 | Loading interstitial ordering; rebuilt VIEW drill |
+| `test_startup_loading.py` | 15 | Three-phase startup interstitial: frame before each blocking step, clear on error, host-not-cluster first message, all five engines |
 | `test_wizard.py` / `test_opstat_cli.py` | 14 / 13 | Wizard and CLI |
+| `test_nvme_tcp.py` | 13 | FR-C fabric percentages (literal values), drill throttle + forced refresh, FR-A footer, FR-B latency passthrough / zero-collapse |
+| `test_nvme_drill.py` | 11 | NVMe drill ranking (busy cNode planted at index 10 of 12), entry/re-poll budgets, batch splitting, per-object fallback, rank cache, cleanup in both layouts |
 | `test_globals_hygiene.py` | 10 | AST check: no function assigns an ALL_CAPS module global without `global` |
-| `test_tui_layout.py`, `test_openmetrics.py`, `test_smb_helpers.py`, `test_nfs_v3_helpers.py` | 9 / 8 / 7 / 3 | Layout, export, protocol helpers |
+| `test_tui_layout.py`, `test_openmetrics.py`, `test_cleanup_lifecycle.py`, `test_smb_helpers.py`, `test_nfs_v3_helpers.py` | 9 / 8 / 8 / 7 / 3 | Layout, export, cleanup lifecycle (signal-blocked drain, guard ordering, shutdown message), protocol helpers |
 
 ### The mock
 
@@ -501,14 +539,13 @@ Verified against the repository at the time of writing.
 
 ### Outstanding
 
-1. **NVMe ranking and drill batching.** cNode/host/VIP drills head-slice the
-   object list to the first 8 (`enter_drill_mode`, no activity ranking) and
-   create several monitors per object (per-op BlockMetrics + proto), a
-   per-object query explosion with no throttle or forced refresh. Port the
-   ranking/throttle/cache/force parts of `vast_drill` (the *display* monitors
-   must stay multi-family — see the family-split finding below). ~467+ calls per
-   30 s session. **Not yet done** — real BEFORE baseline captured (headline uses
-   8 monitors: 5 per-op BlockMetrics + 1 fabric + 1 proto + volume).
+1. **NVMe ranking and drill batching — IMPLEMENTED, REAL-VMS VALIDATION
+   PENDING.** See *NVMe / block status*: activity ranking (no head-slice),
+   batched display monitors with per-object fallback, mock-measured 65 → 13
+   entry calls and 64 → 8 re-poll queries. What remains real-cluster-only:
+   whether var203 accepts multi-`object_id` monitors at cnode/vip/blockhost
+   scope, the blockhost drill end-to-end, and the AFTER call measurement —
+   all in the work-laptop validation package.
 3. **NFSv3 VIEW drill** still uses `ViewMetrics`. The NFSv4.1 rebuild on
    `host_view` may be portable — `host_view` carries `protocol=NFS3`.
 4. **Delegation diagnostic** not implemented. Needs a path-entry interaction.
@@ -695,10 +732,29 @@ preserved. Common concepts: `[q]` Quit, `[o]` Ops, `[l]` Lat, `[n]` Name,
 hosts. **VIP standardizes on `[i]`, never `[v]`.** No key means two concepts on
 different engines. Fold in per-engine as engines are touched; build shared
 helpers where they reduce divergence safely.
-- **Status: NOT STARTED.** Contract defined here. NVMe was the intended first
-  port but is not yet done — its current footer/keys have not been changed.
-  Per-engine deviations to be recorded under *Navigation deviations* below as
-  each engine is audited.
+- **Status: DONE locally (all five engines); real-VMS nav sanity pending.**
+  The contract lives in code: `vast_drill.CANONICAL_CONTROLS` +
+  `nav_controls()` (canonical order/labels, protocol extras appended, raises
+  on a non-canonical key) + `nav_legend()` (one shared renderer). Every
+  engine's `_NAV_CONTROLS` is built through it. NVMe was normalized first
+  (`i`/`x`/`space`; stale `v`/`p` help and README text corrected); NFSv4.1's
+  `[4]`/`[h]` moved after the common set; NFSv3's htop-style legend
+  (`` `q`uit ``, `[spc]refresh`, `x=cluster`) was restyled to the bracket
+  contract with keys unchanged, and its footer now truncates legibly at
+  narrow widths. Guarded by the FR-A section of `test_render_navigation.py`
+  (canonical order/labels per engine, VIP-never-v, exit-never-p, shared
+  triple, legend rendering).
+
+### Navigation deviations (deliberate, documented)
+- **S3 `[b]` Bucket** is protocol-specific and appended after the common set
+  (previously between `[c]` and `[t]`). It is deliberately *not* presented in
+  the `[v]` View slot even though the bucket drill is ViewMetrics-backed: the
+  key a user presses is `b`, and the label must match the key.
+- **NFSv3 has no `[n]` Name sort** (its sorts are `r`pc/`o`ps/`l`at/`w`ork);
+  the contract standardizes what exists rather than inventing controls.
+  `[r]`/`[w]` are NFSv3-specific and appended after the common set.
+- **NVMe `[r]` Reset stats** reuses NFSv3's `[r]` key for a different concept.
+  Pre-existing collision, both protocol-specific (never co-visible), kept.
 
 ### FR-B — Latency unit correctness and display
 Verify each latency's **source unit from code/API evidence** (VAST returns
@@ -708,25 +764,50 @@ render `0` for a meaningful sub-precision value. Prefer ms for user-facing
 latency where it reads better; keep µs where values are consistently sub-ms.
 Make the unit obvious in labels; one consistent policy across protocols where
 practical; unit tests with literal ms/µs/ns source values.
-- **Status: AUDITED (code), fix NOT applied.** NVMe latency trace: source props
-  are BlockMetrics/VolumeMetrics `*_latency__avg`; `apply_op_rates` assigns them
-  straight to `avg_us` with **no conversion** (assumes microseconds, the
-  monitor-API convention consistent with D-003); combined latency renders as
-  `avg_us / 1000 → "%.2f ms"`, per-op via `format_latency_us`. Gaps to close:
-  (1) confirm the µs source assumption against a known-unit metric on the real
-  cluster; (2) `"%.2f ms"` renders `0.00 ms` for sub-10 µs values — prefer a
-  formatter that drops to µs below ~1 ms. No code changed yet.
+- **Status: AUDIT COMPLETE (all five engines + exporter paths); two local
+  defects fixed; unproven source units listed for the var203 package.**
+
+  Full audit of every user-visible latency path. No ns-sourced value exists
+  anywhere in the code, so no ns conversion exists (or needs tests). The two
+  display defects found were fixed; no *source-unit* conversion was changed
+  anywhere.
+
+  | Engine / panel | Source (family, field) | Native unit | Evidence | Conversion → display |
+  |---|---|---|---|---|
+  | NFSv3 op table + combined | `NfsMetrics,nfs_{op}_latency__avg` (monitor) | µs | Monitor-API convention; real-VMS screens validated by owner | none → `N µs` (unit-labeled columns) |
+  | NFSv4.1 dashboard | `ProtoMetrics NFS4Common *_latency__avg` + NfsMetrics supplement | **µs, proven** | [D-003](decisions/D-003-nfs4metrics-latency-is-microseconds.md) cross-family 0.92 agreement | `format_latency_us` auto µs/ms |
+  | NFSv4.1 native drill | `Nfs4Metrics` `_sum`/`_count` deltas | **µs, proven** | [D-002](decisions/D-002-nfs4metrics-counters-are-cumulative.md)/[D-003](decisions/D-003-nfs4metrics-latency-is-microseconds.md) | derived avg = Δsum/Δcount → `format_latency_us` |
+  | NFSv4.1 hosts/views drills | exporter `host_view` `latency` gauge | **UNPROVEN** — assumed µs (`latency_us` field) | none; no unit metadata in the exposition | none → `format_latency_us` |
+  | SMB rows + drills | `ProtoMetrics SMBCommon *_latency__avg`, View/TenantMetrics latency | µs (assumed) | Same ProtoMetrics family as the proven NFS4Common case; not per-op proven | none → `format_latency_us` |
+  | S3 rows + health | `ProtoMetrics S3Common` / `S3Metrics *_latency__avg`, ViewMetrics | µs (assumed) | As SMB | `format_latency_ms`: ms at ≥5 µs, µs below (**fixed** — was `0.00 ms` for sub-5 µs) |
+  | NVMe op table + drills | `BlockMetrics`/`VolumeMetrics *_latency__avg` | µs (assumed) | Monitor-API convention (consistent with D-003); **unconfirmed on-cluster** | none → `format_latency_us` |
+  | NVMe combined header | weighted read/write `avg_us` | as above | — | `format_latency_us` (**fixed** — was hand-`/1000` `"%.2f ms"`, so sub-10 µs read `0.00 ms`) |
+
+  Zero-vs-unavailable: every formatter returns `-` for no-data, and
+  counter-based ops gate latency on ops evidence (a first poll shows `-`, not
+  a fake value) — covered by literal tests in `test_nvme_tcp.py`,
+  `test_s3_helpers.py`, `test_tui_layout.py`.
+
+  **Unproven source units (var203 package items):** `host_view` `latency`
+  gauge; the NVMe BlockMetrics/VolumeMetrics µs assumption; SMB/S3
+  per-op corroboration. Each is checkable by comparing against a known-µs
+  metric on the same cluster under load. Until then those displays are
+  UNVERIFIED, not wrong — behavior unchanged.
 
 ### FR-C — Block fabric percentage correction
 BLOCK/NVMe: Fabric activity must **not** be in the primary workload-mix
 denominator (READ/WRITE/metadata only). Fabric stays visible as its own
 metric/bar. Verify current math first; tests proving the old denominator is
 wrong and the new one is right.
-- **Status: DONE.** `block_workload_mix` now excludes fabric/admin from the
-  read/write/reclaim denominator; Fabric renders as a separate "of all activity"
-  indicator. `tests/test_nvme_tcp.py` covers read-only/write-only/mixed/
-  mixed+large-fabric/reclaim/zero-workload+fabric/idle with literal values. Not
-  yet screen-verified on the real cluster (pending the NVMe AFTER pass).
+- **Status: DONE locally; real screen verification pending.**
+  `block_workload_mix` excludes fabric/admin from the read/write/reclaim
+  denominator; Fabric renders as a separate `of all activity` indicator.
+  Render audit confirmed the math and the panel agree end-to-end. There is no
+  "metadata" workload category in the BlockMetrics op set (data / reclaim /
+  fabric / admin only), so no metadata share is shown — inventing one would
+  fabricate telemetry. `tests/test_nvme_tcp.py` covers read-only/write-only/
+  mixed/mixed+large-fabric/reclaim/zero-workload+fabric/idle with literal
+  values. Real BLOCK screen check is in the work-laptop package.
 
 ### FR-D — Testing / quality build-in
 The repo has a real suite and `./scripts/validate.sh`; unit testing is **no
@@ -735,11 +816,11 @@ refactored: every change runs the full gate (3.8 + current, zero skips,
 openssl suites actually run); new defects get regression tests; API efficiency,
 TUI render/nav, and metric/unit semantics are tested dimensions; the mock does
 not replace real-VMS validation for cluster-only semantic questions.
-- **Status:** ongoing; NVMe coverage added this phase.
-
-### Navigation deviations to normalize later (FR-A)
-Recorded as engines are audited; do not change NFS/SMB/S3 keys until their turn.
-- *(populated as each engine is audited — see NVMe audit this phase.)*
+- **Status:** ongoing by design. This phase: `test_nvme_drill.py` (ranking/
+  batching/fallback/cleanup, proven failing pre-change), FR-A contract tests
+  across all engines, FR-B literal-unit tests, exporter-fixture isolation
+  fix, collection floor raised 395 → 465 (suite at 504). The gate is the
+  quality bar; coverage grows with each legacy path touched.
 
 ## How to resume
 

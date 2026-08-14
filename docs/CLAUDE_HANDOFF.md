@@ -1,288 +1,121 @@
- M tests/test_s3_helpers.py
- M vast_common.py
- M vast_drill.py
-?? tests/test_cleanup_lifecycle.py
-?? tests/test_nvme_tcp.py
-?? tests/test_smb_s3_drill.py
-?? tests/test_startup_loading.py
-(venv) kmac@macbook:~/git/opstat [refactor/tui-performance]$ git branch --show-current
-refactor/tui-performance
-(venv) kmac@macbook:~/git/opstat [refactor/tui-performance]$ git rev-parse HEAD
-c67ad8fdf78b8b3008eb44e82d25fa66f2064283
-(venv) kmac@macbook:~/git/opstat [refactor/tui-performance]$ git diff --stat
-(venv) kmac@macbook:~/git/opstat [refactor/tui-performance]$ git diff --stat | cat
- docs/CLAUDE_HANDOFF.md          | 572 ++--------------------------------------
- docs/REFACTOR_HANDOFF.md        | 231 +++++++++++++++-
- nfs_v3.py                       | 115 +++++---
- nfs_v41.py                      |  52 +++-
- nvme_tcp.py                     | 165 +++++++++---
- s3.py                           | 221 ++++++++++------
- smb.py                          | 209 +++++++++------
- tests/mock_vms.py               |  20 +-
- tests/test_render_navigation.py |  57 ++++
- tests/test_s3_helpers.py        |  10 +-
- vast_common.py                  |  45 +++-
- vast_drill.py                   |  25 ++
- 12 files changed, 911 insertions(+), 811 deletions(-)
-(venv) kmac@macbook:~/git/opstat [refactor/tui-performance]$ git ls-files --others --exclude-standard
-tests/test_cleanup_lifecycle.py
-tests/test_nvme_tcp.py
-tests/test_smb_s3_drill.py
-tests/test_startup_loading.py
-(venv) kmac@macbook:~/git/opstat [refactor/tui-performance]$ git add docs/CLAUDE_HANDOFF.md; git commit -m "Updated output" ; git push
-[refactor/tui-performance 65e5c15] Updated output
- 1 file changed, 114 insertions(+), 532 deletions(-)
-Enumerating objects: 7, done.
-Counting objects: 100% (7/7), done.
-Delta compression using up to 12 threads
-Compressing objects: 100% (4/4), done.
-Writing objects: 100% (4/4), 3.05 KiB | 3.05 MiB/s, done.
-Total 4 (delta 2), reused 0 (delta 0), pack-reused 0 (from 0)
-remote: Resolving deltas: 100% (2/2), completed with 2 local objects.
-To github.com:kmacvast/opstat.git
-   c67ad8f..65e5c15  refactor/tui-performance -> refactor/tui-performance
-(venv) kmac@macbook:~/git/opstat [refactor/tui-performance]$ git pull
-remote: Enumerating objects: 7, done.
-remote: Counting objects: 100% (7/7), done.
-remote: Compressing objects: 100% (2/2), done.
-remote: Total 4 (delta 2), reused 4 (delta 2), pack-reused 0 (from 0)
-Unpacking objects: 100% (4/4), 786 bytes | 112.00 KiB/s, done.
-From github.com:kmacvast/opstat
-   65e5c15..b69fb6b  refactor/tui-performance -> origin/refactor/tui-performance
-Updating 65e5c15..b69fb6b
-Fast-forward
- docs/CLAUDE_HANDOFF.md | 214 ++++++++++++++++++++++++++++++++++++++++++++++-----------------------------------------------------------------------------------------------------------------
- 1 file changed, 61 insertions(+), 153 deletions(-)
-(venv) kmac@macbook:~/git/opstat [refactor/tui-performance]$ subl docs/CLAUDE_HANDOFF.md
-(venv) kmac@macbook:~/git/opstat [refactor/tui-performance]$ f
-(venv) kmac@macbook:~/git/opstat [refactor/tui-performance]$ git status --short
-git branch --show-current
-git rev-parse HEAD
+# opstat — cross-AI engineering handoff
 
-git switch -c handoff/work-laptop-wip-20260814
+Concise technical handoff for moving reasoning between AI assistants (Claude,
+ChatGPT, or another agent) and machines. Readable without any prior chat
+transcript. Point-in-time: verify every SHA and count against the repository
+before relying on it. Depth lives elsewhere — this file is the map:
 
-git add -- \
-  docs/CLAUDE_HANDOFF.md \
-  docs/REFACTOR_HANDOFF.md \
-  nfs_v3.py \
-  nfs_v41.py \
-  nvme_tcp.py \
-  s3.py \
-  smb.py \
-  tests/mock_vms.py \
+- [../AGENTS.md](../AGENTS.md) — the behavioral contract (governs all agents).
+- [REFACTOR_HANDOFF.md](REFACTOR_HANDOFF.md) — full branch state and evidence.
+- [decisions/](decisions/) — settled decisions; reopening one needs new
+  evidence and explicit owner approval.
 
+---
 
+## Where things stand
 
+| | |
+|---|---|
+| Branch | `refactor/tui-performance-local-continuation-wip` |
+| Last commit | `03f72a2` (on top of WIP checkpoint `779cd6e`; base `main` @ `77549f06`) |
+| Working tree | **Large uncommitted continuation pass** (see below). Do not discard; do not commit/push without explicit owner instruction |
+| Gate | `./scripts/validate.sh` → PASS: **504 collected / 504 passed / 0 skipped** on current Python and Python 3.8; doc links valid |
+| Real clusters | `var203.selab.vastdata.com` only, from the owner's **work laptop** only. `var204` unavailable until the owner says otherwise. No cluster is reachable from the personal laptop |
 
+## Objective
 
+Make `opstat` (stdlib-only Python 3.8+ terminal dashboard for VAST clusters)
+fast, API-frugal and honest: request volume is a regression dimension, panels
+are evidence-gated, zero ≠ unavailable, and nothing is displayed that the
+cluster did not return.
 
+## Complete and validated on real VMS (earlier passes)
 
+- NFSv3 + NFSv4.1 engines: merged probe-validated monitors, ranked/batched/
+  throttled drills, native NFSv4 exporter telemetry (`Nfs4Metrics`,
+  `host_view`) — semantics proven and recorded in `decisions/` D-001…D-012.
+- SMB/S3 view/tenant/bucket drills ported to `vast_drill.DrillSession`
+  (var203-validated: entry 18 → 7 calls; SMB view ranking 104 s → 9 s).
+- Cleanup-interruption fix (signal-blocked drain, guard-after-drain) across
+  all five engines.
 
+## Complete locally in the current working tree (this pass)
 
+All mock/unit-proven, on both interpreters:
 
+- **FR-A navigation, all five engines.** Canonical contract in
+  `vast_drill.CANONICAL_CONTROLS` / `nav_controls()` / shared `nav_legend()`
+  renderer. VIP=`[i]` (never `v`), exit=`[x]` (never `p`), `[space]` refresh;
+  protocol-specific controls after common ones. NFSv3's htop-style footer
+  restyled (keys unchanged); NVMe stale `v`/`p` help+README text corrected.
+  Deviations documented in REFACTOR_HANDOFF (S3 `[b]` Bucket appended after
+  common; NFSv3 lacks `[n]`; NVMe `[r]` collision noted).
+- **NVMe drill ranking + batching.** Head-slice of first 8 objects replaced by
+  activity ranking (batched BlockMetrics read_req+write_req rank monitor,
+  bounding-samples deltas, rank cache; topn deliberately unused — D-007).
+  Display monitors batched per op-group across objects with splittability
+  validation and per-object fallback. Mock-measured: entry 65 → 13 calls,
+  re-poll 64 → 8 queries. Proven failing pre-change (busy cNode at mock index
+  10 was never selected).
+- **FR-B latency audit complete** (table in REFACTOR_HANDOFF). Two display
+  defects fixed: S3 sub-5 µs no longer renders `0.00 ms`; NVMe combined
+  latency now uses the shared auto-scaling formatter. No source-unit
+  conversions changed. No ns-sourced value exists anywhere.
+- **FR-C fabric percentages**: render audit confirms math+panel agree; no
+  metadata category exists in BlockMetrics, so none is shown.
+- Exporter render tests self-initialize (pass in isolation now); collection
+  floor raised 395 → 465; startup/shutdown + navigation invariants promoted
+  into `.claude/rules/tui-behavior.md`.
 
+## IMPLEMENTED / REAL-VMS VALIDATION PENDING
 
+Implementation is done and deterministically tested; var203 only confirms:
 
+1. NVMe batch monitors accepted (multi-`object_id` at cnode/vip/blockhost
+   scope) — engine falls back per-object if not.
+2. NVMe blockhost drill end-to-end (mock deliberately does not model
+   `/blockhosts/`).
+3. NVMe real BEFORE/AFTER call counts; startup + shutdown UX appearance;
+   FR-A footers on real screens; FR-C BLOCK screen.
 
+## BLOCKED ON REAL-VMS EVIDENCE
 
+Implementation deliberately not attempted without live evidence:
 
-  tests/test_render_navigation.py \
-  tests/test_s3_helpers.py \
+1. **NVMe headline consolidation** — var203 probe showed all-BlockMetrics-ops
+   in one monitor is rejected at query time ("can't mix pr[operties]") and
+   cross-family results are build-inconsistent. Split preserved.
+2. **Unproven latency source units** — `host_view` `latency` gauge; NVMe
+   BlockMetrics/VolumeMetrics µs assumption; SMB/S3 per-op corroboration.
+   Displays unchanged and marked UNVERIFIED until compared against a known-µs
+   metric under load.
 
+Every remaining live dependency is scripted in
+[../scripts/var203_validation/](../scripts/var203_validation/) — one
+work-laptop trip answers all of it.
 
+## Outstanding work (not started)
 
+- NFSv3 VIEW drill: possible `host_view` rebuild (carries `protocol=NFS3`).
+- Delegation diagnostic (needs a path-entry interaction; D-008).
+- Background-threading question for the synchronous exporter scrape (open
+  consequence in D-005; L1).
+- Windows build path untested in CI (`pthread_sigmask` is getattr-guarded but
+  never exercised; `test.yml` is Linux-only, `release.yml` ships an .exe).
+- Logical commit breakdown + final real-VMS pass, then publication (owner).
 
+## Recommended next step
 
+Owner runs the var203 validation package from the work laptop and returns its
+output; then reconcile, split the working tree into the proposed logical
+commits (list in the session report / REFACTOR_HANDOFF), and validate on the
+real cluster before any publication.
 
+## Ground rules for any AI resuming here
 
-
-
-
-
-
-
-
-
-  vast_common.py \
-  vast_drill.py \
-  tests/test_cleanup_lifecycle.py \
-  tests/test_nvme_tcp.py \
-  tests/test_smb_s3_drill.py \
-  tests/test_startup_loading.py
-
-echo
-echo "===== STAGED STATE ====="
-git status --short
-
-echo
-echo "===== STAGED DIFFSTAT ====="
-git diff --cached --stat
-
-echo
-echo "===== STAGED FILE LIST ====="
-git diff --cached --name-status
- M docs/REFACTOR_HANDOFF.md
- M nfs_v3.py
- M nfs_v41.py
- M nvme_tcp.py
- M s3.py
- M smb.py
- M tests/mock_vms.py
- M tests/test_render_navigation.py
- M tests/test_s3_helpers.py
- M vast_common.py
- M vast_drill.py
-?? tests/test_cleanup_lifecycle.py
-?? tests/test_nvme_tcp.py
-?? tests/test_smb_s3_drill.py
-?? tests/test_startup_loading.py
-refactor/tui-performance
-b69fb6b0b66a8918f6a8cc46599d84b3fc46623e
-Switched to a new branch 'handoff/work-laptop-wip-20260814'
-
-===== STAGED STATE =====
-M  docs/REFACTOR_HANDOFF.md
-M  nfs_v3.py
-M  nfs_v41.py
-M  nvme_tcp.py
-M  s3.py
-M  smb.py
-M  tests/mock_vms.py
-A  tests/test_cleanup_lifecycle.py
-A  tests/test_nvme_tcp.py
-M  tests/test_render_navigation.py
-M  tests/test_s3_helpers.py
-A  tests/test_smb_s3_drill.py
-A  tests/test_startup_loading.py
-M  vast_common.py
-M  vast_drill.py
-
-===== STAGED DIFFSTAT =====
-
-===== STAGED FILE LIST =====
-(venv) kmac@macbook:~/git/opstat [handoff/work-laptop-wip-20260814]$ echo "===== STAGED STATE ====="
-git status --short | cat
-
-echo
-echo "===== STAGED DIFFSTAT ====="
-git diff --cached --stat | cat
-
-echo
-echo "===== STAGED FILE LIST ====="
-git diff --cached --name-status | cat
-
-
-===== STAGED STATE =====
-M  docs/REFACTOR_HANDOFF.md
-M  nfs_v3.py
-M  nfs_v41.py
-M  nvme_tcp.py
-M  s3.py
-M  smb.py
-M  tests/mock_vms.py
-A  tests/test_cleanup_lifecycle.py
-
-A  tests/test_nvme_tcp.py
-M  tests/test_render_navigation.py
-M  tests/test_s3_helpers.py
-A  tests/test_smb_s3_drill.py
-A  tests/test_startup_loading.py
-M  vast_common.py
-M  vast_drill.py
-
-===== STAGED DIFFSTAT =====
- docs/REFACTOR_HANDOFF.md        | 231 +++++++++++++++++++--
- nfs_v3.py                       | 115 ++++++++---
- nfs_v41.py                      |  52 ++++-
- nvme_tcp.py                     | 165 +++++++++++----
- s3.py                           | 221 ++++++++++++--------
- smb.py                          | 209 +++++++++++--------
- tests/mock_vms.py               |  20 +-
- tests/test_cleanup_lifecycle.py | 166 +++++++++++++++
- tests/test_nvme_tcp.py          | 139 +++++++++++++
- tests/test_render_navigation.py |  57 ++++++
- tests/test_s3_helpers.py        |  10 +-
- tests/test_smb_s3_drill.py      | 433 ++++++++++++++++++++++++++++++++++++++++
- tests/test_startup_loading.py   | 104 ++++++++++
- vast_common.py                  |  45 ++++-
- vast_drill.py                   |  25 +++
- 15 files changed, 1736 insertions(+), 256 deletions(-)
-
-===== STAGED FILE LIST =====
-M docs/REFACTOR_HANDOFF.md
-M nfs_v3.py
-M nfs_v41.py
-M nvme_tcp.py
-M s3.py
-M smb.py
-M tests/mock_vms.py
-A tests/test_cleanup_lifecycle.py
-A tests/test_nvme_tcp.py
-M tests/test_render_navigation.py
-M tests/test_s3_helpers.py
-A tests/test_smb_s3_drill.py
-A tests/test_startup_loading.py
-M vast_common.py
-M vast_drill.py
-(venv) kmac@macbook:~/git/opstat [handoff/work-laptop-wip-20260814]$ git commit -m "wip: preserve interrupted opstat refactor state"
-[handoff/work-laptop-wip-20260814 779cd6e] wip: preserve interrupted opstat refactor state
- 15 files changed, 1736 insertions(+), 256 deletions(-)
- create mode 100644 tests/test_cleanup_lifecycle.py
- create mode 100644 tests/test_nvme_tcp.py
- create mode 100644 tests/test_smb_s3_drill.py
- create mode 100644 tests/test_startup_loading.py
-(venv) kmac@macbook:~/git/opstat [handoff/work-laptop-wip-20260814]$
-echo
-echo "===== CHECKPOINT ====="
-git log -1 --oneline
-git rev-parse HEAD
-git status --short
-
-===== CHECKPOINT =====
-779cd6e39df002d00b1c7006f471f09234797c5c
-(venv) kmac@macbook:~/git/opstat [handoff/work-laptop-wip-20260814]$
-echo
-echo "===== CHECKPOINT ====="
-git log -1 --oneline | cat
-git rev-parse HEAD| cat
-git status --short| cat
-
-===== CHECKPOINT =====
-779cd6e wip: preserve interrupted opstat refactor state
-779cd6e39df002d00b1c7006f471f09234797c5c
-(venv) kmac@macbook:~/git/opstat [handoff/work-laptop-wip-20260814]$ git push -u origin handoff/work-laptop-wip-20260814 | cat
-Enumerating objects: 33, done.
-Counting objects: 100% (33/33), done.
-Delta compression using up to 12 threads
-Compressing objects: 100% (19/19), done.
-Writing objects: 100% (19/19), 28.69 KiB | 3.59 MiB/s, done.
-Total 19 (delta 14), reused 0 (delta 0), pack-reused 0 (from 0)
-remote: Resolving deltas: 100% (14/14), completed with 14 local objects.
-remote:
-remote: Create a pull request for 'handoff/work-laptop-wip-20260814' on GitHub by visiting:
-remote:      https://github.com/kmacvast/opstat/pull/new/handoff/work-laptop-wip-20260814
-remote:
-To github.com:kmacvast/opstat.git
- * [new branch]      handoff/work-laptop-wip-20260814 -> handoff/work-laptop-wip-20260814
-branch 'handoff/work-laptop-wip-20260814' set up to track 'origin/handoff/work-laptop-wip-20260814'.
-(venv) kmac@macbook:~/git/opstat [handoff/work-laptop-wip-20260814]$ echo
-echo "===== LOCAL ====="
-git rev-parse HEAD| cat
-
-echo
-echo "===== TRACKING REF ====="
-git rev-parse origin/handoff/work-laptop-wip-20260814| cat
-
-echo
-echo "===== ACTUAL REMOTE ====="
-git ls-remote origin refs/heads/handoff/work-laptop-wip-20260814| cat
-
-===== LOCAL =====
-779cd6e39df002d00b1c7006f471f09234797c5c
-
-===== TRACKING REF =====
-779cd6e39df002d00b1c7006f471f09234797c5c
-
-===== ACTUAL REMOTE =====
-779cd6e39df002d00b1c7006f471f09234797c5c  refs/heads/handoff/work-laptop-wip-20260814
-(venv) kmac@macbook:~/git/opstat [handoff/work-laptop-wip-20260814]$
+Read `AGENTS.md` first; it governs. Never push/merge/tag/PR or commit
+unbidden. Never fabricate telemetry, metric semantics, or mock behavior for
+unproven APIs. Real-VMS work happens only from the owner's work laptop with
+`VAST_PASSWORD`/`VAST_TOKEN` from the environment. Run `./scripts/validate.sh`
+before claiming green — a bare `pytest` hides 180+ silently-skipped tests when
+`openssl` is missing.
