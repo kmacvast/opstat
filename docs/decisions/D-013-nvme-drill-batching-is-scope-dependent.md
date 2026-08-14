@@ -1,6 +1,8 @@
 # D-013 — NVMe drill batching is scope-dependent and must be response-validated
 
-**Status:** Accepted · **Recorded:** 2026-08-14 · **Cluster:** var203, VAST OS 5.5.0.1
+**Status:** Accepted · **Recorded:** 2026-08-14 · **Cluster:** var203, VAST OS 5.4.6
+*(originally mis-recorded as 5.5.0.1; the validation frames report
+`vast-os-release-5.4.6.0`, build `release-5.4.6-2628322`)*
 
 ## Context
 
@@ -68,13 +70,21 @@ ranking is viable there and that a real zero is distinguishable from no data.
   the rejected batch leaks no monitors, and that the fallback still renders
   real per-object rows. Removing the validation fails four of those tests.
 
-## What is still unproven
+## The exact unsplittable shape (settled by the second run)
 
-The probe recorded rows-per-object = 0 without distinguishing **"no `object_id`
-column"** from **"column present, no rows for the requested ids"**. Both are
-modelled and both force the fallback, so the implementation is correct either
-way — but the exact shape is not established, and the next real run should
-capture the full `prop_list` for the `vip` and `blockhost` batch queries.
+The second lab run captured the full `prop_list`, settling what the first run
+left ambiguous: the response **does** carry an `object_id` column at every
+scope — the rows simply never match the requested ids ("column present, no
+matching rows"). Both candidate shapes remain modelled in the mock, but the
+real one is now known.
+
+The `vip` result carries a second finding: the requested
+`BlockMetrics,read_req` / `read_latency__avg` came back in the `prop_list` as
+**`TopNMetrics,read_req` / `TopNMetrics,read_latency__avg`** — at vip scope
+the cluster silently rewrites the metric family. A monitor that echoes a
+*different family* than requested is one more reason response validation, not
+request success, is the only trustworthy signal. `blockhost` echoed
+BlockMetrics unchanged and still returned no matching rows.
 
 Whether the per-object fallback's *cost* on `vip`/`blockhost` is acceptable in
 practice has not been measured on a real cluster; the wall-clock evidence from

@@ -17,9 +17,9 @@ before relying on it. Depth lives elsewhere — this file is the map:
 | | |
 |---|---|
 | Branch | `refactor/tui-performance-local-continuation-wip` |
-| Last commit | `03f72a2` (on top of WIP checkpoint `779cd6e`; base `main` @ `77549f06`) |
-| Working tree | **Large uncommitted continuation pass** (see below). Do not discard; do not commit/push without explicit owner instruction |
-| Gate | `./scripts/validate.sh` → PASS: **504 collected / 504 passed / 0 skipped** on current Python and Python 3.8; doc links valid |
+| Last commit | `96f284e` (continuation branch published through the round-1/round-2 lab runs) |
+| Working tree | **Uncommitted round-2 reconciliation** (footer wrap, NVMe key dispatch + drill loading frame, validator fixes, docs). Do not discard; do not commit/push without explicit owner instruction |
+| Gate | `./scripts/validate.sh` → PASS on current Python and Python 3.8, 0 skipped; doc links valid (counts in REFACTOR_HANDOFF) |
 | Real clusters | `var203.selab.vastdata.com` only, from the owner's **work laptop** only. `var204` unavailable until the owner says otherwise. No cluster is reachable from the personal laptop |
 
 ## Objective
@@ -90,6 +90,41 @@ Implementation deliberately not attempted without live evidence:
    Displays unchanged and marked UNVERIFIED until compared against a known-µs
    metric under load.
 
+## Settled by round 2 (Linux lab host, cluster-adjacent, 2026-08-14)
+
+Round 2 ran `run_var203_validation.py` beside var203 (**VAST OS 5.4.6**, not
+5.5.0.1 as first recorded), so its wall-clock is trustworthy:
+
+- **FR-C is REAL-VMS VALIDATED.** Live BLOCK frame: Read 72.5 / Write 27.1 /
+  Reclaim 0.4 (= 100.0%), Fabric separate at 80.3% "of all activity"; idle
+  frame showed 0/0/0 with Fabric 100% and no fabricated workload share.
+- **Navigation contract validated on real screens** (`nav.*` all PASS); but a
+  real-use **footer-width regression** was found on an ordinary laptop
+  terminal — only `[q] [o] [l]` visible, working keys undiscoverable. Fixed:
+  the legend now wraps (`nav_legend_lines`), never drops a control; literal
+  q/o/l-only repro test added.
+- **Real defect found and fixed: queued keys were dropped.** Poll cycles block
+  30–80 s on this cluster; multiple keys arrive in one read and the old
+  handling fired one action and discarded the rest (the lab log shows a
+  buffered space swallowing `x` and `i` — every drill-window FAIL in the
+  validator report traces to this). All five engines now dispatch every
+  queued key in arrival order through the shared
+  `vast_drill.dispatch_queued_keys`; multi-key buffers are regression-tested
+  per engine (`tests/test_key_dispatch.py`).
+- **Real defect found and fixed: NVMe had no drill-entry loading frame**, and
+  its entry legitimately runs ~2 min on this cluster. Now routed through
+  `with_loading_status`.
+- **Startup = 157 s of honest serial API time** (26.6 s `/clusters/` + ~59 s
+  for 8 creates + ~67 s for 8 first queries; per-call 2–38 s). No duplicate
+  work exists to cut; the one lever (fewer startup monitors) is BLOCKED on
+  the new merge-legality probes in `probe_var203.py`. The "206 s" first
+  report included ~50 s of validator dead-wait on a wrong marker (fixed).
+- **D-013 shape settled**: unsplittable responses DO carry an `object_id`
+  column — rows just never match; and at vip scope the cluster silently
+  rewrites requested BlockMetrics props to `TopNMetrics`.
+- **Latency units still UNVERIFIED** — the known-µs reference read 0 again
+  (idle NFS4 during the window) and `host_view` published no latency series.
+
 ## Settled by round 1 of real-VMS validation (2026-08-14)
 
 - **NVMe batch layout is scope-dependent** — [D-013](decisions/D-013-nvme-drill-batching-is-scope-dependent.md).
@@ -133,10 +168,11 @@ cadence, ranking, navigation, Fabric screen, per-id cleanup) and writes
 
 ## Recommended next step
 
-Owner runs the var203 validation package from the work laptop and returns its
-output; then reconcile, split the working tree into the proposed logical
-commits (list in the session report / REFACTOR_HANDOFF), and validate on the
-real cluster before any publication.
+Commit the round-2 reconciliation (owner-approved split), then re-run
+`run_var203_validation.py` on the lab host with the fixed validator: it should
+now show the cNode drill fully green, the true drill AFTER costs, vip/blockhost
+fallback behavior, the merge-legality probe verdicts (startup lever), and —
+with NFS4 load active during the probe window — a usable latency cross-check.
 
 ## Ground rules for any AI resuming here
 

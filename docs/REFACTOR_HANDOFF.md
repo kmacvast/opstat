@@ -447,6 +447,39 @@ Mock-measured budgets (counts transfer to a real cluster; wall-clock does not):
 - `--volumes` scoping unchanged (its VolumeMetrics monitors were already
   per-scope).
 
+**Round-2 lab findings (var203 = VAST OS 5.4.6, cluster-adjacent host):**
+
+- **Startup is 157 s of honest serial API time, not a hang and not network
+  noise.** From the session's own log: `GET /clusters/` 26.6 s + 8 monitor
+  creates ≈ 59.3 s (median ~2.2 s with 31 s and 14 s spikes) + the first 8
+  queries ≈ 67.3 s. 17 serial calls, no duplicates, no re-probes, nothing
+  reusable — per-call latency on this 5.4.6 cluster runs 2–38 s. The reported
+  206 s included ~50 s of the *validator* dead-waiting for a "TOTAL IOPS"
+  string the panel never renders (marker fixed). The only structural
+  reduction is fewer startup monitors, which needs the merge-legality probe
+  now in `probe_var203.py` (`merge.data_pairs`, `merge.data_plus_fabric`) —
+  BLOCKED ON REAL-VMS EVIDENCE until it runs. No blind change was made.
+- **Real defect: queued keys were dropped.** Keys are read between poll
+  cycles, and a cycle blocks 30–80 s on this cluster, so several keys arrive
+  in one read; the old handling fired ONE action per read and discarded the
+  rest. The lab log proves it: after cNode entry, a buffered space consumed
+  the queued `x` and `i` — the drill's monitors were never deleted until
+  shutdown, VIP/HOST never entered, and every drill-window FAIL in the
+  validator report follows from those swallowed keys. Fixed in **all five
+  engines**: each input buffer now routes through the shared
+  `vast_drill.dispatch_queued_keys` with a per-engine `_dispatch_key` —
+  every queued key honored in arrival order, one action per key, one
+  deferred repaint per batch, bindings unchanged. Regression tests replay
+  the literal ` x<drill>` buffer per engine (`tests/test_key_dispatch.py`).
+- **Real defect: NVMe had no drill-entry loading frame** — the one engine
+  without it, and its entry blocks the longest (~2 min real). `c` froze the
+  previous frame for the whole entry. Now routed through
+  `vast_drill.with_loading_status` (status → render → work → clear), tested.
+- **Shutdown `q` during a blocked poll** exits only after the current cycle
+  completes (single-threaded by design) — the lab run's SIGTERM fallback at
+  180 s was the validator's budget expiring mid-drain, not a hang; cleanup
+  then ran and all 17 session monitors were verified deleted per-id.
+
 ---
 
 ## Real-VMS observations
@@ -547,13 +580,20 @@ Verified against the repository at the time of writing.
 
 ### Outstanding
 
-1. **NVMe ranking and drill batching — IMPLEMENTED, REAL-VMS VALIDATION
-   PENDING.** See *NVMe / block status*: activity ranking (no head-slice),
-   batched display monitors with per-object fallback, mock-measured 65 → 13
-   entry calls and 64 → 8 re-poll queries. What remains real-cluster-only:
-   whether var203 accepts multi-`object_id` monitors at cnode/vip/blockhost
-   scope, the blockhost drill end-to-end, and the AFTER call measurement —
-   all in the work-laptop validation package.
+1. **NVMe ranking and drill batching — batch acceptance settled per scope
+   ([D-013](decisions/D-013-nvme-drill-batching-is-scope-dependent.md)):
+   cnode batches, vip/blockhost fall back.** Still real-cluster-only: a full
+   drill AFTER measurement with the fixed validator (the first run's drill
+   FAILs were swallowed keys + too-short deadlines, not the drill), and the
+   blockhost drill end-to-end.
+2. **NVMe startup cost (157 s real, cluster-adjacent).** 17 serial calls at
+   2–38 s each; no duplicated work to remove. The one structural lever —
+   fewer startup monitors — is BLOCKED ON REAL-VMS EVIDENCE pending the
+   merge-legality probes now in `probe_var203.py`.
+2b. ~~Queued-key drop~~ **RESOLVED in all five engines** — shared
+   `vast_drill.dispatch_queued_keys` + per-engine `_dispatch_key`;
+   multi-key buffers regression-tested per engine
+   (`tests/test_key_dispatch.py`, 25 tests).
 3. **NFSv3 VIEW drill** still uses `ViewMetrics`. The NFSv4.1 rebuild on
    `host_view` may be portable — `host_view` carries `protocol=NFS3`.
 4. **Delegation diagnostic** not implemented. Needs a path-entry interaction.
@@ -741,7 +781,23 @@ preserved. Common concepts: `[q]` Quit, `[o]` Ops, `[l]` Lat, `[n]` Name,
 hosts. **VIP standardizes on `[i]`, never `[v]`.** No key means two concepts on
 different engines. Fold in per-engine as engines are touched; build shared
 helpers where they reduce divergence safely.
-- **Status: DONE locally (all five engines); real-VMS nav sanity pending.**
+- **Status: DONE locally (all five engines), including the width fix below;
+  real-VMS keys/legend validated; wrapped-footer appearance re-check pending.**
+
+  **Real-use regression (found by the owner, fixed):** the shared legend was
+  rendered as ONE line and truncated to the frame width, so an ordinary
+  laptop terminal showed only `[q] Quit |[o] Ops |[l] Lat` while c/v/t/x
+  still *worked* but were undiscoverable — display-only, width-dependent.
+  `vast_drill.nav_legend_lines()` now wraps the legend across lines (greedy
+  packing, canonical order preserved, protocol extras still last); all five
+  engines render every supported control at any width, and a control is only
+  ever shortened by extreme narrowness, never silently omitted. Guarded by
+  width-parametrized tests (200/100/80/60) plus a literal repro of the
+  q/o/l-only field report at 28 columns.
+
+  The second lab run validated the rest of the contract on real screens:
+  legend text, `[i]`/`[x]`/`[space]` live, retired `v`/`p` dead
+  (`nav.*` all PASS).
   The contract lives in code: `vast_drill.CANONICAL_CONTROLS` +
   `nav_controls()` (canonical order/labels, protocol extras appended, raises
   on a non-canonical key) + `nav_legend()` (one shared renderer). Every
@@ -803,12 +859,24 @@ practical; unit tests with literal ms/µs/ns source values.
   metric on the same cluster under load. Until then those displays are
   UNVERIFIED, not wrong — behavior unchanged.
 
+  The second lab run attempted the cross-check and it did **not** settle
+  anything: the known-µs reference (`NFS4Common read_latency__avg`) read `0`
+  in the probe window and `host_view` again published **zero** latency
+  series, so `BlockMetrics read_latency__avg = 515.61` stands alone — a
+  plausible µs magnitude, and magnitude alone is not proof. Units remain
+  UNVERIFIED; the probe needs NFS4 load active during its window.
+
 ### FR-C — Block fabric percentage correction
 BLOCK/NVMe: Fabric activity must **not** be in the primary workload-mix
 denominator (READ/WRITE/metadata only). Fabric stays visible as its own
 metric/bar. Verify current math first; tests proving the old denominator is
 wrong and the new one is right.
-- **Status: DONE locally; real screen verification pending.**
+- **Status: REAL-VMS VALIDATED (var203, second lab run).** The live BLOCK
+  frame under block load showed Read 72.5% / Write 27.1% / Reclaim 0.4%
+  (sums to 100.0%) with Fabric shown separately as `80.3% of all activity`,
+  and the idle warm-up frame showed 0/0/0 workload with Fabric 100% — no
+  fabricated workload share from fabric-only traffic. Latency presentation
+  behaved as designed (`609 µs`, `1.30 ms`, `15 µs` — auto-scaled, labeled).
   `block_workload_mix` excludes fabric/admin from the read/write/reclaim
   denominator; Fabric renders as a separate `of all activity` indicator.
   Render audit confirmed the math and the panel agree end-to-end. There is no
