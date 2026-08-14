@@ -279,6 +279,21 @@ class OpstatSession(object):
             self._drain(0.5)
         return needle in strip_ansi(self.output) and (time.time() - self.started) or None
 
+    def wait_for_since(self, needle, offset, budget):
+        """Like wait_for, but only matches output produced after *offset*.
+
+        Matching the whole buffer read old frames as current state - a key
+        was declared consumed because the PREVIOUS drill's panel contained
+        the string being waited for.
+        """
+        deadline = time.time() + budget
+        while time.time() < deadline:
+            if needle in strip_ansi(self.output[offset:]):
+                return time.time() - self.started
+            self._drain(0.5)
+        return (needle in strip_ansi(self.output[offset:])
+                and (time.time() - self.started) or None)
+
     def send(self, keys, settle=0.0):
         os.write(self._master, keys.encode())
         if settle:
@@ -478,10 +493,23 @@ def scenario_nvme(args):
         REPORT.log("  %-26s %s" % (
             phase, ("%.2fs" % elapsed) if elapsed else "NOT SEEN"))
 
-    dashboard = session.wait_for("TOTAL IOPS", args.startup_budget) or \
-        session.wait_for("NVMe", 5)
+    # "BLOCK HEALTH & WORKLOAD" is the dashboard's actual panel title.
+    # ("TOTAL IOPS" was assumed in the first run and never renders, so the
+    # validator dead-waited a full budget after the dashboard was already up,
+    # inflating 157 s to a reported 206 s.)
+    dashboard = session.wait_for("BLOCK HEALTH & WORKLOAD", args.startup_budget)
     REPORT.log("  %-26s %s" % (
         "dashboard", ("%.2fs" % dashboard) if dashboard else "NOT SEEN"))
+
+    # Per-call startup cost, from the session's own log: which requests the
+    # 206 s actually went to. Durations are in the log lines ("1234ms").
+    startup_lines = session.api_since(0)
+    REPORT.log("  startup call durations:")
+    for line in startup_lines:
+        m = re.search(r"\b(GET|POST|DELETE)\s+https?://\S*?(/api/\S+?)\s+(\d+)ms", line)
+        if m:
+            REPORT.log("    %-8s %-44s %8sms"
+                       % (m.group(1), m.group(2).replace("/api", "")[:44], m.group(3)))
 
     seen_in_order = [p for p in STARTUP_PHASES if phase_times.get(p)]
     ordered = seen_in_order == [p for p in STARTUP_PHASES if phase_times.get(p)] and \
@@ -550,24 +578,37 @@ def _panel_excerpt(frame):
 def _drill_scenario(session, key, mode, args):
     REPORT.log("\n=== NVMe %s drill (key '%s') ===" % (mode.upper(), key))
     title = DRILL_TITLES[mode]
-    before = len(session.output)
     api_mark = session.api_mark()
+    consumed_at = len(session.output)
     t0 = time.time()
     session.send(key)
-    opened = session.wait_for(title, args.drill_budget)
+    # Two-stage readiness. First: proof the keypress was CONSUMED - the drill
+    # paints a "please stand by" loading frame before its blocking work, and
+    # keys are only read between poll cycles (30-80 s each on var203). Then:
+    # the panel itself, which legitimately took ~2 minutes of ranking + batch
+    # creation on the first lab run - the old fixed 120 s deadline expired
+    # while opstat was doing exactly what it should.
+    consumed = session.wait_for_since("stand by", consumed_at, args.key_budget) \
+        or session.wait_for_since(title, consumed_at, args.key_budget)
+    if not consumed:
+        REPORT.log("  WARN: no loading frame within %ss of '%s'"
+                   % (args.key_budget, key))
+    opened = session.wait_for_since(title, consumed_at, args.drill_budget)
     # Snapshot the log the instant the panel renders: anything after this is
     # ordinary polling during the settle window, not part of drill entry.
     entry_s = time.time() - t0
     entry_lines = session.api_since(api_mark)
     entry_calls = parse_calls(entry_lines)
     session._drain(args.drill_settle)
-    new_frame = strip_ansi(session.output[before:])
     if not opened:
         REPORT.verdict("nvme.%s.open" % mode, FAIL,
                        "panel '%s' never rendered within %ss"
                        % (title, args.drill_budget))
 
-    names = _drill_names(new_frame)
+    # Rows come from the LAST repaint only - the tail of the whole buffer
+    # still contains the previous mode's panels, which is how stale cNode
+    # rows were attributed to the VIP and HOST windows in the first lab run.
+    names = _drill_names(_last_frame(session)) if opened else []
     layout = _infer_layout(entry_lines)
     REPORT.log("  entry wall-clock    : %.2fs  (to panel render)" % entry_s)
     REPORT.log("  entry API calls     : %d  (keypress -> panel rendered)"
@@ -597,17 +638,32 @@ def _drill_scenario(session, key, mode, args):
                    if forced_q else
                    ("repaint only, no forced query" if forced else "no effect"))
 
-    session.send("x", settle=2.0)
-    session.send(" ", settle=args.refresh_settle)   # force a repaint to read
-    exited = title not in strip_ansi(session.output[-6000:])
+    exited = _exit_drill(session, title, args)
     REPORT.verdict("nvme.%s.exit_x" % mode, PASS if exited else FAIL,
-                   "x returned to the dashboard" if exited else "still in drill after x")
+                   "x returned to the dashboard" if exited
+                   else "still in drill after x (waited %ss)" % args.key_budget)
     REPORT.verdict("nvme.%s.entry" % mode,
                    PASS if opened else FAIL,
                    "%d calls, %s layout, %d rows, %.2fs"
                    % (len(entry_calls), layout, len(names), entry_s))
     return {"names": names, "entry_s": entry_s, "entry_calls": len(entry_calls),
             "layout": layout}
+
+
+def _exit_drill(session, title, args):
+    """Send x and wait until the LAST frame is no longer the drill panel.
+
+    Key consumption can take a full poll cycle, so a fixed 2 s settle read
+    "still in drill" for an x that simply had not been processed yet.
+    """
+    session.send("x")
+    deadline = time.time() + args.key_budget
+    while time.time() < deadline:
+        session._drain(2.0)
+        frame = _last_frame(session)
+        if title not in frame and "PERFORMANCE INSIGHTS" in frame:
+            return True
+    return title not in _last_frame(session)
 
 
 def _infer_layout(lines):
@@ -632,6 +688,19 @@ def _infer_layout(lines):
     if any("_rank_" in n or "rank_" in n for n in names) and len(names) == 1:
         return "rank only"
     return "per-object"
+
+
+def _last_frame(session):
+    """The most recent full repaint in the PTY buffer.
+
+    The buffer accumulates every repaint; parsing its tail attributed stale
+    cNode rows to the VIP and HOST windows in the first lab run. Frames start
+    at the title bar, so the last title-bar occurrence bounds current screen
+    state.
+    """
+    text = strip_ansi(session.output)
+    idx = text.rfind("VAST NVMe-oTCP")
+    return text[idx:] if idx >= 0 else text
 
 
 def _drill_names(frame):
@@ -678,22 +747,26 @@ def _navigation_scenario(session, args):
         return strip_ansi(session.output[mark:]) or strip_ansi(session.output[-6000:])
 
     # 'p' must not exit a drill (retired NVMe binding).
-    session.send("c", settle=args.drill_settle)
-    session.wait_for(DRILL_TITLES["cnode"], args.drill_budget)
+    mark = len(session.output)
+    session.send("c")
+    session.wait_for_since(DRILL_TITLES["cnode"], mark, args.drill_budget)
     session.send("p", settle=2.0)
-    still_in = DRILL_TITLES["cnode"] in current_frame()
+    current_frame()                       # force a repaint (p alone paints nothing)
+    still_in = DRILL_TITLES["cnode"] in _last_frame(session)
     REPORT.verdict("nav.p_does_not_exit", PASS if still_in else FAIL,
                    "p left the cNode drill open" if still_in
                    else "p exited the drill - retired binding is still live")
-    session.send("x", settle=2.0)
+    _exit_drill(session, DRILL_TITLES["cnode"], args)
 
     # 'v' must not open a VIP drill on NVMe (retired binding; v means View).
-    session.send("v", settle=args.drill_settle)
-    opened_vip = DRILL_TITLES["vip"] in current_frame()
+    session.send("v", settle=2.0)
+    current_frame()
+    opened_vip = DRILL_TITLES["vip"] in _last_frame(session)
     REPORT.verdict("nav.v_is_not_vip", FAIL if opened_vip else PASS,
                    "v opened the VIP drill - retired binding is still live"
                    if opened_vip else "v did not open VIP")
-    session.send("x", settle=2.0)
+    if opened_vip:
+        _exit_drill(session, DRILL_TITLES["vip"], args)
 
 
 def _cleanup_scenario(session, args, label):
@@ -802,10 +875,13 @@ def main():
     ap.add_argument("--user", default=DEFAULT_USER)
     ap.add_argument("--startup-budget", type=int, default=120,
                     help="seconds to wait for each startup phase")
-    ap.add_argument("--drill-budget", type=int, default=120)
+    ap.add_argument("--drill-budget", type=int, default=420,
+                    help="seconds to wait for a drill panel; a real var203 entry legitimately ran ~2 minutes")
     ap.add_argument("--drill-settle", type=float, default=8.0)
     ap.add_argument("--cadence-window", type=int, default=45)
     ap.add_argument("--refresh-settle", type=float, default=6.0)
+    ap.add_argument("--key-budget", type=int, default=150,
+                    help="seconds to wait for a keypress to be consumed; keys are read between poll cycles, which ran 30-80 s on var203")
     ap.add_argument("--drain-budget", type=int, default=180)
     ap.add_argument("--skip-probe", action="store_true")
     ap.add_argument("--skip-others", action="store_true",

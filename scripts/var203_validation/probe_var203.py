@@ -204,6 +204,65 @@ def probe_rank(object_type, endpoint):
 # ---------------------------------------------------------------------------
 # Probe 3: latency source units (compare unknown vs proven-µs under load)
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Probe 3: startup-monitor merge legality (cluster scope)
+# ---------------------------------------------------------------------------
+# NVMe startup ran 157 s on a cluster-adjacent host: 1 clusters fetch + 8
+# monitor creates + 8 first queries, strictly serial, at 2-38 s per call. The
+# only structural reduction is fewer monitors - merging the per-op groups -
+# and an earlier var203 probe rejected SOME merged shape at query time
+# ("can't mix pr[operties]") without recording which combinations are legal.
+# These probes map the boundary so the startup layout can shrink safely.
+def probe_merge_legality(cluster_id):
+    log("\n=== startup merge-legality probes (cluster scope) ===")
+    candidates = [
+        # All five counter+avg data/reclaim pairs in one monitor: the shape
+        # that would collapse 6 creates+queries into 1 of each.
+        ("merge.data_pairs", [
+            "BlockMetrics,read_req", "BlockMetrics,read_latency__avg",
+            "BlockMetrics,write_req", "BlockMetrics,write_latency__avg",
+            "BlockMetrics,unmap_req", "BlockMetrics,unmap_latency__avg",
+        ]),
+        # Counter pairs plus the fabric __rate/__avg pairs: everything in one.
+        ("merge.data_plus_fabric", [
+            "BlockMetrics,read_req", "BlockMetrics,read_latency__avg",
+            "BlockMetrics,write_req", "BlockMetrics,write_latency__avg",
+            "BlockMetrics,handle_request_latency__rate",
+            "BlockMetrics,handle_request_latency__avg",
+        ]),
+    ]
+    for name, props in candidates:
+        monitor_id = None
+        try:
+            monitor_id = create_probe_monitor(
+                name.replace(".", "_"), props, "cluster", [cluster_id])
+            result = api("GET", "/monitors/%s/query/" % monitor_id)
+            prop_list = (result or {}).get("prop_list", [])
+            returned = [p for p in props if p in prop_list]
+            rows = (result or {}).get("data") or []
+            populated = 0
+            if rows and returned:
+                idx = {n: i for i, n in enumerate(prop_list)}
+                populated = sum(
+                    1 for p in returned
+                    for row in rows[:12]
+                    if len(row) > idx[p] and row[idx[p]] is not None)
+            ok = len(returned) == len(props) and populated > 0
+            verdict(name, ok,
+                    "returned %d/%d requested props, %d populated cells; "
+                    "prop_list=%s" % (len(returned), len(props), populated,
+                                      prop_list))
+        except RuntimeError as exc:
+            verdict(name, False, "rejected: %s" % str(exc)[:120])
+        finally:
+            # create_probe_monitor registered the id; cleanup_all() deletes
+            # and per-id-verifies every session monitor on exit. Deleting the
+            # short-lived probe monitor promptly just keeps the shared
+            # cluster tidy between probes.
+            if monitor_id is not None:
+                delete_probe_monitor(monitor_id)
+
+
 def probe_latency_units(cluster_id):
     """Prints value pairs; the unit verdict is a human comparison.
 
@@ -285,6 +344,7 @@ def main():
         probe_batch("vip", "/vips/")
         probe_batch("blockhost", "/blockhosts/")
         probe_rank("cnode", "/cnodes/")
+        probe_merge_legality(cluster_id)
         probe_latency_units(cluster_id)
     finally:
         log("\n=== cleanup ===")
