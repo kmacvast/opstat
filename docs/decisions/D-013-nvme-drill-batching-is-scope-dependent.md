@@ -86,9 +86,41 @@ the cluster silently rewrites the metric family. A monitor that echoes a
 request success, is the only trustworthy signal. `blockhost` echoed
 BlockMetrics unchanged and still returned no matching rows.
 
-Whether the per-object fallback's *cost* on `vip`/`blockhost` is acceptable in
-practice has not been measured on a real cluster; the wall-clock evidence from
-the tethered work-laptop run was discarded as network-distorted.
+## The fallback cost, measured — and the redesign it forced (round 3)
+
+The third lab run measured the per-object fallback on a cluster-adjacent host:
+**vip 43 monitors / 137 calls / 464 s; blockhost 41 monitors / 122 calls /
+720 s — and zero usable rows from any of them.** Every per-object monitor at
+those scopes returned as empty as the batch had, one 2–38 s call at a time,
+and the accumulated fan-out (206 monitors in one session) made clean shutdown
+slower than the observer's patience.
+
+The fallback is therefore redesigned around the telemetry evidence itself:
+
+- The rank scan's slices decide whether a scope publishes per-object telemetry
+  at all. **No rows for any requested id → the drill renders an explicit
+  no-telemetry notice and creates no display monitors** — a bounded probe
+  (endpoint list + rank attempt + batch attempt) instead of a monitor storm
+  proving each object empty individually. On var203's 5.4.6 build this is the
+  real vip/blockhost outcome.
+- When telemetry exists but the batch will not split, the per-object fallback
+  is **bounded**: the top `_MAX_FALLBACK_OBJECTS` (4) ranked candidates, and
+  only the data-I/O op groups the drill panel renders (read/write/compare +
+  proto) — the fabric/admin/reclaim groups fed no drill field yet cost a
+  monitor each per object.
+- A scan whose rank-monitor creates were all refused proves nothing about
+  telemetry; the verdict is only recorded from slices that were actually
+  examined, and the drill errs toward the bounded fallback.
+
+## Startup consolidation is ruled out (round-3 merge probes)
+
+Two cluster-scope merge-legality probes settled whether the NVMe headline's
+per-op monitor split could be consolidated: `merge.data_pairs` (read+write
+pairs in one monitor) and `merge.data_plus_fabric` were both **rejected at
+query time with HTTP 400 "can't mix properties"**. The per-op split is a real
+constraint of this build, not history — headline consolidation must not be
+attempted around these combinations. Startup cost work has to come from
+elsewhere (the first-paint no longer blocks on the initial query cycle).
 
 ## What would justify reopening
 

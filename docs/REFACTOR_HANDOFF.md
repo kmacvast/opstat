@@ -439,8 +439,9 @@ Mock-measured budgets (counts transfer to a real cluster; wall-clock does not):
   Rank monitors are accepted at `cnode` scope (`read_req` deltas: object 4 =
   1062.353/s, object 3 = 0.0/s), so activity ranking is viable there.
   Regression coverage reproduces both unsplittable response shapes.
-  **Still pending:** the real drill *cost* of the fallback on `vip`/
-  `blockhost`, and the blockhost drill end-to-end.
+  **Round 3 measured the fallback cost and it forced a redesign** (see the
+  round-3 block below and D-013): vip 43 monitors / 464 s, blockhost 41
+  monitors / 720 s, zero usable rows from either.
 - `/blockhosts/` is **deliberately not modeled in the mock** (no real API
   evidence for its response shape); the host drill shares the cnode/vip code
   path and is exercised only on a real cluster.
@@ -508,6 +509,60 @@ loopback, synthetic metric values, the planted "busy views" used to prove
 ranking correctness.
 
 ---
+
+## Round-3 lab findings (var203 = VAST OS 5.4.6, cluster-adjacent host)
+
+The third unattended run validated the round-2 fixes and exposed the remaining
+structural problems; all remediated locally in this pass, REAL-VMS VALIDATION
+PENDING (round 4).
+
+**Validated on the real cluster:**
+- Startup UX: all three phases in order, footer present; dashboard at 166 s.
+- cNode drill end-to-end: ranking, batch layout, splittable rows
+  (`cnode-3-7`/`cnode-3-8` rendered), 21-call entry, forced space refresh.
+- FR-C fabric separation on live screens - **FR-C is REAL-VMS VALIDATED**
+  (Read 72.5 / Write 27.1 / Reclaim 0.4 = 100% workload; Fabric 80.3% of all
+  activity, separate; fabric-only idle frame fabricates no workload share).
+- Exact-id cleanup accounting; probe cleanup 8/8.
+- Merge legality settled: `merge.data_pairs` and `merge.data_plus_fabric`
+  both **rejected at query (HTTP 400 "can't mix properties")** - headline
+  consolidation is ruled out on this build. Open-decision item closed.
+
+**Real defects found, remediated locally this pass:**
+1. **Unbounded per-object fallback** (vip 43 monitors/464 s, blockhost 41/720 s,
+   zero rows) -> telemetry-evidence-gated: a scope whose rank/batch responses
+   carry no per-object rows renders an explicit no-telemetry notice with zero
+   display monitors; a scope with telemetry but no batch gets a bounded
+   fallback (top-4 ranked, data-I/O groups only). Session monitor ceiling
+   falls from ~206 to ~25.
+2. **Keys unprocessable for 150+ s** (cnode exit_x FAIL): the loop re-fetched
+   8 headline monitors every 5 s tick during a drill (2-38 s per call, always
+   behind schedule). Now: queued input aborts the remaining queries of a
+   cycle (`vast_common.input_pending`), and an open drill moves the headline
+   to the 15 s drill cadence (space still forces everything).
+3. **First paint blocked on the first query cycle** (~80 s of the 166 s):
+   the dashboard now renders after monitor creation with the truthful
+   "Gathering initial metrics" status on the footer-owning waiting frame;
+   the first cycle starts immediately with keys live.
+4. **Shutdown observed as a hang**: the round-3 "leak" (2413-2420 + 2618) was
+   a still-running drain - 206 monitors at ~2 s each outlasted the 362 s
+   observation window; ids 2413-2420 are the headline set (first eight
+   creates), 2618 the last drill monitor. Primary fix is the fan-out
+   elimination; the drain also now reports truthful `k/N` progress every ten
+   deletes and continues past a raising delete.
+5. **Validator toggle-state artifact**: `nav.p_does_not_exit FAIL` was the
+   validator sending `c` while the drill was already open (its exit had
+   failed) - the toggle closed it and the check blamed `p`. `p` is bound
+   nowhere in the repository; cross-engine retired-alias tests now prove it,
+   and the validator establishes dashboard state before judging.
+
+**Latency (round 3):** the NFS4Common known-µs reference read 0 again (idle
+NFS4 in the probe window despite the loadgen), so BlockMetrics (546.5) and
+host_view (now 6 series, 0.75-3.94, incl. `protocol="BLOCK"` on the same
+traffic BlockMetrics measures) remain **UNVERIFIED**. The ~650x ratio between
+host_view BLOCK latency and BlockMetrics read latency for concurrent block
+traffic is recorded as suggestive (ms vs µs) but is NOT proof; no display
+change was made.
 
 ## Test architecture
 
