@@ -162,15 +162,26 @@ def test_batch_rows_are_per_object_and_ranked(nvme):
 # Fallback: a cluster that rejects the batch keeps the per-object layout
 # ---------------------------------------------------------------------------
 def test_batch_rejection_falls_back_to_per_object_monitors(nvme):
+    """Every multi-object create refused -> bounded per-object fallback.
+
+    Ranking cannot run either (rank monitors are multi-object), which proves
+    nothing about telemetry - the drill must still open, capped at
+    _MAX_FALLBACK_OBJECTS with only the data-I/O groups the panel renders.
+    The unbounded fallback cost 43 monitors / 464 s on var203 (round 3).
+    """
     engine, vms = nvme
     vms.state.max_object_ids = 1     # any multi-object monitor is refused
     try:
         engine.enter_drill_mode("cnode")
         assert engine.DRILL_ERROR is None
         assert not engine._drill_batch_active()
-        assert len(engine.DRILL_MONITORS) >= 1
+        assert 1 <= len(engine.DRILL_MONITORS) <= engine._MAX_FALLBACK_OBJECTS
         # Per-object tuples carry the object name (batch carries None).
         assert all(name is not None for _ids, _proto, name in engine.DRILL_MONITORS)
+        # Data-I/O groups only: read/write/compare (3), never the 7-group
+        # full set that made the fallback a monitor storm.
+        for ops_ids, _proto, _name in engine.DRILL_MONITORS:
+            assert len(ops_ids) == 3, f"fallback created {len(ops_ids)} op groups"
         engine.fetch_drill_query(force=True)
     finally:
         vms.state.max_object_ids = None
@@ -224,19 +235,47 @@ def test_drill_cleanup_leaves_no_monitors(nvme, constrained):
 # rows-per-object = 0 without separating "no object_id column" from "column
 # present, no matching rows"), so both are modelled and both must fall back.
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("shape", ["no_object_id", "no_matching_rows"])
 @pytest.mark.parametrize("mode,object_type", [("vip", "vip"), ("cnode", "cnode")])
-def test_unsplittable_batch_falls_back_and_still_shows_real_rows(
-        nvme, shape, mode, object_type):
+def test_no_matching_rows_scope_gets_the_honest_empty_panel(
+        nvme, mode, object_type):
+    """The real var203 vip/blockhost shape: responses carry an object_id
+    column but no rows ever match the requested ids - for the rank monitor
+    too. That scope publishes no per-object telemetry, and the drill must SAY
+    so instead of fanning out per-object monitors that each prove emptiness
+    at 2-38 s a call (43 monitors / 464 s in round 3)."""
     engine, vms = nvme
-    vms.state.batch_unsplittable = {object_type: shape}
+    vms.state.batch_unsplittable = {object_type: "no_matching_rows"}
+    try:
+        vms.reset_calls()
+        engine.enter_drill_mode(mode)
+        assert engine.DRILL_MODE is None, "drill opened on a telemetry-less scope"
+        assert engine.DRILL_ERROR is not None
+        assert "telemetry" in engine.DRILL_ERROR
+        assert engine.DRILL_MONITORS == []
+        # Bounded probe cost: endpoint list + rank attempt + batch attempt,
+        # never a per-object storm.
+        posts = [c for c in vms.calls() if c[1] == "POST"]
+        assert len(posts) <= 6, f"{len(posts)} monitor creates on a dead scope"
+    finally:
+        vms.state.batch_unsplittable = {}
+    live = set(vms.live_monitors()) - set(engine.OPS_MONITOR_IDS) - {engine.PROTO_MONITOR_ID}
+    assert not live, f"probe monitors leaked: {sorted(live)}"
+
+
+@pytest.mark.parametrize("mode,object_type", [("vip", "vip"), ("cnode", "cnode")])
+def test_no_object_id_shape_falls_back_bounded_with_real_rows(
+        nvme, mode, object_type):
+    """The other candidate shape: batch responses lack the object_id column
+    but per-object telemetry exists. Fallback engages - bounded and
+    data-only - and still renders real per-object rows."""
+    engine, vms = nvme
+    vms.state.batch_unsplittable = {object_type: "no_object_id"}
     try:
         engine.enter_drill_mode(mode)
         assert engine.DRILL_ERROR is None, engine.DRILL_ERROR
         assert not engine._drill_batch_active(), (
             "committed to a batch whose response carries no per-object rows")
-        # Fallback tuples carry the object name; the batch tuple carries None.
-        assert engine.DRILL_MONITORS
+        assert 1 <= len(engine.DRILL_MONITORS) <= engine._MAX_FALLBACK_OBJECTS
         assert all(name is not None for _ids, _proto, name in engine.DRILL_MONITORS)
 
         # Two ticks: BlockMetrics req counters are cumulative, so the first
@@ -245,8 +284,6 @@ def test_unsplittable_batch_falls_back_and_still_shows_real_rows(
         engine.fetch_drill_query(force=True)
         rows = engine.LAST_DRILL_ROWS
         assert rows, "fallback produced no drill rows"
-        # Rows must be real per-object measurements, not one aggregate smeared
-        # across every object or a row per object with identical values.
         assert len({r["name"] for r in rows}) == len(rows), "duplicate object rows"
         assert any(r["total_iops"] for r in rows), "no object reported any activity"
     finally:

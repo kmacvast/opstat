@@ -129,6 +129,19 @@ _DRILL_CFG = {
 }
 
 _MAX_DRILL_OBJECTS = 8
+# Per-object fallback bound: when a scope cannot batch (D-013), fan-out is
+# capped to the most-active ranked candidates rather than every selected
+# object. Round 3 on var203 measured the unbounded fallback at 43 monitors /
+# 464 s (vip) and 41 monitors / 720 s (blockhost) - functionally a failure
+# for an interactive tool, and the reason a session held 206 monitors.
+_MAX_FALLBACK_OBJECTS = 4
+# Whether the most recent rank scan returned ANY per-object rows, per mode.
+# On var203 the vip/blockhost rank responses carry no rows for the requested
+# ids at all (D-013): distinguishing "telemetry absent" from "objects idle"
+# is what decides between an honest empty panel and a bounded fallback.
+_RANK_SAW_ROWS = False
+_RANK_SCORED = False
+_SCOPE_HAS_TELEMETRY = {}
 
 # Metrics not exposed on current VMS builds - surfaced in discover-metrics notes.
 _UNAVAILABLE_TELEMETRY = (
@@ -1277,6 +1290,17 @@ def _cleanup_drill_monitors():
     DRILL_MONITORS = []
 
 
+def _drill_ops_rows():
+    """The op rows the drill panel actually renders: data I/O only.
+
+    Drill rows show name / total IOPS / read-write weighted latency / data
+    bandwidth. Fabric, admin and reclaim groups fed none of those fields yet
+    cost a monitor each per object in the fallback layout - more than half of
+    the 41-43 monitors the round-3 var203 run created per unbatchable drill.
+    """
+    return [row for row in OPS if row[0] in _DATA_IO_KEYS]
+
+
 def _block_rank_score(sliced_result):
     """Activity score for one candidate: read+write ops/sec from its slice.
 
@@ -1287,6 +1311,10 @@ def _block_rank_score(sliced_result):
     and a naive two-newest-rows delta would score every object 0.0. An object
     without two populated samples scores 0.0 rather than being guessed at.
     """
+    global _RANK_SAW_ROWS, _RANK_SCORED
+    _RANK_SCORED = True
+    if (sliced_result or {}).get("data"):
+        _RANK_SAW_ROWS = True
     total = 0.0
     for fqn in _RANK_PROPS:
         rate = vast_drill.delta_rate_from_samples(sliced_result, fqn)
@@ -1303,8 +1331,12 @@ def _rank_drill_candidates(mode, cfg, objects):
     cluster with more than eight. Ranking is cached in the DrillSession, so
     re-entering a drill inside the TTL costs no rank monitors at all.
     """
+    global _RANK_SAW_ROWS, _RANK_SCORED
     subtitle_fields = cfg.get("subtitle_fields", ())
     by_id = {o["id"]: o for o in objects}
+    _RANK_SAW_ROWS = False
+    _RANK_SCORED = False
+    cached = DRILL._cached(mode, objects) is not None
     ranked = DRILL.rank(
         mode, objects,
         object_type=cfg["object_type"],
@@ -1314,6 +1346,13 @@ def _rank_drill_candidates(mode, cfg, objects):
         name_of=lambda o: _obj_name(o, cfg["name_fields"]),
         use_topn=False,
     )
+    if not cached and _RANK_SCORED:
+        # A fresh scan sliced real responses; those slices decide whether
+        # this scope publishes per-object telemetry. A cache hit keeps the
+        # prior verdict, and a scan that never scored (every rank-monitor
+        # create refused) proves nothing about telemetry - the verdict
+        # stays unset and the drill errs toward the bounded fallback.
+        _SCOPE_HAS_TELEMETRY[mode] = _RANK_SAW_ROWS
     selected = []
     for item in ranked:
         entry = {"id": item["id"], "name": item["name"]}
@@ -1342,7 +1381,8 @@ def _create_batch_drill_monitors(mode, cfg, drill_objects):
     created = []
     proto_id = None
     try:
-        for idx, prop_list in enumerate(build_ops_monitor_groups(ops_rows=OPS)):
+        for idx, prop_list in enumerate(
+                build_ops_monitor_groups(ops_rows=_drill_ops_rows())):
             created.append(_create_monitor_raw(
                 f"{mode}_batch_{idx}", prop_list, cfg["object_type"], object_ids,
             ))
@@ -1397,12 +1437,31 @@ def enter_drill_mode(mode):
     _cleanup_drill_monitors()
     new_monitors = _create_batch_drill_monitors(mode, cfg, DRILL_OBJECTS)
     if new_monitors is None:
-        # Per-object fallback: the pre-batch layout, unchanged.
+        if not _SCOPE_HAS_TELEMETRY.get(mode, True):
+            # Neither the batch nor the rank response carried a single row
+            # for any requested object: this cluster publishes no per-object
+            # block telemetry at this scope (observed on var203 for vip and
+            # blockhost, D-013). Say so instead of fanning out monitors that
+            # measurably return nothing - the round-3 run spent 43 monitors
+            # and 464 s proving each object empty, one monitor at a time.
+            DRILL_ERROR = (
+                f"No per-{mode} block telemetry on this cluster: monitor "
+                f"responses carry no rows for any {mode} object "
+                f"(batch and rank probes agree)."
+            )
+            DRILL_OBJECTS = []
+            return
+        # Bounded per-object fallback: telemetry exists but the batch is not
+        # splittable here, so keep the top-ranked candidates only, and only
+        # the data-I/O op groups the drill panel renders. Cost is capped at
+        # _MAX_FALLBACK_OBJECTS x (3 data groups + proto) monitors instead
+        # of every object x every group.
         new_monitors = []
-        for obj in DRILL_OBJECTS:
+        for obj in DRILL_OBJECTS[:_MAX_FALLBACK_OBJECTS]:
             try:
                 ops_ids = create_ops_monitors(
-                    f"{mode}_{obj['id']}", cfg["object_type"], [obj["id"]], ops_rows=OPS,
+                    f"{mode}_{obj['id']}", cfg["object_type"], [obj["id"]],
+                    ops_rows=_drill_ops_rows(),
                 )
                 proto_id = None
                 if cfg["object_type"] != "blockhost":
@@ -1413,6 +1472,7 @@ def enter_drill_mode(mode):
                 new_monitors.append((ops_ids, proto_id, obj["name"]))
             except RuntimeError:
                 pass
+        DRILL_OBJECTS = DRILL_OBJECTS[:_MAX_FALLBACK_OBJECTS]
     if not new_monitors:
         DRILL_ERROR = f"Could not create any {mode} monitors"
         DRILL_OBJECTS = []
@@ -1488,7 +1548,7 @@ def _drill_row_for_object(obj_name, ops_results, proto_result, poll_time):
     """One display row for one drill object - shared by both monitor layouts."""
     rows, _ = build_rows_from_results(
         ops_results, proto_result, scope=f"drill:{obj_name}",
-        poll_time=poll_time, ops_rows=OPS,
+        poll_time=poll_time, ops_rows=_drill_ops_rows(),
     )
     if not rows:
         return None
