@@ -184,3 +184,35 @@ def test_dispatch_helper_renders_once_per_batch():
         "abcd", dispatch, lambda: renders.append(1))
     assert rendered is False
     assert renders == [1], "expected exactly one deferred render per batch"
+
+
+# ---------------------------------------------------------------------------
+# Retired aliases stay dead. [p] exited the NVMe drill historically; the
+# round-3 lab validator reported it "still live", which turned out to be a
+# validator state artifact - but the contract deserves direct coverage: p (and
+# v-for-VIP on NVMe) must dispatch to None and mutate nothing, everywhere.
+# ---------------------------------------------------------------------------
+def test_retired_p_alias_is_dead_everywhere(engine, capsys):
+    module = engine
+    name = module.__name__
+    module._dispatch_key(FIRST_DRILL[name])
+    mode_before = module.DRILL_MODE
+    assert mode_before is not None
+
+    outcome = module._dispatch_key("p")
+    capsys.readouterr()
+    assert outcome is None, f"{name}: 'p' is bound (returned {outcome!r})"
+    assert module.DRILL_MODE == mode_before, f"{name}: 'p' changed drill state"
+
+
+def test_v_does_not_open_vip_on_nvme(vms, monkeypatch, capsys):
+    module = _engine("nvme_tcp", vms, monkeypatch)
+    try:
+        outcome = module._dispatch_key("v")
+        capsys.readouterr()
+        assert outcome is None, "'v' is bound on NVMe (retired VIP alias)"
+        assert module.DRILL_MODE is None
+    finally:
+        module.cleanup()
+        module._CLEANED_UP = False
+        vast_common.close_connection()

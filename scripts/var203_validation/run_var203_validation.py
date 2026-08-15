@@ -600,6 +600,21 @@ def _drill_scenario(session, key, mode, args):
     entry_lines = session.api_since(api_mark)
     entry_calls = parse_calls(entry_lines)
     session._drain(args.drill_settle)
+    if not opened and NO_TELEMETRY_MARKER in strip_ansi(session.output[consumed_at:]):
+        # A scope that publishes no per-object telemetry renders an explicit
+        # notice instead of fanning out monitors (round-3 remediation). On
+        # builds like var203's 5.4.6 that IS the correct vip/blockhost
+        # outcome: a bounded probe, an honest panel, no monitor storm.
+        posts = [c for c in entry_calls if c[0] == "POST"]
+        REPORT.verdict("nvme.%s.open" % mode, PASS,
+                       "honest no-telemetry notice rendered (%d creates, %.0fs)"
+                       % (len(posts), entry_s))
+        REPORT.verdict("nvme.%s.entry" % mode,
+                       PASS if len(posts) <= 8 else FAIL,
+                       "%d calls, %d creates - bounded probe, no fan-out"
+                       % (len(entry_calls), len(posts)))
+        session.send("x", settle=2.0)
+        return {"names": [], "entry_s": entry_s, "no_telemetry": True}
     if not opened:
         REPORT.verdict("nvme.%s.open" % mode, FAIL,
                        "panel '%s' never rendered within %ss"
