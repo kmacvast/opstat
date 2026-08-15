@@ -399,3 +399,53 @@ def test_drill_entry_paints_loading_frame_before_work(nvme, monkeypatch):
     assert first_render[1], "loading status was empty in the pre-work frame"
     assert "stand by" in first_render[1]
     assert engine.DRILL_STATUS is None, "loading status not cleared"
+
+
+# ---------------------------------------------------------------------------
+# Responsiveness: the round-3 var203 run left an "x" unprocessed for 150+ s
+# because one refresh cycle is several serial queries at 2-38 s each and keys
+# are only read between cycles. Two fixes are covered here: queued input
+# aborts the remaining queries of a cycle, and an open drill moves the
+# headline monitors to the drill cadence instead of every 5 s tick.
+# ---------------------------------------------------------------------------
+def test_pending_input_aborts_the_rest_of_the_headline_cycle(nvme, monkeypatch):
+    engine, vms = nvme
+    engine.fetch_monitor_query()          # baseline rows
+    rows_before = engine.LAST_ROWS
+    assert rows_before, "baseline fetch produced no rows"
+
+    monkeypatch.setattr(engine.vast_common, "input_pending", lambda: True)
+    vms.reset_calls()
+    engine.fetch_monitor_query()
+    queries = [c for c in vms.calls() if "/query/" in str(c[2])]
+    # proto + first ops monitor at most: the cycle must yield after noticing
+    # the pending keystroke, not run all monitors serially.
+    assert len(queries) <= 2, f"cycle ran {len(queries)} queries with input pending"
+    assert engine.LAST_ROWS == rows_before, "aborted cycle must keep prior rows"
+
+
+def test_open_drill_moves_headline_to_drill_cadence(nvme, monkeypatch):
+    engine, vms = nvme
+    engine.enter_drill_mode("cnode")
+    assert engine.DRILL_ERROR is None
+    engine._LAST_HEADLINE_AT = 0.0
+    engine.poll_tick()                    # due -> headline + drill
+    vms.reset_calls()
+    engine.poll_tick()                    # immediately again -> throttled
+    paths = [str(c[2]) for c in vms.calls()]
+    headline = [p for p in paths
+                if any(f"/monitors/{m}/" in p for m in engine.OPS_MONITOR_IDS)]
+    assert headline == [], (
+        "headline re-queried on the 5 s tick while a drill is open")
+
+
+def test_manual_refresh_still_forces_headline_in_drill(nvme):
+    engine, vms = nvme
+    engine.enter_drill_mode("cnode")
+    engine.poll_tick()
+    vms.reset_calls()
+    engine.manual_refresh()
+    paths = [str(c[2]) for c in vms.calls()]
+    headline = [p for p in paths
+                if any(f"/monitors/{m}/" in p for m in engine.OPS_MONITOR_IDS)]
+    assert headline, "space no longer forces the headline monitors"

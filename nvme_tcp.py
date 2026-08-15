@@ -1220,6 +1220,23 @@ def write_csv_rows(rows, selected_sample):
             ])
 
 
+def _query_ops_monitors_interruptible(monitor_ids):
+    """Query each monitor, yielding to queued input between calls.
+
+    One headline cycle is several serial queries at 2-38 s each on var203.
+    If a keystroke arrives mid-cycle, the remaining queries are abandoned
+    (None) so the main loop can process it within one call's latency instead
+    of the whole cycle's - the round-3 run left an ``x`` unprocessed for
+    150+ s. The caller treats an aborted cycle as "no new data".
+    """
+    results = []
+    for idx, monitor_id in enumerate(monitor_ids):
+        if idx and vast_common.input_pending():
+            return None
+        results.append(api_request("GET", f"/monitors/{monitor_id}/query/"))
+    return results
+
+
 def fetch_monitor_query():
     global LAST_ROWS, LAST_SAMPLE, PREV_ROWS, LAST_POLL_MONOTONIC
     PREV_ROWS = LAST_ROWS
@@ -1228,8 +1245,14 @@ def fetch_monitor_query():
     proto_result = api_request("GET", f"/monitors/{PROTO_MONITOR_ID}/query/") if PROTO_MONITOR_ID else None
 
     if VOLUME_SCOPED and CLUSTER_SUPPLEMENT_MONITOR_IDS:
-        vol_results = query_ops_monitors(OPS_MONITOR_IDS)
-        cluster_results = query_ops_monitors(CLUSTER_SUPPLEMENT_MONITOR_IDS)
+        vol_results = _query_ops_monitors_interruptible(OPS_MONITOR_IDS)
+        if vol_results is None:
+            LAST_ROWS = PREV_ROWS
+            return
+        cluster_results = _query_ops_monitors_interruptible(CLUSTER_SUPPLEMENT_MONITOR_IDS)
+        if cluster_results is None:
+            LAST_ROWS = PREV_ROWS
+            return
         vol_rows, sample = build_rows_from_results(
             vol_results, proto_result, scope="volume", poll_time=poll_time,
             ops_rows=volume_primary_ops_rows(),
@@ -1242,7 +1265,10 @@ def fetch_monitor_query():
         if sample == "-" and cluster_sample != "-":
             sample = cluster_sample
     else:
-        ops_results = query_ops_monitors(OPS_MONITOR_IDS)
+        ops_results = _query_ops_monitors_interruptible(OPS_MONITOR_IDS)
+        if ops_results is None:
+            LAST_ROWS = PREV_ROWS
+            return
         scope = "volume" if VOLUME_SCOPED else "cluster"
         rows, sample = build_rows_from_results(
             ops_results, proto_result, scope=scope, poll_time=poll_time,
@@ -1973,16 +1999,37 @@ def _render_help_bar(width):
         print(c("  ", _DIM) + line, flush=True)
 
 
+_LAST_HEADLINE_AT = 0.0
+
+
 def poll_tick():
-    """One refresh poll: cluster monitors plus the active drill, if any."""
-    fetch_monitor_query()
+    """One refresh poll: cluster monitors plus the active drill, if any.
+
+    While a drill is open the headline monitors move to the drill cadence
+    (15 s) instead of every 5 s tick: the headline is several serial queries
+    at 2-38 s each on var203, so re-fetching it every tick left the loop
+    permanently behind schedule and keystrokes waiting behind whole cycles.
+    Object-scoped block families publish ~1/min, so nothing is lost. The
+    space bar (manual_refresh) still forces everything.
+    """
+    global _LAST_HEADLINE_AT, STARTUP_STATUS
+    now = time.monotonic()
+    if not DRILL_MODE or now - _LAST_HEADLINE_AT >= _DRILL_MIN_QUERY_INTERVAL:
+        fetch_monitor_query()
+        _LAST_HEADLINE_AT = now
+        if LAST_ROWS:
+            STARTUP_STATUS = None
     if DRILL_MODE:
         fetch_drill_query()
 
 
 def manual_refresh():
     """Space-bar refresh: cluster monitors plus a forced (un-throttled) drill query."""
+    global _LAST_HEADLINE_AT, STARTUP_STATUS
     fetch_monitor_query()
+    _LAST_HEADLINE_AT = time.monotonic()
+    if LAST_ROWS:
+        STARTUP_STATUS = None
     if DRILL_MODE:
         fetch_drill_query(force=True)
 
@@ -2113,14 +2160,18 @@ def initialize():
         configure_volume_scope(ARGS)
         create_cluster_monitors()
 
-    def _gather():
-        fetch_monitor_query()
-
     vast_drill.with_startup_status(_set_startup_status, render_screen, [
         (f"Connecting to {VMS}:{PORT}, please stand by...", _connect),
         (lambda: f"Preparing metrics on {CLUSTER_NAME or VMS}, please stand by...", _prepare),
-        ("Gathering initial metrics, please stand by...", _gather),
     ])
+    # The first query cycle is NOT awaited before the dashboard appears: on
+    # var203 it is several serial queries totalling ~80 s, and blocking here
+    # pushed first paint to 166 s with keys dead the whole time. The
+    # "Gathering" status persists on the rendered (footer-owning) waiting
+    # frame and poll_tick clears it when the first cycle lands - the main
+    # loop starts that cycle immediately and keys are live from this moment.
+    _set_startup_status("Gathering initial metrics, please stand by...")
+    render_screen()
 
 
 def main():
@@ -2138,7 +2189,10 @@ def main():
     initialize()
     render_screen()
 
-    next_refresh_time = time.time() + REFRESH_SECONDS
+    # First poll is due NOW: initialize() no longer blocks on the first
+    # query cycle, so the loop starts gathering immediately while keys are
+    # already live.
+    next_refresh_time = time.time()
     while True:
         now = time.time()
         chars = check_keypress()

@@ -64,9 +64,16 @@ def test_startup_paints_a_frame_before_each_blocking_step(engine_name, monitor_f
 
     module.initialize()
 
-    # The three blocking calls happen in order...
+    # The blocking calls happen in order. NVMe deliberately does NOT block
+    # startup on the first query cycle: on var203 that cycle is ~80 s of
+    # serial queries and awaiting it pushed first paint to 166 s with keys
+    # dead. Its "Gathering" status persists on the rendered waiting frame
+    # and poll_tick clears it when the first cycle lands.
     calls = [d for k, d in events if k == "call"]
-    assert calls == ["get_current_cluster", monitor_fn, "fetch_monitor_query"], calls
+    if engine_name == "nvme_tcp":
+        assert calls == ["get_current_cluster", monitor_fn], calls
+    else:
+        assert calls == ["get_current_cluster", monitor_fn, "fetch_monitor_query"], calls
     # ...and every one of them is immediately preceded by a rendered frame whose
     # status was already set (the user sees what the process is waiting on).
     for i, (kind, _detail) in enumerate(events):
@@ -76,8 +83,16 @@ def test_startup_paints_a_frame_before_each_blocking_step(engine_name, monitor_f
             assert events[i - 1][1], "status not set before %s" % _detail
     # The first frame names the host (cluster name is unknown that early).
     assert events[0] == ("render", None) or "Connecting" in (events[0][1] or ""), events[0]
-    # Status is cleared once startup finishes.
-    assert module.STARTUP_STATUS is None
+    if engine_name == "nvme_tcp":
+        # The dashboard appears with the Gathering status still visible on
+        # the footer-owning waiting frame; the first poll cycle clears it.
+        assert module.STARTUP_STATUS is not None
+        assert "Gathering" in module.STARTUP_STATUS
+        assert events[-1][0] == "render", "no frame rendered with the Gathering status"
+        module.STARTUP_STATUS = None
+    else:
+        # Status is cleared once startup finishes.
+        assert module.STARTUP_STATUS is None
 
 
 @pytest.mark.parametrize("engine_name,monitor_fn", ENGINES)

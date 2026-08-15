@@ -768,6 +768,25 @@ def check_keypress():
     return strip_escape_sequences(b"".join(chunks).decode(errors="ignore"))
 
 
+def input_pending():
+    """True when stdin has unread keystrokes (non-blocking, zero timeout).
+
+    Lets a long serial fetch cycle notice queued input BETWEEN API calls and
+    yield back to the main loop early: on var203 one refresh cycle is several
+    monitor queries at 2-38 s each, and a keypress used to wait for the whole
+    cycle - an ``x`` went unprocessed for 150+ s in the round-3 lab run.
+    False when keyboard polling is inactive (piped stdin, tests, non-POSIX),
+    so fetch loops behave exactly as before in those environments.
+    """
+    if not _TERM_ENABLED:
+        return False
+    try:
+        readable, _w, _e = select.select([sys.stdin.fileno()], [], [], 0)
+        return bool(readable)
+    except Exception:
+        return False
+
+
 def wait_for_input(timeout):
     """Block until stdin has data or *timeout* seconds elapse; True on input.
 
