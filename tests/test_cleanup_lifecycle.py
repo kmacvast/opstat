@@ -164,3 +164,51 @@ def test_engine_cleanup_reattempts_drain_when_it_is_interrupted(monkeypatch):
         assert calls["n"] == 2, "second cleanup skipped the drain"
     finally:
         smb._CLEANED_UP = False
+
+
+def test_engine_cleanup_survives_an_injected_delete_failure(tmp_path, monkeypatch):
+    """End-to-end through the mock: one monitor's DELETE fails with HTTP 500;
+    every other session monitor must still be removed and the failure
+    reported - the drain must never let one bad delete orphan the rest."""
+    pytest.importorskip("ssl")
+    import shutil as _shutil
+
+    if _shutil.which("openssl") is None:
+        pytest.skip("openssl binary required to generate the mock VMS certificate")
+    from types import SimpleNamespace
+
+    from tests.mock_vms import MockVMS
+
+    import nvme_tcp
+
+    vms = MockVMS(certdir=str(tmp_path)).start()
+    try:
+        monkeypatch.setenv("VAST_TOKEN", "test-token")
+        nvme_tcp.init_config(SimpleNamespace(
+            vms="127.0.0.1", port=vms.port, user="admin", password=None,
+            sample_average=None, refresh=5, csv=None, no_color=True,
+            discover_metrics=False, log_api_calls=False,
+            export_openmetrics=False, openmetrics_file=None,
+            volumes=None, volume=None))
+        nvme_tcp.CLUSTER_ID, nvme_tcp.CLUSTER_NAME = nvme_tcp.get_current_cluster()
+        nvme_tcp.create_cluster_monitors()
+        created = set(nvme_tcp.OPS_MONITOR_IDS) | {nvme_tcp.PROTO_MONITOR_ID}
+        victim = sorted(created)[2]
+        vms.state.fail_delete_ids = {victim}
+
+        monkeypatch.setattr(nvme_tcp, "restore_terminal", lambda: None)
+        nvme_tcp._CLEANED_UP = False
+        nvme_tcp.cleanup()
+
+        live = set(vms.live_monitors())
+        assert live == {victim}, (
+            f"drain stopped early: {sorted(live)} still live, expected only {victim}")
+        assert victim in [mid for mid, _d in vast_common.failed_deletes()], (
+            "the failed delete was not reported")
+    finally:
+        vms.state.fail_delete_ids = set()
+        nvme_tcp._CLEANED_UP = False
+        nvme_tcp.cleanup()
+        nvme_tcp._CLEANED_UP = False
+        vast_common.close_connection()
+        vms.stop()

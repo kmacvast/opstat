@@ -371,6 +371,10 @@ class _State:
         # The exact var203 shape is not yet distinguished, so both are
         # modelled and both must force the per-object fallback.
         self.batch_unsplittable = {}
+        # Monitor ids whose DELETE fails with HTTP 500 (each id fails every
+        # attempt). Models the round-3 var203 shutdown, where one failing
+        # delete aborted the drain loop and orphaned the monitors after it.
+        self.fail_delete_ids = set()
         # Reproduce observed VMS 5.5.0.1 behavior: the newest bucket of an
         # object-scoped monitor is still filling, so every property except
         # the ones listed here comes back null in that row. Set to None to
@@ -623,6 +627,8 @@ class _Handler(BaseHTTPRequestHandler):
         if not m:
             return self._error(404, f"no mock route for {path}")
         monitor_id = int(m.group(1))
+        if monitor_id in self.state.fail_delete_ids:
+            return self._error(500, "delete failed (injected)")
         with self.state.lock:
             existed = self.state.monitors.pop(monitor_id, None)
         if existed is None:

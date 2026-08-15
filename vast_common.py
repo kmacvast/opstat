@@ -535,9 +535,23 @@ def drain_monitors(delete_fn):
         except (ValueError, OSError):
             previous_mask = None
     try:
-        for monitor_id in list(_CREATED_MONITORS):
-            delete_fn(monitor_id)
+        # Continue through EVERY owned monitor even when one delete raises
+        # (engine delete wrappers normally record-and-swallow, but the drain
+        # must not depend on that), and show truthful progress on a long
+        # drain: the round-3 var203 shutdown was draining 206 monitors at
+        # ~2 s each - the observer gave up at 362 s with 9 to go, reading a
+        # working drain as a hang. Real counts only, no fake progress.
+        pending = list(_CREATED_MONITORS)
+        total = len(pending)
+        for done, monitor_id in enumerate(pending, 1):
+            try:
+                delete_fn(monitor_id)
+            except Exception as exc:              # noqa: BLE001 - report, keep draining
+                record_failed_delete(monitor_id, str(exc)[:80])
             _CREATED_MONITORS.discard(monitor_id)
+            if total >= 20 and (done % 10 == 0 or done == total):
+                print("  ... %d/%d monitors removed" % (done, total),
+                      file=sys.stderr, flush=True)
     finally:
         if previous_mask is not None:
             try:
