@@ -1,109 +1,99 @@
-Absolutely. For the work laptop, you do not need to run the var203 validator. The work laptop’s job is to sync the published branch and verify the code/test state there. The real-VMS validation belongs on the Linux lab server.
-
-WORK LAPTOP
-
-1. Go to the repo and make sure you don’t have local work
-
-cd ~/git/opstat
+vastdata@kevin-mcdonald-ubu-01:~/git/opstat$ cd ~/git/opstat
 git status --short
+git branch --show-current
 
-If that prints anything, stop there and show me the output before doing the checkout/merge.
+refactor/tui-performance-local-continuation-wip
+vastdata@kevin-mcdonald-ubu-01:~/git/opstat$ git status --short
+vastdata@kevin-mcdonald-ubu-01:~/git/opstat$ git fetch origin
 
-If it is clean, continue.
+git switch refactor/tui-performance-local-continuation-wip
 
-2. Fetch the published branch
-
-git fetch origin refactor/tui-performance-local-continuation-wip
-
-Then:
-
-git checkout refactor/tui-performance-local-continuation-wip
 git merge --ff-only origin/refactor/tui-performance-local-continuation-wip
-
-3. Verify you landed on exactly the published version
-
+remote: Enumerating objects: 58, done.
+remote: Counting objects: 100% (58/58), done.
+remote: Compressing objects: 100% (8/8), done.
+remote: Total 38 (delta 30), reused 38 (delta 30), pack-reused 0 (from 0)
+Unpacking objects: 100% (38/38), 26.34 KiB | 252.00 KiB/s, done.
+From github.com:kmacvast/opstat
+   96f284e..d0d42ad  refactor/tui-performance-local-continuation-wip -> origin/refactor/tui-performance-local-continuation-wip
+Already on 'refactor/tui-performance-local-continuation-wip'
+Your branch is behind 'origin/refactor/tui-performance-local-continuation-wip' by 5 commits, and can be fast-forwarded.
+  (use "git pull" to update your local branch)
+Updating 96f284e..d0d42ad
+Fast-forward
+ docs/CLAUDE_HANDOFF.md                                         |  50 +++++++++++++++++++++++++++-----
+ docs/REFACTOR_HANDOFF.md                                       |  86 +++++++++++++++++++++++++++++++++++++++++++++++++------
+ docs/VAST_LAB_HANDOFF.md                                       | 140 ++++++++++++++++++++++++++++++++++++++++++++++++-----------------------------------------
+ docs/decisions/D-013-nvme-drill-batching-is-scope-dependent.md |  26 +++++++++++------
+ nfs_v3.py                                                      |  69 +++++++++++++++++++++-----------------------
+ nfs_v41.py                                                     |  60 +++++++++++++++++++++++----------------
+ nvme_tcp.py                                                    | 104 +++++++++++++++++++++++++++++++++++++++---------------------------
+ s3.py                                                          |  42 ++++++++++++++++-----------
+ scripts/var203_validation/probe_var203.py                      |  60 +++++++++++++++++++++++++++++++++++++++
+ scripts/var203_validation/run_var203_validation.py             | 112 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++------------
+ smb.py                                                         |  40 ++++++++++++++++----------
+ tests/test_key_dispatch.py                                     | 186 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ tests/test_nvme_drill.py                                       |  78 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ tests/test_render_navigation.py                                |  82 +++++++++++++++++++++++++++++++++++++++++++++++++++++
+ vast_drill.py                                                  |  79 +++++++++++++++++++++++++++++++++++++++++++++++++++
+ 15 files changed, 974 insertions(+), 240 deletions(-)
+ create mode 100644 tests/test_key_dispatch.py
+vastdata@kevin-mcdonald-ubu-01:~/git/opstat$ echo "===== WORK LAPTOP READY ====="
+git branch --show-current
 git rev-parse HEAD
-
-It must print:
-
-25220c24afb9e45de9b8193d30a503ded9e4a9af
-
-Then verify the recent history:
-
-git log -6 --oneline
-
-The top four commits should be:
-
+git status --short
+git log -7 --oneline --decorate
+===== WORK LAPTOP READY =====
+refactor/tui-performance-local-continuation-wip
+d0d42adbe0b2f4359fddee038f2c23dd8033e166
+d0d42ad (HEAD -> refactor/tui-performance-local-continuation-wip, origin/refactor/tui-performance-local-continuation-wip) updated instructions from Sheila
 25220c2 docs: reconcile round-2 var203 evidence
 23a5e45 validation: state-aware lab driver and merge-legality probes
 eb65cde input: honor every queued keystroke in all five engines
 5a41b46 nav: wrap the footer legend instead of truncating it
+96f284e updated instructions from Sheila
+4c449cc validation: automated lab driver and round-1 evidence reconciliation
+vastdata@kevin-mcdonald-ubu-01:~/git/opstat$ ./scripts/validate.sh
+------------------------------------------------------------
+opstat validation gate
+------------------------------------------------------------
+Tooling
+  openssl         : OpenSSL 3.0.13 30 Jan 2024 (Library: OpenSSL 3.0.13 30 Jan 2024)
+  interpreter     : Python 3.12.3
+  uv              : uv 0.12.5 (x86_64-unknown-linux-gnu)
 
-4. Verify the work laptop tree is clean
+Documentation
+  links           : 276 relative documentation links OK (6 known-broken references skipped -- see KNOWN_BROKEN)
 
-git status --short
+Collection
+  collected       : 563 (floor 465)
 
-Expected: no output.
+Suite: current Python (Python 3.12.3)
+........................................................................ [ 12%]
+........................................................................ [ 25%]
+........................................................................ [ 38%]
+........................................................................ [ 51%]
+........................................................................ [ 63%]
+........................................................................ [ 76%]
+........................................................................ [ 89%]
+...........................................................              [100%]
+563 passed in 380.72s (0:06:20)
+  result          : 563 passed, 0 failed, 0 skipped, 0 error
 
-5. Run the full validation gate
+Suite: Python 3.8 (uv)
+........................................................................ [ 12%]
+........................................................................ [ 25%]
+........................................................................ [ 38%]
+........................................................................ [ 51%]
+........................................................................ [ 63%]
+........................................................................ [ 76%]
+........................................................................ [ 89%]
+...........................................................              [100%]
+563 passed in 388.61s (0:06:28)
+  result          : 563 passed, 0 failed, 0 skipped, 0 error
 
-On the work laptop:
-
-./scripts/validate.sh
-
-The published baseline we’re expecting is:
-
-563 collected
-563 passed
-0 failed
-0 skipped
-
-on both the current Python and Python 3.8, plus:
-
-276 relative documentation links OK
-
-The important final line is:
-
+------------------------------------------------------------
 RESULT: PASS
-
-This may take a while, so coffee protocol is authorized. ☕
-
-6. Run the focused regression suites
-
-After the full gate passes:
-
-pytest -q \
-  tests/test_render_navigation.py \
-  tests/test_nvme_drill.py \
-  tests/test_nvme_tcp.py \
-  tests/test_key_dispatch.py
-
-Expected:
-
-233 passed
-
-These specifically cover the work we just published: footer navigation, queued-key handling, NVMe drill behavior, and related navigation contracts.
-
-7. Final work-laptop state check
-
-echo
-echo "===== WORK LAPTOP FINAL STATE ====="
-git branch --show-current
-git rev-parse HEAD
-git status --short
-
-Expected:
-
-===== WORK LAPTOP FINAL STATE =====
-refactor/tui-performance-local-continuation-wip
-25220c24afb9e45de9b8193d30a503ded9e4a9af
-
-And then nothing from git status --short.
-
-⸻
-
-At that point the three-machine state is cleanly separated:
-
-Personal MacBook: synced to 25220c2, and you have personally visually verified the footer fix. Work laptop: the steps above establish that the published branch also passes from your normal development environment. Linux lab server: separately sync it to 25220c2 and run the new real-var203 validator with the block and NFSv4.1 load generators active.
-
-Once the work laptop finishes ./scripts/validate.sh, paste me that output. We can record the work-laptop validation before moving on to the second var203 run.
+  Current Python and Python 3.8 both green, nothing skipped.
+------------------------------------------------------------
+vastdata@kevin-mcdonald-ubu-01:~/git/opstat$
