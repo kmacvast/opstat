@@ -122,6 +122,48 @@ constraint of this build, not history — headline consolidation must not be
 attempted around these combinations. Startup cost work has to come from
 elsewhere (the first-paint no longer blocks on the initial query cycle).
 
+## Round 4: the storm the redesign missed, and the verdict moved first
+
+The fourth lab run validated the bounded batch probe (4 creates, 1 query,
+teardown - exactly as designed) and cNode end-to-end (13 calls, batch layout,
+real rows, 28 s), and then exposed a defect UPSTREAM of all of it: the VIP
+rank scan itself created **189 monitors** (`rank_vip_0,2,4,...,376` - chunk
+size 2, all 378 VIPs in pairs, 34 minutes). The DrillSession's discovered
+rank-chunk size was a single value shared across object types: the 2-cNode
+scan "learned" that chunks of 2 work, and that size then capped the VIP scan.
+A size learned because a scope IS small is not capability evidence.
+
+Two structural changes follow, and they pin down a distinction this record
+now states explicitly - these are **three separate questions that must never
+share a cache or a boolean**:
+
+1. **Rank-batching capability** (what `object_ids` count will the cluster
+   accept in one rank monitor?) - cached per `object_type`, and only when a
+   larger size was actually refused first (`was_cap`), never merely because a
+   small population fit in one chunk.
+2. **Telemetry availability** (does this scope return per-object rows at
+   all?) - decided by a bounded O(1) capability probe (`DrillSession.
+   probe_scope`, one monitor over <= 8 sampled ids) BEFORE any
+   population-scaled ranking, for scopes larger than the panel. Small scopes
+   reach the same verdict through their single rank chunk. The verdict is
+   cached per session; a dead scope re-renders its notice for free. The probe
+   is opt-in: the proven NFS/SMB/S3 callers rank scopes whose telemetry is
+   already established and are untouched.
+3. **Display-batch splittability** (can one display monitor serve all
+   selected objects?) - unchanged: response-validated at entry per this
+   record's original decision.
+
+Dead-scope discovery cost is now constant - mock-proven at populations 10,
+100, 500 and 1000 with a fixed create budget of <= 3 - and the honest
+no-telemetry notice renders (with footer) whether or not the dashboard has
+data yet, with `x` returning to the dashboard.
+
+Round 4 also proved the cleanup invariant the hard way: the abandoned session
+leaked its eight headline monitors because the shutdown banner's write to a
+dead PTY raised EIO and killed `cleanup()` before the drain. Cleanup output is
+now best-effort by construction (`vast_common.emit_stderr`); monitor deletion
+never depends on a writable terminal.
+
 ## What would justify reopening
 
 A VAST build returning per-object rows at `vip`/`blockhost` scope — which the

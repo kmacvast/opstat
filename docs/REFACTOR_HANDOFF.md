@@ -442,9 +442,11 @@ Mock-measured budgets (counts transfer to a real cluster; wall-clock does not):
   **Round 3 measured the fallback cost and it forced a redesign** (see the
   round-3 block below and D-013): vip 43 monitors / 464 s, blockhost 41
   monitors / 720 s, zero usable rows from either.
-- `/blockhosts/` is **deliberately not modeled in the mock** (no real API
-  evidence for its response shape); the host drill shares the cnode/vip code
-  path and is exercised only on a real cluster.
+- `/blockhosts/` is now **modeled in the mock from real probe evidence**
+  (three var203 rounds: six objects, `name`/`nqn` fields, BlockMetrics echoed
+  unrewritten, zero per-object rows on that build). The host drill has mock
+  coverage for both the dead-scope contract (populations 6/10/100/500/1000,
+  fixed create budget) and the live-scope case a future build would present.
 - `--volumes` scoping unchanged (its VolumeMetrics monitors were already
   per-scope).
 
@@ -553,8 +555,14 @@ PENDING (round 4).
 5. **Validator toggle-state artifact**: `nav.p_does_not_exit FAIL` was the
    validator sending `c` while the drill was already open (its exit had
    failed) - the toggle closed it and the check blamed `p`. `p` is bound
-   nowhere in the repository; cross-engine retired-alias tests now prove it,
-   and the validator establishes dashboard state before judging.
+   nowhere in the repository; cross-engine retired-alias tests prove it.
+   **Correction (round 4):** the dashboard-state gating this section
+   originally claimed as landed had NOT actually shipped - the patch script
+   that carried it aborted before writing and the round-3 commit message
+   overstated its content. It genuinely landed in the round-4 remediation,
+   along with the `NO_TELEMETRY_MARKER` definition whose absence crashed the
+   round-4 validator (the marker is now imported from `nvme_tcp`, so the
+   contract cannot drift or dangle).
 
 **Latency (round 3):** the NFS4Common known-µs reference read 0 again (idle
 NFS4 in the probe window despite the loadgen), so BlockMetrics (546.5) and
@@ -563,6 +571,55 @@ traffic BlockMetrics measures) remain **UNVERIFIED**. The ~650x ratio between
 host_view BLOCK latency and BlockMetrics read latency for concurrent block
 traffic is recorded as suggestive (ms vs µs) but is NOT proof; no display
 change was made.
+
+## Round-4 lab findings and remediation (var203, cluster-adjacent host)
+
+**Validated on the real cluster (round 4):** startup phases + footer with
+first dashboard at **67.62 s** (was 166 s); cNode drill fully green - 13-call
+entry, batch layout, real rows, 28.04 s, forced refresh, `x` exits; merge
+probes re-confirmed rejected; probe cleanup 8/8.
+
+**The VIP monitor storm, root-caused from the pid-3930933 log:** the VIP rank
+scan created **189 monitors in pairs** (`rank_vip_0,2,...,376`) over 34
+minutes. Cause: `DrillSession`'s discovered rank-chunk size was shared across
+object types - the 2-cNode scan taught it "2", which then capped the 378-VIP
+scan. The round-3 no-telemetry gate itself worked (bounded 4-create batch
+probe, no per-object fan-out afterwards), but it sat *downstream* of the
+population-scaled ranking.
+
+**Remediation (this pass, mock-proven, REAL-VMS VALIDATION PENDING round 5):**
+
+- Rank-chunk capability cached **per object_type**, and only when a larger
+  size was actually refused (`was_cap`) - a small population can no longer
+  poison another scope's scan. Literal regression: cnode(2) then vip(378)
+  must produce <= 2 VIP rank monitors (fails on the round-4 code with 189).
+- **Bounded capability pre-probe** (`DrillSession.probe_scope`, opt-in, one
+  monitor over <= 8 ids) decides telemetry availability BEFORE ranking for
+  scopes larger than the panel; verdict cached per session. Dead-scope
+  discovery is O(1): populations 10/100/500/1000 all cost <= 3 creates
+  (parametrized tests). Rank capability, telemetry availability and display
+  splittability are now three explicitly separate questions (D-013).
+- The no-telemetry notice actually **renders** now (drill panel and waiting
+  frame both; with footer; `x` exits) - the round-3 notice was set but the
+  mode-less state never reached the panel renderer.
+- **Cleanup no longer depends on a writable terminal**: the round-4 leak of
+  the eight headline monitors was the shutdown banner's EIO on a dead PTY
+  killing `cleanup()` pre-drain. All cleanup output routes through
+  best-effort `vast_common.emit_stderr`; tests prove a dead stderr still
+  drains every owned monitor, end-to-end through the mock.
+- **Validator**: `NO_TELEMETRY_MARKER` imported from the product (the
+  round-4 NameError is structurally impossible); scenario exceptions now
+  quit the session and run exact-id cleanup accounting via `finally`
+  (unit-tested); nav `p` judged only with the drill confirmed open, else
+  UNVERIFIED; `--round5` runs the narrow NVMe-only re-validation.
+- Two **vacuous test filters** found and fixed: rank-monitor budget
+  assertions matched against the calls-tuple status column and could never
+  fail; the mock now records created monitor names
+  (`created_monitor_names()`) and the assertions are real.
+
+**Round-5 targets (NOT yet measured):** VIP/HOST entry in seconds with the
+honest notice and <= 3 creates each; session total ~20 creates (round 4:
+206); clean `q` with zero remaining ids.
 
 ## Test architecture
 
