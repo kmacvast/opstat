@@ -560,6 +560,67 @@ def test_no_telemetry_state_renders_notice_and_x_exits(nvme, capsys):
         vms.state.batch_unsplittable = {}
 
 
+def test_validator_contract_matches_the_product_notice():
+    """The lab validator imports the marker from the product; the notice the
+    product renders must actually contain it (round 4 crashed on a marker
+    that was referenced but never defined)."""
+    import nvme_tcp
+
+    notice = nvme_tcp._no_telemetry_notice("vip")
+    assert nvme_tcp.NO_TELEMETRY_MARKER in notice
+    import importlib.util as _ilu
+    spec = _ilu.spec_from_file_location(
+        "run_var203_validation",
+        "scripts/var203_validation/run_var203_validation.py")
+    mod = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert mod.NO_TELEMETRY_MARKER == nvme_tcp.NO_TELEMETRY_MARKER
+
+
+def test_validator_scenario_exception_still_quits_the_session(monkeypatch):
+    """Round 4: a NameError mid-scenario abandoned the opstat process, which
+    ran headless for 24 minutes and leaked its headline monitors when the
+    dying PTY finally killed it. Whatever the scenario raises, the session
+    must be quit and its cleanup accounting must run."""
+    import importlib.util as _ilu
+
+    spec = _ilu.spec_from_file_location(
+        "run_var203_validation",
+        "scripts/var203_validation/run_var203_validation.py")
+    val = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(val)
+
+    events = []
+
+    class _FakeSession:
+        exit_code = None
+        output = ""
+
+        def start(self):
+            events.append("start")
+            return self
+
+        def quit(self, *_a, **_k):
+            events.append("quit")
+            self.exit_code = 0
+            return 0.0
+
+    monkeypatch.setattr(val, "OpstatSession",
+                        lambda *a, **k: _FakeSession())
+    monkeypatch.setattr(val, "_scenario_nvme_body",
+                        lambda *_a: (_ for _ in ()).throw(NameError("boom")))
+    monkeypatch.setattr(val, "_cleanup_scenario",
+                        lambda *_a, **_k: events.append("cleanup"))
+
+    args = type("A", (), {"drain_budget": 1, "vms": "unused.invalid",
+                          "user": "admin", "vms_port": 443})()
+    with pytest.raises(NameError):
+        val.scenario_nvme(args)
+    assert "quit" in events, "exception path abandoned the opstat session"
+    assert "cleanup" in events, "exception path skipped cleanup accounting"
+    assert events.index("quit") < events.index("cleanup")
+
+
 # ---------------------------------------------------------------------------
 # Blockhost: same dead-scope contract as VIP. The inventory shape is modeled
 # from three rounds of real var203 probe evidence (six objects, name + nqn,

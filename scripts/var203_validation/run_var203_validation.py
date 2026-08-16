@@ -71,6 +71,12 @@ DRILL_TITLES = {
     "host": "HOST INITIATORS",
 }
 
+# The no-telemetry contract comes from the product itself, so the validator
+# cannot drift from what the panel actually says. Round 4 crashed on a marker
+# that was referenced but never defined; importing it makes that structurally
+# impossible, and a unit test asserts the notice really contains the marker.
+from nvme_tcp import NO_TELEMETRY_MARKER            # noqa: E402
+
 
 class Report(object):
     """Accumulates lines for the result file and the verdict tallies."""
@@ -481,10 +487,39 @@ def verify_ids_gone(ids, args):
 # Scenario A: NVMe startup
 # ---------------------------------------------------------------------------
 def scenario_nvme(args):
+    """NVMe scenario with a guaranteed session lifecycle.
+
+    Round 4: a NameError inside the VIP section was caught by main()'s
+    wrapper, which moved on to the next protocol WITHOUT quitting this
+    session - opstat ran headless for 24 more minutes and its headline
+    monitors leaked when the dying PTY finally killed it. Whatever happens
+    inside the scenario, the finally block quits the process cleanly and
+    runs the exact-id cleanup accounting.
+    """
     REPORT.log("\n=== A. NVMe startup + dashboard ===")
     session = OpstatSession(
         "nvme", ["--block", "--nvme-over-tcp"], args.vms, args.user, args.vms_port,
     ).start()
+    try:
+        return _scenario_nvme_body(session, args)
+    finally:
+        if session.exit_code is None:
+            REPORT.log("\n=== G. NVMe shutdown ===")
+            shutdown_s = session.quit(args.drain_budget)
+            tail = strip_ansi(session.output)
+            cleanup_seen = CLEANUP_MARKER in tail
+            REPORT.log("  shutdown wall-clock : %.2fs" % shutdown_s)
+            REPORT.log("  exit code           : %s" % session.exit_code)
+            REPORT.verdict("nvme.shutdown.frame", PASS if cleanup_seen else FAIL,
+                           "'%s' shown before the drain" % CLEANUP_MARKER
+                           if cleanup_seen else "no cleanup message")
+            REPORT.verdict("nvme.shutdown.exit",
+                           PASS if session.exit_code == 0 else FAIL,
+                           "exit=%s in %.2fs" % (session.exit_code, shutdown_s))
+        _cleanup_scenario(session, args, "nvme")
+
+
+def _scenario_nvme_body(session, args):
 
     phase_times = {}
     for phase in STARTUP_PHASES:
@@ -546,20 +581,8 @@ def scenario_nvme(args):
     # --- Navigation ---------------------------------------------------------
     _navigation_scenario(session, args)
 
-    # --- Shutdown -----------------------------------------------------------
-    REPORT.log("\n=== G. NVMe shutdown ===")
-    shutdown_s = session.quit(args.drain_budget)
-    tail = strip_ansi(session.output)
-    cleanup_seen = CLEANUP_MARKER in tail
-    REPORT.log("  shutdown wall-clock : %.2fs" % shutdown_s)
-    REPORT.log("  exit code           : %s" % session.exit_code)
-    REPORT.verdict("nvme.shutdown.frame", PASS if cleanup_seen else FAIL,
-                   "'%s' shown before the drain" % CLEANUP_MARKER if cleanup_seen
-                   else "no cleanup message")
-    REPORT.verdict("nvme.shutdown.exit", PASS if session.exit_code == 0 else FAIL,
-                   "exit=%s in %.2fs" % (session.exit_code, shutdown_s))
-
-    _cleanup_scenario(session, args, "nvme")
+    # Shutdown + cleanup accounting are owned by scenario_nvme's finally, so
+    # they run on the exception path too.
     return drill_results
 
 
@@ -761,17 +784,28 @@ def _navigation_scenario(session, args):
         session.send(" ", settle=args.refresh_settle)
         return strip_ansi(session.output[mark:]) or strip_ansi(session.output[-6000:])
 
-    # 'p' must not exit a drill (retired NVMe binding).
+    # 'p' must not exit a drill (retired NVMe binding). The drill keys
+    # TOGGLE: in round 4 a previous phase had left the cNode drill open, so
+    # sending "c" here CLOSED it and the frame check blamed p - a false
+    # "retired binding still live". Establish dashboard state first, and only
+    # judge p with the drill positively CONFIRMED open; anything less is
+    # UNVERIFIED, never FAIL.
+    if DRILL_TITLES["cnode"] in _last_frame(session):
+        _exit_drill(session, DRILL_TITLES["cnode"], args)
     mark = len(session.output)
     session.send("c")
-    session.wait_for_since(DRILL_TITLES["cnode"], mark, args.drill_budget)
-    session.send("p", settle=2.0)
-    current_frame()                       # force a repaint (p alone paints nothing)
-    still_in = DRILL_TITLES["cnode"] in _last_frame(session)
-    REPORT.verdict("nav.p_does_not_exit", PASS if still_in else FAIL,
-                   "p left the cNode drill open" if still_in
-                   else "p exited the drill - retired binding is still live")
-    _exit_drill(session, DRILL_TITLES["cnode"], args)
+    opened = session.wait_for_since(DRILL_TITLES["cnode"], mark, args.drill_budget)
+    if not opened:
+        REPORT.verdict("nav.p_does_not_exit", UNVERIFIED,
+                       "cNode drill never confirmed open; p cannot be judged")
+    else:
+        session.send("p", settle=2.0)
+        current_frame()                   # force a repaint (p alone paints nothing)
+        still_in = DRILL_TITLES["cnode"] in _last_frame(session)
+        REPORT.verdict("nav.p_does_not_exit", PASS if still_in else FAIL,
+                       "p left the cNode drill open" if still_in
+                       else "p exited the drill - retired binding is still live")
+        _exit_drill(session, DRILL_TITLES["cnode"], args)
 
     # 'v' must not open a VIP drill on NVMe (retired binding; v means View).
     session.send("v", settle=2.0)
@@ -797,6 +831,10 @@ def _cleanup_scenario(session, args, label):
     deleted = deleted_monitor_ids(lines)
     REPORT.log("  total API calls     : %d" % len(calls))
     REPORT.log("  ids created         : %s" % sorted(set(created)))
+    if label == "nvme":
+        REPORT.log("  session creates     : %d  (round 4 measured 206 on "
+                   "this cluster; the bounded design predicts ~20, but "
+                   "measure, don't assume)" % len(set(created)))
     REPORT.log("  ids deleted         : %s" % sorted(set(deleted)))
     remaining = verify_ids_gone(sorted(set(created) - set(deleted)), args)
     REPORT.log("  ids still present   : %s" % (remaining or "NONE"))
@@ -898,12 +936,25 @@ def main():
     ap.add_argument("--key-budget", type=int, default=150,
                     help="seconds to wait for a keypress to be consumed; keys are read between poll cycles, which ran 30-80 s on var203")
     ap.add_argument("--drain-budget", type=int, default=180)
+    ap.add_argument("--round5", "--nvme-only", dest="round5",
+                    action="store_true",
+                    help="narrow re-validation of the round-4 remediation: "
+                         "NVMe only (cNode control + VIP + HOST + nav + "
+                         "shutdown + monitor budget); skips the probes and "
+                         "the other four engines, which are already "
+                         "real-VMS validated and unchanged")
     ap.add_argument("--skip-probe", action="store_true")
     ap.add_argument("--skip-others", action="store_true",
                     help="NVMe only; skip the SMB/S3/NFS startup checks")
     ap.add_argument("--result", default=RESULT_FILE)
     args = ap.parse_args()
 
+    if args.round5:
+        args.skip_probe = True
+        args.skip_others = True
+        REPORT.log("ROUND-5 MODE: NVMe only - re-validating the bounded "
+                   "dead-scope probe, nav, shutdown and the session monitor "
+                   "budget. Everything else is already established.")
     if args.vms != DEFAULT_VMS:
         REPORT.log("NOTE: target overridden to %s" % args.vms)
 
