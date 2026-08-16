@@ -490,3 +490,128 @@ def test_small_cnode_scope_does_not_poison_vip_rank_chunks(nvme):
     finally:
         vms.state.vips = None
         vms.state.cnodes = None
+
+
+@pytest.mark.parametrize("population", [10, 100, 500, 1000])
+def test_dead_vip_scope_discovery_cost_is_constant(nvme, population):
+    """A scope with no per-object telemetry must be discovered in O(1):
+    a fixed create budget regardless of 10, 100, 500 or 1000 objects."""
+    engine, vms = nvme
+    vms.state.vips = _vip_population(population)
+    vms.state.batch_unsplittable = {"vip": "no_matching_rows"}
+    try:
+        vms.reset_calls()
+        engine.enter_drill_mode("vip")
+        posts = [c for c in vms.calls() if c[1] == "POST"]
+        # Explicit budget: the bounded capability probe (1 create) for large
+        # populations, or one rank chunk (1 create) for small ones. Never a
+        # population-proportional storm.
+        assert len(posts) <= 3, (
+            f"dead vip scope with {population} objects cost {len(posts)} "
+            f"creates; the budget is 3")
+        assert engine.DRILL_MODE is None
+        assert engine.DRILL_ERROR is not None
+        assert engine.NO_TELEMETRY_MARKER in engine.DRILL_ERROR
+        assert engine.DRILL_MONITORS == []
+
+        # Re-entry uses the cached verdict: zero additional creates.
+        vms.reset_calls()
+        engine.enter_drill_mode("vip")
+        posts = [c for c in vms.calls() if c[1] == "POST"]
+        assert posts == [], "re-entering a known-dead scope created monitors"
+    finally:
+        vms.state.vips = None
+        vms.state.batch_unsplittable = {}
+    live = set(vms.live_monitors()) - set(engine.OPS_MONITOR_IDS) - {engine.PROTO_MONITOR_ID}
+    assert not live, f"dead-scope probe leaked monitors: {sorted(live)}"
+
+
+def test_no_telemetry_state_renders_notice_and_x_exits(nvme, capsys):
+    """The honest empty panel renders (with footer) and x leaves it."""
+    engine, vms = nvme
+    vms.state.vips = _vip_population(50)
+    vms.state.batch_unsplittable = {"vip": "no_matching_rows"}
+    try:
+        engine._dispatch_key("i")
+        capsys.readouterr()
+        assert engine.DRILL_MODE is None
+        assert engine.DRILL_ERROR is not None
+
+        import io as _io
+        import shutil as _sh
+        import sys as _sys
+        buf, real = _io.StringIO(), _sys.stdout
+        _sys.stdout = buf
+        try:
+            engine._render_frame()
+        finally:
+            _sys.stdout = real
+        import tui_layout as _tl
+        frame = _tl.strip_ansi(buf.getvalue())
+        assert engine.NO_TELEMETRY_MARKER in frame, "notice not rendered"
+        assert "[q]" in frame, "footer lost on the no-telemetry frame"
+
+        outcome = engine._dispatch_key("x")
+        capsys.readouterr()
+        assert outcome == "refresh"
+        assert engine.DRILL_ERROR is None, "x did not clear the notice state"
+    finally:
+        vms.state.vips = None
+        vms.state.batch_unsplittable = {}
+
+
+# ---------------------------------------------------------------------------
+# Blockhost: same dead-scope contract as VIP. The inventory shape is modeled
+# from three rounds of real var203 probe evidence (six objects, name + nqn,
+# BlockMetrics echoed unrewritten, zero per-object rows on that build).
+# ---------------------------------------------------------------------------
+def _blockhost_population(n):
+    return [{"id": 9000 + i, "name": f"bh-syn-{i}",
+             "nqn": f"nqn.2014-08.org.nvmexpress:uuid:syn-{i:05d}"}
+            for i in range(n)]
+
+
+@pytest.mark.parametrize("population", [6, 10, 100, 500, 1000])
+def test_dead_blockhost_scope_discovery_cost_is_constant(nvme, population):
+    """Dead blockhost scope: fixed create budget at any population - the
+    var203 population is 6 (rank-chunk verdict path); larger synthetic
+    populations exercise the pre-probe path."""
+    engine, vms = nvme
+    if population != 6:
+        vms.state.blockhosts = _blockhost_population(population)
+    vms.state.batch_unsplittable = {"blockhost": "no_matching_rows"}
+    try:
+        vms.reset_calls()
+        engine.enter_drill_mode("host")
+        posts = [c for c in vms.calls() if c[1] == "POST"]
+        assert len(posts) <= 3, (
+            f"dead blockhost scope with {population} objects cost "
+            f"{len(posts)} creates; the budget is 3")
+        assert engine.DRILL_MODE is None
+        assert engine.DRILL_ERROR is not None
+        assert engine.NO_TELEMETRY_MARKER in engine.DRILL_ERROR
+        assert engine.DRILL_MONITORS == []
+
+        vms.reset_calls()
+        engine.enter_drill_mode("host")
+        assert [c for c in vms.calls() if c[1] == "POST"] == [], (
+            "re-entering the known-dead blockhost scope created monitors")
+    finally:
+        vms.state.blockhosts = None
+        vms.state.batch_unsplittable = {}
+    live = set(vms.live_monitors()) - set(engine.OPS_MONITOR_IDS) - {engine.PROTO_MONITOR_ID}
+    assert not live, f"dead-scope probe leaked monitors: {sorted(live)}"
+
+
+def test_live_blockhost_scope_opens_with_real_rows(nvme):
+    """When blockhost telemetry exists (a future build), the drill opens with
+    per-object rows and x exits - the verdict must not hardcode var203."""
+    engine, vms = nvme
+    engine.enter_drill_mode("host")
+    assert engine.DRILL_ERROR is None, engine.DRILL_ERROR
+    assert engine.DRILL_MODE == "host"
+    engine.fetch_drill_query(force=True)
+    engine.fetch_drill_query(force=True)
+    assert engine.LAST_DRILL_ROWS, "live blockhost drill produced no rows"
+    engine.exit_drill_mode()
+    assert engine.DRILL_MODE is None

@@ -72,6 +72,16 @@ VOLUMES = [
 
 VIPS = [{"id": 700 + i, "ip": f"10.1.0.{i + 1}", "name": f"vip-{i}"} for i in range(4)]
 
+# Modeled from real var203 evidence (probe rounds 2-4): /blockhosts/ returns
+# six objects, and blockhost-scoped monitors echo BlockMetrics unrewritten
+# while carrying no per-object rows on that build (the D-013 dead-scope
+# shape, reproduced via state.batch_unsplittable, not hardcoded here).
+BLOCKHOSTS = [
+    {"id": 1 + i, "name": f"blockhost-{i}",
+     "nqn": f"nqn.2014-08.org.nvmexpress:uuid:mock-{i:04d}"}
+    for i in range(6)
+]
+
 
 # Which views/tenants actually carry load, most-active first. Deliberately
 # placed deep in the /views/ listing so an implementation that ranks by
@@ -381,6 +391,7 @@ class _State:
         # None -> the module-level defaults.
         self.vips = None
         self.cnodes = None
+        self.blockhosts = None
         # Names of every monitor created since the last reset_calls(), in
         # order. calls() records only (ts, method, path, status), so tests
         # that need to count monitors BY PURPOSE (rank vs batch vs headline)
@@ -474,6 +485,8 @@ class _Handler(BaseHTTPRequestHandler):
             "/api/tenants/": TENANTS,
             "/api/volumes/": VOLUMES,
             "/api/vips/": self.state.vips if self.state.vips is not None else VIPS,
+            "/api/blockhosts/": (self.state.blockhosts
+                                 if self.state.blockhosts is not None else BLOCKHOSTS),
         }
         if path in simple:
             return self._send(simple[path])

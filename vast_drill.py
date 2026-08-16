@@ -526,6 +526,46 @@ class DrillSession:
             time.monotonic(), self._signature(objects), list(ranked),
         )
 
+    # -- scope capability probing -------------------------------------------
+    def probe_scope(self, mode, objects, *, object_type, rank_props,
+                    time_frame, no_aggregation=False):
+        """Bounded telemetry-availability probe: does this scope return ANY
+        per-object rows at all?
+
+        One monitor over a sample of at most ``max_objects`` ids, one query,
+        one delete - O(1) in the population size. Returns True (telemetry
+        present), False (queried fine, zero rows for every sampled id), or
+        None (create/query refused - proves nothing about telemetry).
+
+        This is deliberately OPT-IN and separate from :meth:`rank`: the
+        proven NFS/SMB/S3 callers rank scopes whose telemetry is already
+        established and never need it. It answers only "is telemetry
+        available", which is a different question from "what rank-chunk size
+        does the cluster accept" (the per-type cache above) and from "is the
+        display batch splittable" (create_monitors below) - three questions
+        that must never share one cache or boolean, which is how a 378-object
+        scope came to prove itself dead one 2-object monitor at a time.
+        """
+        sample = [obj["id"] for obj in objects[:self.max_objects]]
+        if not sample:
+            return None
+        monitor_id = None
+        try:
+            monitor_id = self._create_monitor(
+                "probe_%s" % mode, rank_props, object_type, sample,
+                no_aggregation=no_aggregation,
+            )
+            result = self._request("GET", "/monitors/%s/query/" % monitor_id)
+        except RuntimeError:
+            return None
+        finally:
+            if monitor_id is not None:
+                self._delete_monitor(monitor_id)
+        return any(
+            (slice_result_for_object(result, oid) or {}).get("data")
+            for oid in sample
+        )
+
     # -- monitor creation --------------------------------------------------
     def create_monitors(self, mode, drill_objects, *, object_type, props,
                         no_aggregation=False, validate_batch=False):

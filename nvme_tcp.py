@@ -142,6 +142,17 @@ _MAX_FALLBACK_OBJECTS = 4
 _RANK_SAW_ROWS = False
 _RANK_SCORED = False
 _SCOPE_HAS_TELEMETRY = {}
+# The no-telemetry notice, built from this marker so external tooling (the
+# lab validator) can import the contract instead of guessing at a string that
+# would drift. Keep the marker stable; tests assert the notice contains it.
+NO_TELEMETRY_MARKER = "block telemetry on this cluster"
+
+
+def _no_telemetry_notice(mode):
+    return (
+        f"No per-{mode} {NO_TELEMETRY_MARKER}: monitor responses carry no "
+        f"rows for any {mode} object (capability probe and rank scan agree)."
+    )
 
 # Metrics not exposed on current VMS builds - surfaced in discover-metrics notes.
 _UNAVAILABLE_TELEMETRY = (
@@ -279,6 +290,9 @@ def init_config(args):
     DRILL_MONITORS = []
     LAST_DRILL_ROWS = []
     global DRILL
+    # Scope-telemetry verdicts are per-session state, like the DrillSession
+    # itself: a new run (or test) must re-learn them from the live cluster.
+    _SCOPE_HAS_TELEMETRY.clear()
     DRILL = vast_drill.DrillSession(
         request_fn=api_request,
         create_monitor_fn=_create_monitor_raw,
@@ -1459,22 +1473,39 @@ def enter_drill_mode(mode):
         DRILL_ERROR = f"No {mode} objects returned from {cfg['endpoint']}"
         return
     valid = [o for o in objects if "id" in o]
+    # Telemetry verdict BEFORE any population-scaled work. A scope already
+    # proven dead re-renders the notice for free; an unproven scope larger
+    # than the panel gets a bounded O(1) capability probe (one monitor over
+    # <= _MAX_DRILL_OBJECTS ids) instead of discovering mid-rank - round 4
+    # measured the discover-late shape at 189 rank monitors over 34 minutes.
+    if _SCOPE_HAS_TELEMETRY.get(mode) is False:
+        DRILL_ERROR = _no_telemetry_notice(mode)
+        DRILL_OBJECTS = []
+        return
+    if mode not in _SCOPE_HAS_TELEMETRY and len(valid) > _MAX_DRILL_OBJECTS:
+        present = DRILL.probe_scope(
+            mode, valid, object_type=cfg["object_type"],
+            rank_props=_RANK_PROPS, time_frame=API_TIME_FRAME,
+        )
+        if present is not None:
+            _SCOPE_HAS_TELEMETRY[mode] = present
+        if present is False:
+            DRILL_ERROR = _no_telemetry_notice(mode)
+            DRILL_OBJECTS = []
+            return
     DRILL_OBJECTS = _rank_drill_candidates(mode, cfg, valid)
     _cleanup_drill_monitors()
+    # Small populations reach the verdict through the rank scan itself; check
+    # it before creating ANY display monitors (round 3 checked only after the
+    # batch attempt, spending 4 creates on a scope already known dead).
+    if _SCOPE_HAS_TELEMETRY.get(mode) is False:
+        DRILL_ERROR = _no_telemetry_notice(mode)
+        DRILL_OBJECTS = []
+        return
     new_monitors = _create_batch_drill_monitors(mode, cfg, DRILL_OBJECTS)
     if new_monitors is None:
         if not _SCOPE_HAS_TELEMETRY.get(mode, True):
-            # Neither the batch nor the rank response carried a single row
-            # for any requested object: this cluster publishes no per-object
-            # block telemetry at this scope (observed on var203 for vip and
-            # blockhost, D-013). Say so instead of fanning out monitors that
-            # measurably return nothing - the round-3 run spent 43 monitors
-            # and 464 s proving each object empty, one monitor at a time.
-            DRILL_ERROR = (
-                f"No per-{mode} block telemetry on this cluster: monitor "
-                f"responses carry no rows for any {mode} object "
-                f"(batch and rank probes agree)."
-            )
+            DRILL_ERROR = _no_telemetry_notice(mode)
             DRILL_OBJECTS = []
             return
         # Bounded per-object fallback: telemetry exists but the batch is not
@@ -1950,9 +1981,14 @@ def _render_path_table(width):
     elif DRILL_MODE == "vip":
         mode_title = "VIP PATHS"
         col_name = "VIP"
-    else:
+    elif DRILL_MODE == "cnode":
         mode_title = "CNODE PATHS"
         col_name = "cNode"
+    else:
+        # No mode: an error/notice panel (e.g. a scope with no per-object
+        # telemetry declined to open a drill).
+        mode_title = "DRILL"
+        col_name = "-"
     print(box_top(mode_title, width))
     if DRILL_ERROR:
         print(box_row(c(f"Error: {DRILL_ERROR}", _BRED), width))
@@ -2083,10 +2119,15 @@ def _render_frame():
         else:
             print(c(f"  Waiting for data…  VMS={VMS}:{PORT}"
                     f"  cluster={CLUSTER_NAME or '-'}", _DIM))
+        if DRILL_ERROR:
+            print(c("  " + truncate_display(str(DRILL_ERROR), width - 2), _BRED))
         _render_help_bar(width)
         return
 
-    if DRILL_MODE in ("vip", "cnode", "host"):
+    if DRILL_MODE in ("vip", "cnode", "host") or DRILL_ERROR:
+        # DRILL_ERROR with no mode is the no-telemetry notice: a scope that
+        # publishes nothing per-object declined to open, and the panel must
+        # say so rather than silently staying on the dashboard.
         _render_health_panel(rows, width)
         _render_path_table(width)
     else:
