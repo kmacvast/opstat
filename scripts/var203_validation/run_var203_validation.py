@@ -425,6 +425,175 @@ def parse_calls(lines):
     return calls
 
 
+_QUERY_EVENT = re.compile(
+    r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) GET \S*/monitors/(\d+)/query/\S* (\d+)ms")
+
+# nvme_tcp's drill throttle and its drill-mode headline cadence share this
+# interval (_DRILL_MIN_QUERY_INTERVAL). The judge only ever uses it as a
+# LOWER bound on when ordinary cadence could issue a query, so a product-side
+# increase keeps the proofs sound.
+THROTTLE_S = 15.0
+
+
+def query_events(lines):
+    """(issue_epoch, monitor_id) per monitor /query/ line, oldest first.
+
+    The log stamp is written at completion and the line carries the call's
+    duration, so the issue time is stamp minus duration. Issue times are what
+    the cadence and throttle logic act on - on var203 a single call runs
+    2-38 s, so completion times alone misplace a query by more than a whole
+    throttle window.
+    """
+    events = []
+    for line in lines:
+        m = _QUERY_EVENT.match(line)
+        if not m:
+            continue
+        stamp = time.mktime(time.strptime(m.group(1), "%Y-%m-%d %H:%M:%S"))
+        events.append((stamp - int(m.group(3)) / 1000.0, int(m.group(2))))
+    return events
+
+
+def judge_manual_refresh(pre_events, post_events, t_space, headline_ids,
+                         throttle=THROTTLE_S, slack=2.0):
+    """Decide from query issue times whether space really forced a refresh.
+
+    Round 5 slept a fixed 6 s after the keypress and read "no effect" from a
+    product that was behaving correctly: manual_refresh runs the full
+    headline pass BEFORE the forced drill query, and a single var203 call
+    can exceed the whole window. Worse, in a drill each cadence burst takes
+    longer than the 15 s cadence interval there, so the log is saturated
+    and "some query appeared" can never distinguish forced from scheduled.
+
+    Two proofs, either sufficient, both impossible for ordinary cadence:
+
+    * abort/restart - queued input aborts the in-flight headline pass
+      (nvme_tcp._query_ops_monitors_interruptible), so a headline monitor
+      re-issued after the keypress with less than the full complement of the
+      other headline ids between the two issues is a restart that only a
+      dispatched key can produce. Cadence passes always run to completion.
+    * throttle window - poll_tick re-arms the headline timer at burst start,
+      so the next scheduled issue is >= one full throttle interval after the
+      burst began. A query issued after the keypress but inside that window
+      is the forced refresh. Only applied when the pre-space history shows
+      one cleanly separated burst; a saturated log skips this proof and
+      relies on abort/restart.
+
+    Returns (verdict, detail): PASS with the proof, UNVERIFIED when activity
+    followed the keypress but neither proof holds, FAIL when nothing did.
+    """
+    headline = set(headline_ids)
+    if not post_events:
+        return FAIL, ("no API activity within the deadline - "
+                      "space produced no observable effect")
+
+    combined = sorted(list(pre_events) + list(post_events))
+    full_pass = len(headline) - 1
+    last_seen = {}
+    for idx, (start, mid) in enumerate(combined):
+        if mid not in headline:
+            continue
+        prev = last_seen.get(mid)
+        if prev is not None and start >= t_space - slack:
+            between = set(m for _s, m in combined[prev + 1:idx]
+                          if m in headline and m != mid)
+            if len(between) < full_pass:
+                return PASS, (
+                    "forced: headline monitor %d re-issued %.1fs after the "
+                    "keypress with only %d/%d of the pass between - an "
+                    "aborted-and-restarted pass only a dispatched space "
+                    "produces" % (mid, start - t_space, len(between), full_pass))
+        last_seen[mid] = idx
+
+    pre_head = sorted(e for e in pre_events if e[1] in headline)
+    post_started = sorted(e for e in post_events if e[0] >= t_space - slack)
+    if pre_head and post_started:
+        burst = [pre_head[-1]]
+        for ev in reversed(pre_head[:-1]):
+            if burst[0][0] - ev[0] <= 2.0:
+                burst.insert(0, ev)
+            else:
+                break
+        clean = (len(burst) == len(pre_head)
+                 or burst[0][0] - pre_head[-len(burst) - 1][0] >= 5.0)
+        first_post = post_started[0][0]
+        if clean and first_post < burst[0][0] + throttle - slack:
+            return PASS, (
+                "forced: query issued %.1fs after the keypress and %.1fs "
+                "after the previous headline burst began - inside the %.0fs "
+                "cadence/throttle window no scheduled poll can enter"
+                % (first_post - t_space, first_post - burst[0][0], throttle))
+
+    return UNVERIFIED, (
+        "%d queries followed the space but none is provably forced - "
+        "cadence saturates this log at this latency; not evidence of a "
+        "product defect" % len(post_started))
+
+
+def _manual_refresh_check(session, mode, args, headline_ids, attempts=2):
+    """Space must force an immediate refresh; prove it from the API log.
+
+    Times the keypress so the outcome is attributable, then polls the log to
+    a bounded --refresh-deadline instead of sleeping a fixed settle:
+
+    * quiet log (a burst just finished): press immediately - the next
+      scheduled issue is a full throttle interval away, so anything issued
+      inside that window is the forced refresh.
+    * saturated log (var203 in a drill): press while a headline burst is in
+      flight - queued input aborts the rest of the pass, and the restart
+      signature is unforgeable by cadence.
+    """
+    name = "nvme.%s.manual_refresh" % mode
+    heads = set(headline_ids)
+    verdict, detail = UNVERIFIED, "not attempted"
+    for attempt in range(1, attempts + 1):
+        moment = _pick_refresh_moment(session, heads, args)
+        space_mark = session.api_mark()
+        pre_events = query_events(session.api_lines()[:space_mark])
+        t_space = time.time()
+        session.send(" ")
+        REPORT.log("  space sent into a %s log (attempt %d)" % (moment, attempt))
+        deadline = time.time() + args.refresh_deadline
+        while time.time() < deadline:
+            session._drain(2.0)
+            verdict, detail = judge_manual_refresh(
+                pre_events, query_events(session.api_since(space_mark)),
+                t_space, headline_ids)
+            if verdict == PASS:
+                break
+        if verdict == PASS or attempt == attempts:
+            break
+        REPORT.log("  attempt %d inconclusive (%s); retrying" % (attempt, detail))
+    REPORT.verdict(name, verdict, detail)
+    return verdict
+
+
+def _pick_refresh_moment(session, headline_ids, args):
+    """Wait for a moment at which a forced refresh will be attributable.
+
+    Returns "in-flight" the instant a new headline query completes (a burst
+    is running, with runway for the abort/restart proof), "quiet" after 4 s
+    without log growth (burst boundary; throttle-window proof), or "timeout"
+    if neither shows up - in which case the space is sent anyway and the
+    judge reports honestly.
+    """
+    mark = session.api_mark()
+    last_growth = time.time()
+    deadline = time.time() + min(args.refresh_deadline, 60.0)
+    while time.time() < deadline:
+        session._drain(1.0)
+        new_mark = session.api_mark()
+        if new_mark > mark:
+            if any(e[1] in headline_ids
+                   for e in query_events(session.api_since(mark))):
+                return "in-flight"
+            mark = new_mark
+            last_growth = time.time()
+        elif time.time() - last_growth >= 4.0:
+            return "quiet"
+    return "timeout"
+
+
 def created_monitor_ids(lines):
     """Monitor ids created here, from the POST /monitors/ response body.
 
@@ -694,17 +863,13 @@ def _drill_scenario(session, key, mode, args):
     REPORT.log("  in %ds idle          : %d calls, %d queries"
                % (args.cadence_window, len(cadence_calls), len(queries)))
 
-    # Manual refresh must force a query immediately.
-    mark = len(session.output)
-    refresh_mark = session.api_mark()
-    session.send(" ", settle=args.refresh_settle)
-    forced_calls = parse_calls(session.api_since(refresh_mark))
-    forced_q = [c for c in forced_calls if c[1].endswith("/query/")]
-    forced = len(session.output) > mark or forced_q
-    REPORT.verdict("nvme.%s.manual_refresh" % mode, PASS if forced else FAIL,
-                   "space forced %d queries (%d calls)" % (len(forced_q), len(forced_calls))
-                   if forced_q else
-                   ("repaint only, no forced query" if forced else "no effect"))
+    # Manual refresh must force a query; prove it from the API log. Round 5's
+    # fixed 6 s settle was shorter than a single var203 call and read a
+    # working refresh as "no effect" - the only red result of that run.
+    prior = session.api_lines()[:api_mark]
+    headline_ids = sorted(set(created_monitor_ids(prior))
+                          - set(deleted_monitor_ids(prior)))
+    _manual_refresh_check(session, mode, args, headline_ids)
 
     exited = _exit_drill(session, title, args)
     REPORT.verdict("nvme.%s.exit_x" % mode, PASS if exited else FAIL,
@@ -962,7 +1127,12 @@ def main():
                     help="seconds to wait for a drill panel; a real var203 entry legitimately ran ~2 minutes")
     ap.add_argument("--drill-settle", type=float, default=8.0)
     ap.add_argument("--cadence-window", type=int, default=45)
-    ap.add_argument("--refresh-settle", type=float, default=6.0)
+    ap.add_argument("--refresh-settle", type=float, default=6.0,
+                    help="repaint settle used by the navigation checks")
+    ap.add_argument("--refresh-deadline", type=float, default=90.0,
+                    help="bounded wait for manual-refresh API evidence; the "
+                         "old fixed 6 s settle was shorter than one var203 "
+                         "call and read a working refresh as 'no effect'")
     ap.add_argument("--key-budget", type=int, default=150,
                     help="seconds to wait for a keypress to be consumed; keys are read between poll cycles, which ran 30-80 s on var203")
     ap.add_argument("--drain-budget", type=int, default=180)

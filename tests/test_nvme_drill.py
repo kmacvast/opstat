@@ -837,3 +837,167 @@ def test_validator_dead_scope_stops_at_the_notice_not_the_budget():
     assert "3 calls, 1 creates" in results["nvme.vip.entry"][1], (
         "entry accounting must stop at the notice: %s"
         % results["nvme.vip.entry"][1])
+
+
+def _headline_ids(n=8, base=100):
+    return list(range(base, base + n))
+
+
+def test_judge_manual_refresh_abort_restart_is_forced():
+    """A headline pass restarted mid-flight is unforgeable by cadence: only
+    queued input aborts _query_ops_monitors_interruptible."""
+    val = _load_validator()
+    H = _headline_ids()
+    pre = [(1000.0 + i * 7.5, H[i]) for i in range(3)]     # burst in flight
+    t_space = 1020.0
+    post = [(1024.0, H[0]), (1030.0, H[1])]                # restart from H0
+    verdict, detail = val.judge_manual_refresh(pre, post, t_space, H)
+    assert verdict == val.PASS
+    assert "aborted-and-restarted" in detail
+
+
+def test_judge_manual_refresh_throttle_window_is_forced():
+    """On a quiet log, a query issued inside the throttle window after the
+    previous burst began cannot be a scheduled poll."""
+    val = _load_validator()
+    H = _headline_ids()
+    pre = [(1000.0 + i * 0.1, H[i]) for i in range(8)]     # clean fast burst
+    post = [(1005.0 + i * 0.1, H[i]) for i in range(8)]    # forced full pass
+    verdict, detail = val.judge_manual_refresh(pre, post, 1004.0, H)
+    assert verdict == val.PASS
+    assert "window" in detail
+
+
+def test_judge_manual_refresh_cadence_alone_does_not_pass():
+    """Two COMPLETE passes with the full complement between repeats is what
+    ordinary cadence produces; it must never be read as forced."""
+    val = _load_validator()
+    H = _headline_ids()
+    drill = [(1010.0, 900), (1011.0, 901)]
+    pre = [(1000.0 + i, H[i]) for i in range(8)] + drill
+    post = [(1023.0 + i, H[i]) for i in range(8)]          # next scheduled pass
+    verdict, detail = val.judge_manual_refresh(pre, post, 1020.0, H)
+    assert verdict == val.UNVERIFIED
+    assert "not evidence of a product defect" in detail
+
+
+def test_judge_manual_refresh_back_to_back_complete_passes_do_not_pass():
+    """Timer-aligned consecutive complete passes (no drill queries between,
+    e.g. a skipped drill fetch) still must not read as forced."""
+    val = _load_validator()
+    H = _headline_ids()
+    pre = [(1000.0 + i * 0.1, H[i]) for i in range(8)]
+    post = [(1015.0 + i * 0.1, H[i]) for i in range(8)]    # exactly on cadence
+    verdict, _detail = val.judge_manual_refresh(pre, post, 1010.0, H)
+    assert verdict == val.UNVERIFIED
+
+
+def test_judge_manual_refresh_inflight_completion_is_not_forced():
+    """A line that lands after the keypress but was ISSUED before it is an
+    in-flight cadence call, not evidence."""
+    val = _load_validator()
+    H = _headline_ids()
+    pre = [(1000.0, H[0]), (1007.5, H[1])]
+    post = [(1010.0, H[0])]                 # issued before t_space, landed after
+    verdict, _detail = val.judge_manual_refresh(pre, post, 1030.0, H)
+    assert verdict == val.UNVERIFIED
+
+
+def test_judge_manual_refresh_no_activity_is_an_honest_fail():
+    val = _load_validator()
+    H = _headline_ids()
+    verdict, detail = val.judge_manual_refresh(
+        [(1000.0, H[0])], [], 1010.0, H)
+    assert verdict == val.FAIL
+    assert "no API activity" in detail
+
+
+def _stamp(epoch):
+    return _time.strftime("%Y-%m-%d %H:%M:%S", _time.localtime(epoch))
+
+
+def _query_line(epoch_issue, monitor_id, dur_ms=100):
+    return ("%s GET https://h:443/api/monitors/%d/query/ %dms "
+            "-> HTTP 200 (2 bytes) body={}"
+            % (_stamp(epoch_issue + dur_ms / 1000.0), monitor_id, dur_ms))
+
+
+def test_manual_refresh_check_survives_slow_line_arrival():
+    """The evidence line lands well after any fixed settle would have given
+    up (round 5's 6 s window read a working refresh as 'no effect'); the
+    bounded log poll must still find it and PASS."""
+    val = _load_validator()
+    H = _headline_ids()
+    now = _time.time()
+
+    def on_space(sess):
+        # Forced full pass, issued right after the keypress, but the log
+        # lines only materialize 1.5 s later (slow completion).
+        at = _time.time()
+        for i, mid in enumerate(H):
+            sess._pending.append(
+                (at + 1.5, _query_line(at + 0.2 + i * 0.01, mid)))
+
+    sess = _ScriptedSession(val, {" ": on_space})
+    # Pre-context: one clean completed burst just before the check begins.
+    for i, mid in enumerate(H):
+        sess._lines.append(_query_line(now - 2.0 + i * 0.01, mid))
+    args = SimpleNamespace(refresh_deadline=15.0)
+    val.REPORT = val.Report()
+    verdict = val._manual_refresh_check(sess, "cnode", args, H, attempts=1)
+    assert verdict == val.PASS
+    results = {n: (s, d) for n, s, d in val.REPORT.results}
+    assert results["nvme.cnode.manual_refresh"][0] == val.PASS
+
+
+def test_manual_refresh_check_times_out_to_an_honest_fail():
+    """No API reaction at all within the bounded deadline is the only state
+    that may report FAIL 'no effect'."""
+    val = _load_validator()
+    H = _headline_ids()
+    sess = _ScriptedSession(val, {" ": lambda s: None})
+    args = SimpleNamespace(refresh_deadline=1.0)
+    val.REPORT = val.Report()
+    verdict = val._manual_refresh_check(sess, "cnode", args, H, attempts=1)
+    assert verdict == val.FAIL
+    results = {n: (s, d) for n, s, d in val.REPORT.results}
+    assert "no API activity" in results["nvme.cnode.manual_refresh"][1]
+
+
+def test_manual_refresh_check_failure_still_quits_the_session(monkeypatch):
+    """If the refresh check itself blows up mid-scenario, the session must
+    still be quit and its cleanup accounting must run - same lifecycle
+    guarantee the round-4 NameError violated."""
+    val = _load_validator()
+    events = []
+
+    class _FakeSession:
+        exit_code = None
+        output = ""
+
+        def start(self):
+            events.append("start")
+            return self
+
+        def api_mark(self):
+            raise RuntimeError("api log unreadable")
+
+        def quit(self, *_a, **_k):
+            events.append("quit")
+            self.exit_code = 0
+            return 0.0
+
+    monkeypatch.setattr(val, "OpstatSession", lambda *a, **k: _FakeSession())
+    monkeypatch.setattr(
+        val, "_scenario_nvme_body",
+        lambda session, args: val._manual_refresh_check(
+            session, "cnode", args, [1], attempts=1))
+    monkeypatch.setattr(val, "_cleanup_scenario",
+                        lambda *_a, **_k: events.append("cleanup"))
+    args = SimpleNamespace(drain_budget=1, vms="unused.invalid",
+                           user="admin", vms_port=443, refresh_deadline=1.0)
+    with pytest.raises(RuntimeError):
+        val.scenario_nvme(args)
+    assert "quit" in events, "exception path abandoned the opstat session"
+    assert "cleanup" in events, "exception path skipped cleanup accounting"
+    assert events.index("quit") < events.index("cleanup")
