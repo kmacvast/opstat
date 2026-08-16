@@ -513,6 +513,21 @@ def forget_monitor(monitor_id):
     _CREATED_MONITORS.discard(monitor_id)
 
 
+def emit_stderr(message):
+    """Best-effort stderr line: NEVER raises.
+
+    Cleanup output goes to a terminal that may already be gone - round 4
+    leaked the whole headline monitor set because the shutdown banner's
+    write to a dead PTY raised EIO and killed cleanup() before the drain
+    ran, on the signal path and the atexit retry alike. Rendering is
+    best-effort; monitor deletion is mandatory.
+    """
+    try:
+        print(message, file=sys.stderr, flush=True)
+    except Exception:
+        pass
+
+
 def drain_monitors(delete_fn):
     """Delete every still-registered monitor using engine-supplied delete_fn.
 
@@ -550,8 +565,7 @@ def drain_monitors(delete_fn):
                 record_failed_delete(monitor_id, str(exc)[:80])
             _CREATED_MONITORS.discard(monitor_id)
             if total >= 20 and (done % 10 == 0 or done == total):
-                print("  ... %d/%d monitors removed" % (done, total),
-                      file=sys.stderr, flush=True)
+                emit_stderr("  ... %d/%d monitors removed" % (done, total))
     finally:
         if previous_mask is not None:
             try:

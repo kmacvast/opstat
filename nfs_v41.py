@@ -2636,7 +2636,7 @@ def cleanup():
     # silent pause. Count is known up front; no fake progress.
     _pending = vast_common.pending_monitor_count()
     if _pending:
-        print(vast_common.cleanup_message(_pending), file=sys.stderr, flush=True)
+        vast_common.emit_stderr(vast_common.cleanup_message(_pending))
     vast_common.drain_monitors(delete_monitor)
     # Set the guard only after the drain actually completes, so an interrupted
     # or failed cleanup is retried by the atexit/finally backstop instead of
@@ -2646,7 +2646,8 @@ def cleanup():
     vast_api_log.close()
     openmetrics.close()
     for monitor_id, detail in vast_common.failed_deletes():
-        print(f"WARNING: monitor {monitor_id} not deleted: {detail}", file=sys.stderr)
+        vast_common.emit_stderr(
+            f"WARNING: monitor {monitor_id} not deleted: {detail}")
 
 
 def signal_handler(_signum, _frame):

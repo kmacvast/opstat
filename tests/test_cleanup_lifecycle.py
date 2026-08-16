@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import signal
+import sys
 
 import pytest
 
@@ -209,6 +210,75 @@ def test_engine_cleanup_survives_an_injected_delete_failure(tmp_path, monkeypatc
         vms.state.fail_delete_ids = set()
         nvme_tcp._CLEANED_UP = False
         nvme_tcp.cleanup()
+        nvme_tcp._CLEANED_UP = False
+        vast_common.close_connection()
+        vms.stop()
+
+
+def test_drain_survives_an_unwritable_stderr(monkeypatch):
+    """Round 4: the shutdown banner's write to a dead PTY raised EIO and
+    killed cleanup() before the drain, leaking the whole headline set.
+    Output is best-effort; deletion is mandatory."""
+    class _DeadStream:
+        def write(self, *_a, **_k):
+            raise OSError(5, "Input/output error")
+
+        def flush(self):
+            raise OSError(5, "Input/output error")
+
+    for mid in (41, 42, 43) + tuple(range(50, 72)):   # >=20 -> progress prints
+        vast_common.register_monitor(mid)
+    deleted = []
+    monkeypatch.setattr(sys, "stderr", _DeadStream())
+
+    vast_common.emit_stderr("banner must not raise")   # the round-4 killer
+    vast_common.drain_monitors(deleted.append)
+
+    assert len(deleted) == 25, "drain did not reach every owned monitor"
+    assert vast_common._CREATED_MONITORS == set()
+
+
+def test_engine_cleanup_survives_dead_terminal_end_to_end(tmp_path, monkeypatch):
+    """Mock-backed: banner, progress and warning writes all raise EIO; every
+    owned monitor must still be deleted from the VMS."""
+    import shutil as _shutil
+
+    if _shutil.which("openssl") is None:
+        pytest.skip("openssl binary required to generate the mock VMS certificate")
+    from types import SimpleNamespace
+
+    from tests.mock_vms import MockVMS
+
+    import nvme_tcp
+
+    class _DeadStream:
+        def write(self, *_a, **_k):
+            raise OSError(5, "Input/output error")
+
+        def flush(self):
+            raise OSError(5, "Input/output error")
+
+    vms = MockVMS(certdir=str(tmp_path)).start()
+    try:
+        monkeypatch.setenv("VAST_TOKEN", "test-token")
+        nvme_tcp.init_config(SimpleNamespace(
+            vms="127.0.0.1", port=vms.port, user="admin", password=None,
+            sample_average=None, refresh=5, csv=None, no_color=True,
+            discover_metrics=False, log_api_calls=False,
+            export_openmetrics=False, openmetrics_file=None,
+            volumes=None, volume=None))
+        nvme_tcp.CLUSTER_ID, nvme_tcp.CLUSTER_NAME = nvme_tcp.get_current_cluster()
+        nvme_tcp.create_cluster_monitors()
+        assert vms.live_monitors(), "fixture created no monitors"
+
+        monkeypatch.setattr(nvme_tcp, "restore_terminal", lambda: None)
+        monkeypatch.setattr(sys, "stderr", _DeadStream())
+        nvme_tcp._CLEANED_UP = False
+        nvme_tcp.cleanup()
+
+        assert vms.live_monitors() == {}, (
+            "monitors leaked because cleanup output failed - the round-4 leak")
+    finally:
         nvme_tcp._CLEANED_UP = False
         vast_common.close_connection()
         vms.stop()
