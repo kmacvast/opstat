@@ -113,8 +113,7 @@ def test_rank_cache_spares_re_entry(nvme):
     engine.exit_drill_mode()
     vms.reset_calls()
     engine.enter_drill_mode("cnode")
-    rank_posts = [c for c in vms.calls()
-                  if c[1] == "POST" and "rank" in str(c[3])]
+    rank_posts = [n for n in vms.created_monitor_names() if "rank" in n]
     assert rank_posts == [], "re-entry inside the TTL re-ranked from scratch"
 
 
@@ -449,3 +448,45 @@ def test_manual_refresh_still_forces_headline_in_drill(nvme):
     headline = [p for p in paths
                 if any(f"/monitors/{m}/" in p for m in engine.OPS_MONITOR_IDS)]
     assert headline, "space no longer forces the headline monitors"
+
+
+# ---------------------------------------------------------------------------
+# Round 4: the VIP monitor storm and the O(1) dead-scope contract.
+#
+# The real run devolved one VIP rank scan into 189 serial create/query/delete
+# cycles: the DrillSession's discovered rank chunk size was shared across
+# object types, so "chunks of 2 work" - learned on a 2-cNode scope - capped
+# the 378-VIP scan at 2 ids per monitor. And even with a sane chunk size,
+# a scope that publishes no per-object telemetry only discovered that fact
+# AFTER ranking its whole population. Dead scopes must fail closed and
+# cheaply: discovery cost may not scale with the object count.
+# ---------------------------------------------------------------------------
+def _vip_population(n):
+    return [{"id": 5000 + i, "ip": f"10.9.{i // 250}.{i % 250}",
+             "name": f"vip-syn-{i}"} for i in range(n)]
+
+
+def test_small_cnode_scope_does_not_poison_vip_rank_chunks(nvme):
+    """The literal round-4 sequence: rank a 2-object cNode scope, then enter
+    a 378-object VIP scope with live telemetry. The VIP rank must not devolve
+    into per-pair monitors (189 on the real cluster)."""
+    engine, vms = nvme
+    vms.state.cnodes = [dict(c) for c in vms.state.cnodes or []] or None
+    from tests.mock_vms import CNODES as _C
+    vms.state.cnodes = [_C[0], _C[1]]              # population = 2
+    vms.state.vips = _vip_population(378)          # population = 378, alive
+    try:
+        engine.enter_drill_mode("cnode")
+        assert engine.DRILL_ERROR is None
+        engine.exit_drill_mode()
+
+        vms.reset_calls()
+        engine.enter_drill_mode("vip")
+        rank_posts = [n for n in vms.created_monitor_names() if "rank_vip" in n]
+        assert len(rank_posts) <= 2, (
+            f"{len(rank_posts)} VIP rank monitors created - the cNode scan's "
+            f"chunk size poisoned the VIP scan (round 4: 189 monitors)")
+        engine.exit_drill_mode()
+    finally:
+        vms.state.vips = None
+        vms.state.cnodes = None

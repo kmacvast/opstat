@@ -375,6 +375,18 @@ class _State:
         # attempt). Models the round-3 var203 shutdown, where one failing
         # delete aborted the drain loop and orphaned the monitors after it.
         self.fail_delete_ids = set()
+        # Population overrides for scaling tests: the dead-scope discovery
+        # cost must be O(1) in the object count (round 4: 378 VIPs devolved
+        # into 189 rank monitors), so tests need to grow these arbitrarily.
+        # None -> the module-level defaults.
+        self.vips = None
+        self.cnodes = None
+        # Names of every monitor created since the last reset_calls(), in
+        # order. calls() records only (ts, method, path, status), so tests
+        # that need to count monitors BY PURPOSE (rank vs batch vs headline)
+        # read this - filtering the calls tuple for a name matches nothing,
+        # which made two budget assertions vacuous until a storm slipped by.
+        self.created_names = []
         # Reproduce observed VMS 5.5.0.1 behavior: the newest bucket of an
         # object-scoped monitor is still filling, so every property except
         # the ones listed here comes back null in that row. Set to None to
@@ -457,11 +469,11 @@ class _Handler(BaseHTTPRequestHandler):
 
         simple = {
             "/api/clusters/": CLUSTERS,
-            "/api/cnodes/": CNODES,
+            "/api/cnodes/": self.state.cnodes if self.state.cnodes is not None else CNODES,
             "/api/views/": VIEWS,
             "/api/tenants/": TENANTS,
             "/api/volumes/": VOLUMES,
-            "/api/vips/": VIPS,
+            "/api/vips/": self.state.vips if self.state.vips is not None else VIPS,
         }
         if path in simple:
             return self._send(simple[path])
@@ -610,6 +622,7 @@ class _Handler(BaseHTTPRequestHandler):
         if cap is not None and len(payload.get("object_ids") or []) > cap:
             return self._error(400, f"too many object_ids (max {cap})")
         with self.state.lock:
+            self.state.created_names.append(str(payload.get("name", "")))
             monitor_id = self.state.next_monitor_id
             self.state.next_monitor_id += 1
             self.state.monitors[monitor_id] = {
@@ -766,6 +779,12 @@ class MockVMS:
     def reset_calls(self):
         with self.state.lock:
             self.state.calls.clear()
+            self.state.created_names.clear()
+
+    def created_monitor_names(self):
+        """Names of monitors created since the last reset_calls(), in order."""
+        with self.state.lock:
+            return list(self.state.created_names)
 
     def counts(self):
         """Return {"METHOD normalized-path": count} with ids collapsed."""

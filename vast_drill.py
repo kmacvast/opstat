@@ -322,7 +322,14 @@ class DrillSession:
     def reset(self):
         """Clear learned capabilities and cached rankings (new run, or tests)."""
         self._rank_cache = {}
-        self._rank_chunk_size = None
+        # Discovered rank chunk capability, PER object_type. A single shared
+        # value was objectively wrong: a scan over a 2-object scope (cNode)
+        # "discovered" that chunks of 2 work and that size was then reused
+        # for a 378-object scope (VIP), devolving one rank scan into 189
+        # serial create/query/delete cycles on a real cluster (round 4).
+        # A size learned because a scope IS small says nothing about the
+        # cluster's actual object_ids cap for any other scope.
+        self._rank_chunk_sizes_by_type = {}
         self._batch_unsupported = set()
         self._last_query_at = 0.0
 
@@ -415,15 +422,20 @@ class DrillSession:
             return None
         return ranked
 
-    def _rank_chunk_sizes(self, total):
+    def _rank_chunk_sizes(self, total, object_type):
         """Batch sizes to try, largest first: everything, then stepping down.
 
         A cluster that refuses an oversized ``object_ids`` list fails the
         create fast, so this discovers the real cap in a few extra POSTs and
         the working size is reused for the rest of the run.
         """
-        if self._rank_chunk_size:
-            return [min(self._rank_chunk_size, total)]
+        cached = self._rank_chunk_sizes_by_type.get(object_type)
+        # Reuse a discovered size only when it was learned as a REAL cap -
+        # i.e. a smaller-than-population chunk that worked after a larger one
+        # was refused. A cached size that merely equals a small population's
+        # total is not capability evidence and must not cap larger scans.
+        if cached and cached["was_cap"]:
+            return [min(cached["size"], total)]
         ordered = []
         for size in (total, 256, 128, 64, self.min_batch):
             size = min(size, total)
@@ -470,7 +482,8 @@ class DrillSession:
                            score_fn, time_frame, name_of, no_aggregation):
         id_to_name = {obj["id"]: name_of(obj) for obj in objects}
         ranked = None
-        for chunk_size in self._rank_chunk_sizes(len(objects)):
+        sizes = self._rank_chunk_sizes(len(objects), object_type)
+        for idx, chunk_size in enumerate(sizes):
             try:
                 ranked = self._rank_scan(
                     mode, objects, object_type, rank_props, score_fn,
@@ -478,7 +491,12 @@ class DrillSession:
                 )
             except RuntimeError:
                 continue
-            self._rank_chunk_size = chunk_size
+            # was_cap: a larger size was actually refused before this one
+            # worked, so this is real capability evidence rather than an
+            # artifact of a small population.
+            self._rank_chunk_sizes_by_type[object_type] = {
+                "size": chunk_size, "was_cap": idx > 0,
+            }
             break
         if ranked is None:
             # Every batch size was refused: keep the objects so the drill can
