@@ -18,6 +18,8 @@ settled decision buried in a branch handoff disappears when the branch merges.
 | [../CLAUDE.md](../CLAUDE.md) | Claude Code entrypoint; imports `AGENTS.md` and adds tool-specific routing | Durable policy |
 | [decisions/](decisions/) | Settled engineering decisions with the evidence that settled them | Durable; superseded, never rewritten |
 | [REFACTOR_HANDOFF.md](REFACTOR_HANDOFF.md) | State of the `refactor/tui-performance` effort: baseline, measurements, per-protocol status, open work | **Point-in-time** |
+| [CLAUDE_HANDOFF.md](CLAUDE_HANDOFF.md) | Concise cross-AI handoff: current state, pending real-VMS validation, blocked items | **Point-in-time** |
+| [../scripts/var203_validation/](../scripts/var203_validation/README.md) | Work-laptop validation package: automated probes + interactive checklist for the remaining live-cluster questions | Point-in-time |
 | [WORKSTATION_BOOTSTRAP.md](WORKSTATION_BOOTSTRAP.md) | Setting up a machine to continue the work | Durable procedure |
 
 ## Agent configuration

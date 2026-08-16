@@ -37,9 +37,22 @@ def render_frame(module, columns=200, lines=40):
 
 @pytest.fixture
 def v41(monkeypatch):
-    """nfs_v41 primed with plausible rendered state, no VMS needed."""
+    """nfs_v41 primed with plausible rendered state, no VMS needed.
+
+    The exporter drill panels read the module-global NFS4 / HOSTVIEW
+    collectors, which init_config normally constructs. This fixture builds
+    the same collector objects itself (never scraped, so they render their
+    warm-up/empty states) rather than depending on another test having run
+    init_config first - these tests must pass in isolation, not just in
+    full-suite order.
+    """
+    import nfs4_native
     import nfs_v41
 
+    monkeypatch.setattr(
+        nfs_v41, "NFS4", nfs4_native.Nfs4Collector(lambda *a, **k: ""))
+    monkeypatch.setattr(
+        nfs_v41, "HOSTVIEW", nfs4_native.HostViewCollector(lambda *a, **k: ""))
     tui_layout.set_color(False)
     nfs_v41._COLOR = False
     nfs_v41.VMS, nfs_v41.PORT = "10.0.0.1", 443
@@ -151,7 +164,7 @@ def test_footer_survives_drill_error_and_status_panels(v41):
 # The other engines draw their own footers; guard them against the same bug.
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("engine_name,expected", [
-    ("nfs_v3", ["q", "x"]),
+    ("nfs_v3", ["[q]", "[x] Exit drill"]),
     ("smb", ["[q]", "[x]"]),
     ("s3", ["[q]", "[x]"]),
 ])
@@ -185,6 +198,63 @@ def test_other_engines_keep_controls_visible_in_drill_mode(engine_name, expected
     for token in expected:
         assert token in frame, f"{engine_name} drill frame lost {token!r}"
 
+
+
+# ---------------------------------------------------------------------------
+# Startup / waiting frame: the pre-data frame must own the footer too.
+# nfs_v3 and nvme_tcp used a bare `print("Waiting for data…"); return` that
+# bypassed the footer entirely - the exact early-return pattern this suite
+# guards against. Fails on that pre-change code.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("engine_name,token", [
+    ("nfs_v3", "[q]"),
+    ("nvme_tcp", "[q]"),
+])
+@pytest.mark.parametrize("columns", [200, 120, 80, 40])
+def test_waiting_frame_keeps_the_footer(engine_name, token, columns):
+    import importlib
+
+    module = importlib.import_module(engine_name)
+    tui_layout.set_color(False)
+    module._COLOR = False
+    module.VMS, module.PORT = "10.0.0.1", 443
+    module.CLUSTER_NAME = "c1"
+    module.REFRESH_SECONDS = 5
+    module.DRILL_MODE = None
+    module.LAST_ROWS = []          # no data yet -> the waiting frame
+    if hasattr(module, "STARTUP_STATUS"):
+        module.STARTUP_STATUS = None
+    frame = render_frame(module, columns=columns)
+    assert token in frame, (
+        f"{engine_name} waiting frame dropped the footer token {token!r} at {columns}c")
+
+
+@pytest.mark.parametrize("engine_name,token", [
+    ("nfs_v3", "[q]"),
+    ("nfs_v41", "[q]"),
+    ("smb", "[q]"),
+    ("s3", "[q]"),
+    ("nvme_tcp", "[q]"),
+])
+def test_startup_status_frame_keeps_the_footer(engine_name, token):
+    """The startup interstitial frame must render the nav footer too."""
+    import importlib
+
+    module = importlib.import_module(engine_name)
+    tui_layout.set_color(False)
+    module._COLOR = False
+    module.VMS, module.PORT = "10.0.0.1", 443
+    module.CLUSTER_NAME = None      # earliest phase: cluster not resolved yet
+    module.REFRESH_SECONDS = 5
+    module.DRILL_MODE = None
+    module.LAST_ROWS = []
+    module.STARTUP_STATUS = "Connecting to 10.0.0.1:443, please stand by..."
+    try:
+        frame = render_frame(module)
+    finally:
+        module.STARTUP_STATUS = None
+    assert "Connecting to 10.0.0.1:443" in frame, f"{engine_name} lost the startup message"
+    assert token in frame, f"{engine_name} startup frame dropped the footer token {token!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -234,3 +304,163 @@ def test_exporter_drills_never_drop_the_footer(v41, mode, columns):
     finally:
         v41.EXPORTER_MODE = None
     assert "[q]" in frame
+
+
+# ---------------------------------------------------------------------------
+# FR-A: the canonical cross-protocol navigation contract.
+# Same concept -> same key, same label, same relative order, in every engine.
+# Protocol-specific controls come after the common set. VIP is never [v];
+# exit-drill is never [p] (the old NVMe bindings that survived in help text
+# after the keys themselves changed).
+# ---------------------------------------------------------------------------
+ENGINE_MODULES = ["nfs_v3", "nfs_v41", "smb", "s3", "nvme_tcp"]
+
+
+def _controls(engine_name):
+    import importlib
+
+    return importlib.import_module(engine_name)._NAV_CONTROLS
+
+
+@pytest.mark.parametrize("engine_name", ENGINE_MODULES)
+def test_common_controls_use_canonical_keys_labels_and_order(engine_name):
+    import vast_drill
+
+    canonical = dict(vast_drill.CANONICAL_CONTROLS)
+    order = {k: i for i, (k, _l) in enumerate(vast_drill.CANONICAL_CONTROLS)}
+    controls = _controls(engine_name)
+    common = [(k, l) for k, l in controls if k in canonical]
+    # Canonical labels, exactly.
+    for key, label in common:
+        assert label == canonical[key], (
+            f"{engine_name} labels [{key}] as {label!r}, contract says {canonical[key]!r}")
+    # Canonical relative order.
+    keys = [k for k, _l in common]
+    assert keys == sorted(keys, key=order.get), (
+        f"{engine_name} common controls out of canonical order: {keys}")
+    # Protocol-specific controls strictly after the common set.
+    tail = [(k, l) for k, l in controls if k not in canonical]
+    assert list(controls) == common + tail, (
+        f"{engine_name} interleaves protocol-specific controls with common ones")
+
+
+@pytest.mark.parametrize("engine_name", ENGINE_MODULES)
+def test_vip_is_never_v_and_exit_is_never_p(engine_name):
+    for key, label in _controls(engine_name):
+        if key == "v":
+            assert label == "View", f"{engine_name} binds [v] to {label!r}; v means View"
+        assert key != "p", f"{engine_name} still advertises the retired [p] binding"
+        if label == "VIP":
+            assert key == "i", f"{engine_name} binds VIP to [{key}]; VIP is [i]"
+        if label == "Exit drill":
+            assert key == "x", f"{engine_name} binds exit-drill to [{key}]; exit is [x]"
+
+
+def test_every_engine_shares_one_quit_exit_refresh_triple():
+    """The three controls every engine has must be identical everywhere."""
+    for engine_name in ENGINE_MODULES:
+        controls = dict(_controls(engine_name))
+        assert controls.get("q") == "Quit", engine_name
+        assert controls.get("x") == "Exit drill", engine_name
+        assert controls.get("space") == "Refresh", engine_name
+
+
+@pytest.mark.parametrize("engine_name,token", [
+    ("nfs_v3", "[space] Refresh"),
+    ("nfs_v41", "[space] Refresh"),
+    ("smb", "[space] Refresh"),
+    ("s3", "[space] Refresh"),
+])
+def test_shared_legend_renders_in_engine_footers(engine_name, token):
+    """The rendered footer text comes from the shared legend renderer."""
+    import importlib
+
+    import vast_drill
+
+    module = importlib.import_module(engine_name)
+    tui_layout.set_color(False)
+    legend = tui_layout.strip_ansi(vast_drill.nav_legend(module._NAV_CONTROLS))
+    assert token in legend
+    assert "|" in legend
+
+
+# ---------------------------------------------------------------------------
+# FR-A regression: the footer must WRAP, never silently drop controls.
+#
+# Observed on a real laptop terminal: the footer showed only
+#   [q] Quit |[o] Ops |[l] Lat
+# while c/v/t/x still worked - right-truncation made working controls
+# undiscoverable. The legend now wraps onto continuation lines; a control an
+# engine supports must be visible at any ordinary width.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("engine_name", ENGINE_MODULES)
+@pytest.mark.parametrize("columns", [200, 100, 80, 60])
+def test_every_supported_control_is_visible_at_width(engine_name, columns):
+    import importlib
+
+    module = importlib.import_module(engine_name)
+    tui_layout.set_color(False)
+    module._COLOR = False
+    module.VMS, module.PORT = "10.0.0.1", 443
+    module.CLUSTER_NAME = "c1"
+    module.REFRESH_SECONDS = 5
+    module.DRILL_MODE = None
+    module.LAST_ROWS = []
+    # The startup frame goes through the same footer-owning render path as
+    # the live dashboard, without needing full per-engine row state.
+    module.STARTUP_STATUS = "Connecting to 10.0.0.1:443, please stand by..."
+    try:
+        frame = render_frame(module, columns=columns)
+    finally:
+        module.STARTUP_STATUS = None
+    for key, label in module._NAV_CONTROLS:
+        assert f"[{key}]" in frame, (
+            f"{engine_name}: control [{key}] {label} invisible at "
+            f"{columns} columns - a working key must stay discoverable")
+
+
+def test_the_observed_qol_truncation_cannot_recur():
+    """Literal repro of the field report: q/o/l visible, c/v/t/x gone.
+
+    At 30 columns the old single-line renderer truncated NFSv3's legend to
+    exactly the reported '[q] Quit |[o] Ops |[l] Lat' prefix. The wrapped
+    renderer must keep every control visible at that same width.
+    """
+    import vast_drill
+
+    import nfs_v3
+
+    tui_layout.set_color(False)
+    nfs_v3._COLOR = False
+    # The defective rendering, reconstructed: one line, right-truncated.
+    old_style = tui_layout.truncate_display(
+        tui_layout.strip_ansi(vast_drill.nav_legend(nfs_v3._NAV_CONTROLS)), 28)
+    assert "[q]" in old_style and "[o]" in old_style and "[l]" in old_style
+    assert "[c]" not in old_style, "repro no longer reproduces the field report"
+    # The fixed rendering at the same width: everything survives, wrapped.
+    lines = [tui_layout.strip_ansi(l)
+             for l in vast_drill.nav_legend_lines(nfs_v3._NAV_CONTROLS, 28)]
+    joined = " ".join(lines)
+    for key, _label in nfs_v3._NAV_CONTROLS:
+        assert f"[{key}]" in joined, f"[{key}] dropped at 28 columns"
+    for line in lines:
+        assert tui_layout.display_width(line) <= 28
+
+
+def test_nav_legend_lines_packs_greedily_and_never_drops():
+    import vast_drill
+
+    tui_layout.set_color(False)
+    controls = vast_drill.CANONICAL_CONTROLS
+    for width in (200, 120, 76, 40, 20, 8):
+        lines = [tui_layout.strip_ansi(l)
+                 for l in vast_drill.nav_legend_lines(controls, width)]
+        joined = " ".join(lines)
+        for key, _label in controls:
+            assert f"[{key}]" in joined, (key, width)
+    # Wide enough for everything -> exactly one line, identical content to
+    # the unwrapped legend.
+    one = vast_drill.nav_legend_lines(controls, 500)
+    assert len(one) == 1
+    assert tui_layout.strip_ansi(one[0]) == tui_layout.strip_ansi(
+        vast_drill.nav_legend(controls))

@@ -272,6 +272,7 @@ LAST_ROWS = {"data": [], "stateful": [], "state": [], "pnfs": [],
 LAST_SAMPLE = "-"
 DRILL_MODE = DRILL_ERROR = None
 DRILL_STATUS = None         # transient "Loading..." message during drill setup
+STARTUP_STATUS = None       # transient per-phase message during blocking startup
 DRILL_OBJECTS = []
 DRILL_MONITORS = []
 LAST_DRILL_ROWS = []
@@ -1712,6 +1713,31 @@ def _set_drill_status(text):
     DRILL_STATUS = text
 
 
+def _set_startup_status(text):
+    global STARTUP_STATUS
+    STARTUP_STATUS = text
+
+
+def initialize():
+    """Blocking startup behind per-phase status frames (see vast_drill)."""
+    def _connect():
+        global CLUSTER_ID, CLUSTER_NAME
+        CLUSTER_ID, CLUSTER_NAME = get_current_cluster()
+        _capture_cluster_os()
+
+    def _prepare():
+        create_headline_monitors()
+
+    def _gather():
+        fetch_monitor_query()
+
+    vast_drill.with_startup_status(_set_startup_status, render_screen, [
+        (f"Connecting to {VMS}:{PORT}, please stand by...", _connect),
+        (lambda: f"Preparing metrics on {CLUSTER_NAME or VMS}, please stand by...", _prepare),
+        ("Gathering initial metrics, please stand by...", _gather),
+    ])
+
+
 def _set_exporter_status(text):
     global EXPORTER_STATUS
     EXPORTER_STATUS = text
@@ -1795,18 +1821,11 @@ def render_screen():
     vast_common.flush_frame(buf.getvalue())
 
 
-_NAV_CONTROLS = (
-    ("q", "Quit"),
-    ("o", "Ops"),
-    ("l", "Lat"),
-    ("n", "Name"),
-    ("c", "cNode"),
-    ("v", "View"),
-    ("t", "Tenant"),
-    ("4", "Native v4"),
-    ("h", "v4 hosts"),
-    ("x", "Exit drill"),
-    ("space", "Refresh"),
+# Canonical common controls first (FR-A contract in vast_drill), then the
+# NFSv4.1-specific exporter drills.
+_NAV_CONTROLS = vast_drill.nav_controls(
+    ("q", "o", "l", "n", "c", "v", "t", "x", "space"),
+    extra=(("4", "Native v4"), ("h", "v4 hosts")),
 )
 
 # Never let a narrow terminal collapse the frame to the point where the
@@ -1828,20 +1847,20 @@ def _frame_width():
 
 
 def _render_nav_footer(width):
-    """Application navigation bar, shown in every mode including drill-downs."""
-    parts = []
-    for key, label in _NAV_CONTROLS:
-        if parts:
-            parts.append(c("|", _DIM))
-        parts.append(c(f"[{key}]", _BWHITE) + c(f" {label} ", _DIM))
-    print(box_row("".join(parts), width), flush=True)
+    """Application navigation bar, shown in every mode including drill-downs.
+
+    Wrapped, never truncated: every supported control stays discoverable at
+    any width (box_row's inner width is the frame width minus the borders).
+    """
+    for line in vast_drill.nav_legend_lines(_NAV_CONTROLS, max(width - 4, 12)):
+        print(box_row(line, width), flush=True)
 
 
 def _render_frame():
     width = _frame_width()
     title = (
         c("  VAST NFSv41", _BCYAN) + c(" opstat", _BWHITE) + c(f" v{VERSION}", _DIM)
-        + f"   VMS {c(f'{VMS}:{PORT}', _BWHITE)}   cluster {c(CLUSTER_NAME, _BWHITE)}"
+        + f"   VMS {c(f'{VMS}:{PORT}', _BWHITE)}   cluster {c(CLUSTER_NAME or '?', _BWHITE)}"
         + c(f"   refresh {REFRESH_SECONDS}s", _DIM)
     )
     if EXPORTER_MODE:
@@ -1866,7 +1885,11 @@ def _render_frame():
     # rendered by this common path for every mode - a drill panel returning
     # early used to take the footer with it, leaving drill modes with no
     # visible controls at all.
-    if EXPORTER_MODE or EXPORTER_STATUS:
+    if STARTUP_STATUS:
+        print(box_top("STARTING", width))
+        print(box_row(c(STARTUP_STATUS, _YELLOW), width))
+        print(box_bottom(width))
+    elif EXPORTER_MODE or EXPORTER_STATUS:
         _render_exporter_panels(width)
     elif DRILL_MODE or DRILL_STATUS:
         _render_drill_panel(width)
@@ -2607,13 +2630,24 @@ def cleanup():
     global _CLEANED_UP
     if _CLEANED_UP:
         return
-    _CLEANED_UP = True
     restore_terminal()
+    # Shutdown feedback: the drain is a slow synchronous DELETE loop (and blocks
+    # signals), so announce it truthfully before blocking rather than leaving a
+    # silent pause. Count is known up front; no fake progress.
+    _pending = vast_common.pending_monitor_count()
+    if _pending:
+        vast_common.emit_stderr(vast_common.cleanup_message(_pending))
     vast_common.drain_monitors(delete_monitor)
+    # Set the guard only after the drain actually completes, so an interrupted
+    # or failed cleanup is retried by the atexit/finally backstop instead of
+    # being skipped. drain_monitors blocks signals internally, so it is not
+    # itself interruptible mid-loop.
+    _CLEANED_UP = True
     vast_api_log.close()
     openmetrics.close()
     for monitor_id, detail in vast_common.failed_deletes():
-        print(f"WARNING: monitor {monitor_id} not deleted: {detail}", file=sys.stderr)
+        vast_common.emit_stderr(
+            f"WARNING: monitor {monitor_id} not deleted: {detail}")
 
 
 def signal_handler(_signum, _frame):
@@ -2759,6 +2793,32 @@ def create_headline_monitors():
     _init_state_monitor(candidates=state_candidates, pnfs=pnfs_candidates)
 
 
+def _dispatch_key(key):
+    """Handle one navigation key (see vast_drill.dispatch_queued_keys).
+
+    Returns "rendered" when the action painted already, "refresh" when a
+    repaint is owed after the queued batch drains, None for an unbound key.
+    """
+    global SORT_MODE
+    if key == " ":
+        vast_common.guarded_poll(manual_refresh, render_screen)
+        return "rendered"
+    if key in ("o", "l", "n"):
+        SORT_MODE = {"o": "ops", "l": "latency", "n": "default"}[key]
+        return "refresh"
+    if key in ("c", "t"):
+        switch_drill_mode({"c": "cnode", "t": "tenant"}[key])
+        return "refresh"
+    if key in ("v", "4", "h"):
+        enter_exporter_mode({"v": "view", "4": "native", "h": "hosts"}[key])
+        return "refresh"
+    if key == "x":
+        exit_drill_mode()
+        exit_exporter_mode()
+        return "refresh"
+    return None
+
+
 def main():
     global DATA_MONITOR_ID, META_MONITOR_ID, SUPPLEMENT_MONITOR_ID, BW_MONITOR_ID
     global CLUSTER_ID, CLUSTER_NAME, SORT_MODE
@@ -2771,11 +2831,7 @@ def main():
         return 0
 
     setup_keyboard()
-    CLUSTER_ID, CLUSTER_NAME = get_current_cluster()
-    _capture_cluster_os()
-    create_headline_monitors()
-
-    fetch_monitor_query()
+    initialize()
     render_screen()
     next_refresh = time.time() + REFRESH_SECONDS
 
@@ -2784,30 +2840,9 @@ def main():
         if chars:
             if "\x03" in chars or "q" in chars.lower():
                 break
-            if "o" in chars.lower():
-                SORT_MODE = "ops"
-            elif "l" in chars.lower():
-                SORT_MODE = "latency"
-            elif "n" in chars.lower():
-                SORT_MODE = "default"
-            elif "c" in chars.lower():
-                switch_drill_mode("cnode")
-            elif "v" in chars.lower():
-                enter_exporter_mode("view")
-            elif "t" in chars.lower():
-                switch_drill_mode("tenant")
-            elif "4" in chars:
-                enter_exporter_mode("native")
-            elif "h" in chars.lower():
-                enter_exporter_mode("hosts")
-            elif "x" in chars.lower():
-                exit_drill_mode()
-                exit_exporter_mode()
-            elif " " in chars:
-                vast_common.guarded_poll(manual_refresh, render_screen)
+            # Every queued key, in arrival order - see vast_drill.
+            if vast_drill.dispatch_queued_keys(chars, _dispatch_key, render_screen):
                 next_refresh = time.time() + REFRESH_SECONDS
-                continue
-            render_screen()
             continue
 
         now = time.time()

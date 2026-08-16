@@ -21,6 +21,7 @@ import time
 import urllib.parse
 from datetime import datetime
 
+import tui_layout
 import vast_common
 from tui_layout import as_float, raw_bw_to_gb_sec
 
@@ -321,7 +322,14 @@ class DrillSession:
     def reset(self):
         """Clear learned capabilities and cached rankings (new run, or tests)."""
         self._rank_cache = {}
-        self._rank_chunk_size = None
+        # Discovered rank chunk capability, PER object_type. A single shared
+        # value was objectively wrong: a scan over a 2-object scope (cNode)
+        # "discovered" that chunks of 2 work and that size was then reused
+        # for a 378-object scope (VIP), devolving one rank scan into 189
+        # serial create/query/delete cycles on a real cluster (round 4).
+        # A size learned because a scope IS small says nothing about the
+        # cluster's actual object_ids cap for any other scope.
+        self._rank_chunk_sizes_by_type = {}
         self._batch_unsupported = set()
         self._last_query_at = 0.0
 
@@ -414,15 +422,20 @@ class DrillSession:
             return None
         return ranked
 
-    def _rank_chunk_sizes(self, total):
+    def _rank_chunk_sizes(self, total, object_type):
         """Batch sizes to try, largest first: everything, then stepping down.
 
         A cluster that refuses an oversized ``object_ids`` list fails the
         create fast, so this discovers the real cap in a few extra POSTs and
         the working size is reused for the rest of the run.
         """
-        if self._rank_chunk_size:
-            return [min(self._rank_chunk_size, total)]
+        cached = self._rank_chunk_sizes_by_type.get(object_type)
+        # Reuse a discovered size only when it was learned as a REAL cap -
+        # i.e. a smaller-than-population chunk that worked after a larger one
+        # was refused. A cached size that merely equals a small population's
+        # total is not capability evidence and must not cap larger scans.
+        if cached and cached["was_cap"]:
+            return [min(cached["size"], total)]
         ordered = []
         for size in (total, 256, 128, 64, self.min_batch):
             size = min(size, total)
@@ -469,7 +482,8 @@ class DrillSession:
                            score_fn, time_frame, name_of, no_aggregation):
         id_to_name = {obj["id"]: name_of(obj) for obj in objects}
         ranked = None
-        for chunk_size in self._rank_chunk_sizes(len(objects)):
+        sizes = self._rank_chunk_sizes(len(objects), object_type)
+        for idx, chunk_size in enumerate(sizes):
             try:
                 ranked = self._rank_scan(
                     mode, objects, object_type, rank_props, score_fn,
@@ -477,7 +491,12 @@ class DrillSession:
                 )
             except RuntimeError:
                 continue
-            self._rank_chunk_size = chunk_size
+            # was_cap: a larger size was actually refused before this one
+            # worked, so this is real capability evidence rather than an
+            # artifact of a small population.
+            self._rank_chunk_sizes_by_type[object_type] = {
+                "size": chunk_size, "was_cap": idx > 0,
+            }
             break
         if ranked is None:
             # Every batch size was refused: keep the objects so the drill can
@@ -505,6 +524,46 @@ class DrillSession:
     def _store(self, mode, objects, ranked):
         self._rank_cache[mode] = (
             time.monotonic(), self._signature(objects), list(ranked),
+        )
+
+    # -- scope capability probing -------------------------------------------
+    def probe_scope(self, mode, objects, *, object_type, rank_props,
+                    time_frame, no_aggregation=False):
+        """Bounded telemetry-availability probe: does this scope return ANY
+        per-object rows at all?
+
+        One monitor over a sample of at most ``max_objects`` ids, one query,
+        one delete - O(1) in the population size. Returns True (telemetry
+        present), False (queried fine, zero rows for every sampled id), or
+        None (create/query refused - proves nothing about telemetry).
+
+        This is deliberately OPT-IN and separate from :meth:`rank`: the
+        proven NFS/SMB/S3 callers rank scopes whose telemetry is already
+        established and never need it. It answers only "is telemetry
+        available", which is a different question from "what rank-chunk size
+        does the cluster accept" (the per-type cache above) and from "is the
+        display batch splittable" (create_monitors below) - three questions
+        that must never share one cache or boolean, which is how a 378-object
+        scope came to prove itself dead one 2-object monitor at a time.
+        """
+        sample = [obj["id"] for obj in objects[:self.max_objects]]
+        if not sample:
+            return None
+        monitor_id = None
+        try:
+            monitor_id = self._create_monitor(
+                "probe_%s" % mode, rank_props, object_type, sample,
+                no_aggregation=no_aggregation,
+            )
+            result = self._request("GET", "/monitors/%s/query/" % monitor_id)
+        except RuntimeError:
+            return None
+        finally:
+            if monitor_id is not None:
+                self._delete_monitor(monitor_id)
+        return any(
+            (slice_result_for_object(result, oid) or {}).get("data")
+            for oid in sample
         )
 
     # -- monitor creation --------------------------------------------------
@@ -583,6 +642,148 @@ class DrillSession:
 
 
 # ---------------------------------------------------------------------------
+# Canonical navigation contract (FR-A)
+# ---------------------------------------------------------------------------
+# Same conceptual action -> same key, same label, same relative order in every
+# engine's footer. Protocol-specific controls are appended AFTER the common
+# set. Two bindings are load-bearing prohibitions: VIP is [i] (never [v], which
+# means the View drill), and exit-drill is [x] (never [p], an old NVMe binding
+# that survived into help text after the key itself changed).
+#
+# An engine advertises only the subset it actually supports - the contract
+# standardizes what exists, it does not invent controls.
+CANONICAL_CONTROLS = (
+    ("q", "Quit"),
+    ("o", "Ops"),
+    ("l", "Lat"),
+    ("n", "Name"),
+    ("c", "cNode"),
+    ("v", "View"),
+    ("t", "Tenant"),
+    ("i", "VIP"),
+    ("x", "Exit drill"),
+    ("space", "Refresh"),
+)
+
+_CANONICAL_ORDER = {key: idx for idx, (key, _label) in enumerate(CANONICAL_CONTROLS)}
+_CANONICAL_LABELS = dict(CANONICAL_CONTROLS)
+
+
+def nav_controls(common, extra=()):
+    """Build an engine's footer control list from the canonical contract.
+
+    ``common`` names the canonical keys the engine supports; they come back in
+    canonical order with canonical labels regardless of the order given.
+    ``extra`` is the engine's protocol-specific ``(key, label)`` tuples,
+    appended after the common set. A non-canonical key in ``common`` is a
+    programming error and raises immediately rather than rendering a footer
+    that silently diverges from the contract.
+    """
+    unknown = [key for key in common if key not in _CANONICAL_ORDER]
+    if unknown:
+        raise ValueError("non-canonical nav keys: %s" % ", ".join(unknown))
+    ordered = sorted(set(common), key=_CANONICAL_ORDER.get)
+    return tuple((key, _CANONICAL_LABELS[key]) for key in ordered) + tuple(extra)
+
+
+def nav_legend(controls):
+    """Render ``[key] Label | [key] Label ...`` footer text from control tuples.
+
+    One shared renderer so the look (brackets, pipes, spacing, dim/bright
+    split) cannot drift between engines. Engines wrap the returned string in
+    their own frame furniture (``box_row`` or a plain line).
+
+    On any terminal narrower than the full legend, use
+    :func:`nav_legend_lines` instead - truncating this single line drops
+    controls from the right, which shipped as a real defect: an ordinary
+    laptop terminal showed only ``[q] Quit |[o] Ops |[l] Lat`` while c/v/t/x
+    still worked but were undiscoverable.
+    """
+    parts = []
+    for key, label in controls:
+        if parts:
+            parts.append(tui_layout.c("|", tui_layout._DIM))
+        parts.append(
+            tui_layout.c("[%s]" % key, tui_layout._BWHITE)
+            + tui_layout.c(" %s " % label, tui_layout._DIM)
+        )
+    return "".join(parts).rstrip()
+
+
+def nav_legend_lines(controls, width):
+    """Render the footer legend wrapped to *width*, never dropping a control.
+
+    Returns a list of rendered lines. Controls are packed greedily in their
+    canonical order and wrap onto continuation lines when the next segment
+    would not fit - a control the engine supports must stay discoverable at
+    any width, because the key keeps working whether or not it is shown. At
+    pathologically narrow widths each line carries at least one control and
+    the frame furniture may truncate it, but a control is only ever shortened,
+    never silently omitted.
+    """
+    if width is None or width <= 0:
+        return [nav_legend(controls)]
+    lines = []
+    line_parts = []
+    line_width = 0
+    for key, label in controls:
+        # A rendered segment is "[k] Label " (trailing space) and the join is
+        # a bare "|", so a continuation costs the pipe plus the segment and
+        # its trailing space; the final line loses one space to rstrip.
+        seg_width = tui_layout.display_width("[%s] %s" % (key, label)) + 1
+        sep_width = 1 if line_parts else 0
+        if line_parts and line_width + sep_width + seg_width - 1 > width:
+            lines.append("".join(line_parts).rstrip())
+            line_parts = []
+            line_width = 0
+            sep_width = 0
+        if line_parts:
+            line_parts.append(tui_layout.c("|", tui_layout._DIM))
+        line_parts.append(
+            tui_layout.c("[%s]" % key, tui_layout._BWHITE)
+            + tui_layout.c(" %s " % label, tui_layout._DIM)
+        )
+        line_width += sep_width + seg_width
+    if line_parts:
+        lines.append("".join(line_parts).rstrip())
+    return lines or [""]
+
+
+def dispatch_queued_keys(chars, dispatch, render):
+    """Dispatch every queued key in arrival order - one action per key.
+
+    ``check_keypress`` returns the whole pending buffer, and keys are only
+    read between poll cycles; on a slow cluster one cycle blocks 30-80 s, so
+    several keystrokes routinely arrive in one read. Every engine used to
+    fire ONE action per read and silently discard the rest - a real lab run
+    showed a buffered space swallowing the queued ``x`` and ``i``, leaving
+    the user unable to leave a drill until quit.
+
+    ``dispatch(key)`` performs one key's action and returns ``"rendered"``
+    (the action already painted - e.g. a forced refresh), ``"refresh"`` (a
+    repaint is owed once the batch drains), or ``None`` (unbound key). The
+    single deferred repaint means a burst of queued keys costs one frame,
+    not one per key.
+
+    Returns True when any action already rendered, so the caller re-arms its
+    refresh timer. Quit handling stays in the caller: scanning for ``q``
+    before dispatch preserves quit-from-anywhere-in-the-buffer semantics.
+    """
+    rendered = False
+    refresh_needed = False
+    for key in chars.lower():
+        outcome = dispatch(key)
+        if outcome == "rendered":
+            rendered = True
+            refresh_needed = False
+        elif outcome == "refresh":
+            refresh_needed = True
+    if refresh_needed:
+        render()
+    return rendered
+
+
+# ---------------------------------------------------------------------------
 # Drill-entry loading status
 # ---------------------------------------------------------------------------
 # Entering a drill can block for seconds against a real VMS: ranking hundreds
@@ -590,6 +791,7 @@ class DrillSession:
 # message has to reach the terminal *before* that work starts, or the TUI
 # simply looks hung.
 LOADING_MESSAGES = {
+    "startup": "Gathering initial metrics, please stand by...",
     "cnode": "Loading the cNODE drill-down, please stand by...",
     "view": "Loading the VIEW drill-down, please stand by...",
     "views": "Loading the NFSv4 views, please stand by...",
@@ -619,5 +821,29 @@ def with_loading_status(show_status, render, mode, work):
     try:
         render()
         return work()
+    finally:
+        show_status(None)
+
+
+def with_startup_status(show_status, render, steps):
+    """Run each blocking startup step behind its own status frame.
+
+    ``steps`` is a sequence of ``(message, work)`` pairs run in order. For each
+    step the status is set, one frame is rendered, *then* the blocking work
+    runs — so the terminal shows what the process is waiting on before it
+    blocks, and the message visibly changes as startup progresses (the engines
+    are single-threaded, so this frame-per-phase is the progress signal; there
+    is no spinner).
+
+    ``message`` may be a string or a zero-argument callable returning one, so a
+    later step can name the cluster once an earlier step has resolved it (the
+    cluster name is unknown until the first call returns). The status is cleared
+    in a ``finally`` so it never survives startup, including when a step raises.
+    """
+    try:
+        for message, work in steps:
+            show_status(message() if callable(message) else message)
+            render()
+            work()
     finally:
         show_status(None)

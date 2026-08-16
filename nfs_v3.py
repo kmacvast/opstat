@@ -197,6 +197,7 @@ DRILL_MONITORS = []    # [(monitor_id, object_name), ...]
 LAST_DRILL_ROWS = []   # [{"name": ..., "total_ops": ..., "latency_us": ..., ...}]
 DRILL_ERROR    = None  # set when drill-down fails; cleared on success
 DRILL_STATUS   = None  # transient "Switching to …" message during drill setup
+STARTUP_STATUS = None  # transient per-phase message during blocking startup
 
 RUN_STARTED_AT = None
 
@@ -592,13 +593,24 @@ def cleanup():
     global _CLEANED_UP
     if _CLEANED_UP:
         return
-    _CLEANED_UP = True
     restore_terminal()
+    # Shutdown feedback: the drain is a slow synchronous DELETE loop (and blocks
+    # signals), so announce it truthfully before blocking rather than leaving a
+    # silent pause. Count is known up front; no fake progress.
+    _pending = vast_common.pending_monitor_count()
+    if _pending:
+        vast_common.emit_stderr(vast_common.cleanup_message(_pending))
     vast_common.drain_monitors(delete_monitor)
+    # Set the guard only after the drain actually completes, so an interrupted
+    # or failed cleanup is retried by the atexit/finally backstop instead of
+    # being skipped. drain_monitors blocks signals internally, so it is not
+    # itself interruptible mid-loop.
+    _CLEANED_UP = True
     vast_api_log.close()
     openmetrics.close()
     for monitor_id, detail in vast_common.failed_deletes():
-        print(f"WARNING: monitor {monitor_id} not deleted: {detail}", file=sys.stderr)
+        vast_common.emit_stderr(
+            f"WARNING: monitor {monitor_id} not deleted: {detail}")
 
 
 def signal_handler(_signum, _frame):
@@ -1828,18 +1840,34 @@ def render_screen():
     vast_common.flush_frame(buf.getvalue())
 
 
+# Canonical common controls first (FR-A contract in vast_drill), then the
+# NFSv3-specific sort keys: [r] sort by RPC count, [w] sort by workload share.
+# This replaced the original htop-style legend (`q`uit / [spc]refresh /
+# x=cluster) so every engine reads the same way; the keys themselves are
+# unchanged.
+_NAV_CONTROLS = vast_drill.nav_controls(
+    ("q", "o", "l", "c", "v", "t", "x", "space"),
+    extra=(("r", "RPC"), ("w", "Work")),
+)
+
+
+def _footer_keys(width=None):
+    """The navigation key legend (owned by the common render path).
+
+    Wrapped to the terminal width rather than truncated: right-truncation
+    silently dropped controls (a real laptop terminal showed only q/o/l while
+    c/v/t/x still worked), and a control that works must stay discoverable.
+    """
+    inner = None if width is None else max(width - 2, 12)
+    return "\n".join(
+        c("  ", _DIM) + line
+        for line in vast_drill.nav_legend_lines(_NAV_CONTROLS, inner)
+    )
+
+
 def _render_frame():
     rows            = LAST_ROWS
     selected_sample = LAST_SAMPLE
-
-    if not rows:
-        print(f"Waiting for data…  VMS={VMS}:{PORT}  cluster={CLUSTER_NAME}")
-        return
-
-    total_ops        = sum(as_float(r["ops_sec"]) or 0 for r in rows)
-    combined_latency = compute_combined_avg_latency(rows)
-    total_bw         = compute_total_throughput_gbs(rows)
-    deltas           = compute_deltas(rows, PREV_ROWS)
     width            = min(shutil.get_terminal_size((184, 40)).columns, 184)
     mode_tag         = "avg " + API_TIME_FRAME if SAMPLE_AVERAGE_MODE else "latest"
 
@@ -1850,7 +1878,7 @@ def _render_frame():
     title_line = (
         c("  VAST NFSv3", _BCYAN) + c(" opstat", _BWHITE) + c(f" v{VERSION}", _DIM)
         + "   VMS " + c(f"{VMS}:{PORT}", _BWHITE)
-        + "   cluster " + c(CLUSTER_NAME, _BWHITE)
+        + "   cluster " + c(CLUSTER_NAME or "?", _BWHITE)
         + c(f"   refresh {REFRESH_SECONDS}s", _DIM)
         + drill_tag + csv_tag
     )
@@ -1861,6 +1889,26 @@ def _render_frame():
         + (f"  {os_label}" if os_label else ""),
         _DIM,
     )
+
+    # ── Startup / waiting frame: keep the header and footer (the common path
+    #    owns the footer - never a bare early return). ─────────────────────────
+    if STARTUP_STATUS or not rows:
+        print(title_line)
+        print(info_line)
+        print(c(_H * width, _DIM))
+        if STARTUP_STATUS:
+            print(c("  " + STARTUP_STATUS, _BYELLOW))
+        else:
+            print(c(f"  Waiting for data…  VMS={VMS}:{PORT}"
+                    f"  cluster={CLUSTER_NAME or '?'}", _DIM))
+        print(c(_H * width, _DIM))
+        print(_footer_keys(width), flush=True)
+        return
+
+    total_ops        = sum(as_float(r["ops_sec"]) or 0 for r in rows)
+    combined_latency = compute_combined_avg_latency(rows)
+    total_bw         = compute_total_throughput_gbs(rows)
+    deltas           = compute_deltas(rows, PREV_ROWS)
     print(title_line)
     print(info_line)
     print(c(_H * width, _DIM))
@@ -1887,22 +1935,9 @@ def _render_frame():
         + lat_dot(combined_latency) + " " + lat_s
         + "   " + delta_arrow(total_bw) + " " + bw_s
     )
-    keys    = (
-        c("  ", _DIM)
-        + c("[spc]", _BWHITE) + c("refresh  ", _DIM)
-        + c("r", _BWHITE) + c("pc  ", _DIM)
-        + c("o", _BWHITE) + c("ps  ", _DIM)
-        + c("l", _BWHITE) + c("at  ", _DIM)
-        + c("w", _BWHITE) + c("ork  ", _DIM)
-        + c("c", _BWHITE) + c("Node  ", _DIM)
-        + c("v", _BWHITE) + c("iew  ", _DIM)
-        + c("t", _BWHITE) + c("enant  ", _DIM)
-        + c("x", _BWHITE) + c("=cluster  ", _DIM)
-        + c("q", _BWHITE) + c("uit", _DIM)
-    )
     print(c(_H * width, _DIM))
     print(foot)
-    print(keys, flush=True)
+    print(_footer_keys(width), flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1995,6 +2030,60 @@ def discover_metrics():
 # Main loop
 # ---------------------------------------------------------------------------
 
+def _set_startup_status(text):
+    global STARTUP_STATUS
+    STARTUP_STATUS = text
+
+
+def initialize():
+    """Blocking startup behind per-phase status frames.
+
+    Auth, cluster resolution, monitor creation and the first sample fetch take
+    tens of seconds against a real VMS. Each phase paints its status frame
+    before it blocks (via vast_drill.with_startup_status), so the terminal shows
+    what it is waiting on; the status clears when the first real frame renders,
+    and on error.
+    """
+    def _connect():
+        global CLUSTER_ID, CLUSTER_NAME
+        CLUSTER_ID, CLUSTER_NAME = get_current_cluster()
+        _capture_cluster_os()
+
+    def _prepare():
+        create_headline_monitors()
+
+    def _gather():
+        fetch_monitor_query()
+
+    vast_drill.with_startup_status(_set_startup_status, render_screen, [
+        (f"Connecting to {VMS}:{PORT}, please stand by...", _connect),
+        (lambda: f"Preparing metrics on {CLUSTER_NAME or VMS}, please stand by...", _prepare),
+        ("Gathering initial metrics, please stand by...", _gather),
+    ])
+
+
+def _dispatch_key(key):
+    """Handle one navigation key (see vast_drill.dispatch_queued_keys).
+
+    Returns "rendered" when the action painted already, "refresh" when a
+    repaint is owed after the queued batch drains, None for an unbound key.
+    """
+    global SORT_MODE
+    if key == " ":
+        vast_common.guarded_poll(manual_refresh, render_screen)
+        return "rendered"
+    if key in ("r", "o", "l", "w"):
+        SORT_MODE = {"r": "rpc", "o": "ops", "l": "latency", "w": "workload"}[key]
+        return "refresh"
+    if key in ("c", "v", "t"):
+        switch_drill_mode({"c": "cnode", "v": "view", "t": "tenant"}[key])
+        return "refresh"
+    if key == "x":
+        exit_drill_mode()
+        return "refresh"
+    return None
+
+
 def main():
     global RPC_MONITOR_ID, BW_MONITOR_ID, CLUSTER_ID, CLUSTER_NAME, SORT_MODE, DRILL_ERROR
 
@@ -2008,12 +2097,7 @@ def main():
     ensure_csv_file()
     setup_keyboard()
 
-    CLUSTER_ID, CLUSTER_NAME = get_current_cluster()
-    _capture_cluster_os()
-
-    create_headline_monitors()
-
-    fetch_monitor_query()
+    initialize()
     render_screen()
 
     next_refresh_time = time.time() + REFRESH_SECONDS
@@ -2023,38 +2107,11 @@ def main():
         chars = check_keypress()
 
         if chars:
-            ch = chars.lower()
-
-            if "\x03" in chars or "q" in ch:
+            if "\x03" in chars or "q" in chars.lower():
                 break
-
-            refresh_needed = True
-
-            if "r" in ch:
-                SORT_MODE = "rpc"
-            elif "o" in ch:
-                SORT_MODE = "ops"
-            elif "l" in ch:
-                SORT_MODE = "latency"
-            elif "w" in ch:
-                SORT_MODE = "workload"
-            elif "c" in ch:
-                switch_drill_mode("cnode")
-            elif "v" in ch:
-                switch_drill_mode("view")
-            elif "t" in ch:
-                switch_drill_mode("tenant")
-            elif "x" in ch:
-                exit_drill_mode()
-            elif " " in chars:
-                vast_common.guarded_poll(manual_refresh, render_screen)
+            # Every queued key, in arrival order - see vast_drill.
+            if vast_drill.dispatch_queued_keys(chars, _dispatch_key, render_screen):
                 next_refresh_time = time.time() + REFRESH_SECONDS
-                refresh_needed = False  # guarded_poll already rendered
-            else:
-                refresh_needed = False
-
-            if refresh_needed:
-                render_screen()
             continue
 
         if now >= next_refresh_time:

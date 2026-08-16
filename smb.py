@@ -38,6 +38,7 @@ import ipaddress
 import openmetrics
 import vast_api_log
 import vast_common
+import vast_drill
 from tui_layout import (
     display_width, format_fixed_number, format_scaled_metric, join_columns,
     pad_display, truncate_display, c, set_color, set_unicode, glyph_set,
@@ -203,6 +204,9 @@ _TENANT_WRITE_MD_LAT_CNT = "TenantMetrics,write_md_latency__num_samples"
 
 _MAX_DRILL_OBJECTS = 8
 _DRILL_PROBE_LIMIT = 32
+# Object-scoped metric families publish ~1/min, so re-querying a drill on every
+# 5 s headline tick returned byte-identical payloads on the real cluster.
+_DRILL_MIN_QUERY_INTERVAL = 15.0
 _DRILL_COL = {"name": 24, "ops": 12, "lat": 10, "bw": 9, "top": 12, "pct": 6}
 
 HEALTH_PANEL_TITLE = "SMB HEALTH & WORKLOAD"
@@ -255,6 +259,8 @@ DRILL_MONITORS = []
 LAST_DRILL_ROWS = []
 DRILL_ERROR = None
 DRILL_STATUS = None
+STARTUP_STATUS = None
+DRILL = None
 LAST_TOPN = None
 LAST_SESSION_CONTEXT = None
 _LAST_AUX_FETCH_AT = 0.0
@@ -307,6 +313,16 @@ def init_config(args):
     CSV_FILE = getattr(args, "csv", None)
     RUN_STARTED_AT = datetime.now()
     configure_client_scope(args)
+
+    global DRILL
+    DRILL = vast_drill.DrillSession(
+        request_fn=api_request,
+        create_monitor_fn=_create_monitor_raw,
+        delete_monitor_fn=delete_monitor,
+        max_objects=_MAX_DRILL_OBJECTS,
+        min_batch=_DRILL_PROBE_LIMIT,
+        min_query_interval=_DRILL_MIN_QUERY_INTERVAL,
+    )
 
 
 def configure_client_scope(args):
@@ -537,8 +553,12 @@ def build_drill_rank_prop_list(mode):
 
 
 def _is_batch_drill_mode(mode=None):
-    mode = mode or DRILL_MODE
-    return mode in ("view", "tenant")
+    """True when the active drill is served by one batched monitor.
+
+    Keyed on the actual monitor layout, not the mode: a view/tenant drill that
+    fell back to per-object monitors must be queried per object, not sliced.
+    """
+    return vast_drill.DrillSession.batch_active(None, DRILL_MONITORS)
 
 
 def _normalize_object_id(value):
@@ -1886,48 +1906,29 @@ def _build_drill_row(mode, result, obj_name):
     return _build_cnode_drill_row(result, obj_name)
 
 
+def _drill_score(mode, sliced_result):
+    """Activity score for one object during ranking."""
+    return as_float(_build_drill_row(mode, sliced_result, "").get("total_ops")) or 0.0
+
+
 def _rank_drill_candidates(mode, objects, cfg):
-    """Rank view/tenant candidates in chunks - scans all objects, not just the first 32."""
-    if not objects:
-        return []
+    """Return the most active ``_MAX_DRILL_OBJECTS`` view/tenant candidates.
 
-    id_to_name = {obj["id"]: _obj_name(obj, cfg["name_fields"]) for obj in objects}
-    all_ranked = []
-
-    for chunk_start in range(0, len(objects), _DRILL_PROBE_LIMIT):
-        chunk = objects[chunk_start:chunk_start + _DRILL_PROBE_LIMIT]
-        object_ids = [obj["id"] for obj in chunk]
-        rank_monitor_id = None
-        try:
-            rank_monitor_id = _create_monitor_raw(
-                f"rank_{mode}_{chunk_start}",
-                build_drill_rank_prop_list(mode),
-                cfg["object_type"],
-                object_ids,
-                no_aggregation=cfg.get("no_aggregation", False),
-            )
-            result = api_request("GET", f"/monitors/{rank_monitor_id}/query/")
-            for obj_id in object_ids:
-                name = id_to_name[obj_id]
-                slice_result = _slice_result_for_object(result, obj_id)
-                row = _build_drill_row(mode, slice_result, name)
-                all_ranked.append({
-                    "id": obj_id,
-                    "name": name,
-                    "total_ops": as_float(row.get("total_ops")) or 0.0,
-                })
-        except RuntimeError:
-            for obj in chunk:
-                all_ranked.append({
-                    "id": obj["id"],
-                    "name": id_to_name[obj["id"]],
-                    "total_ops": 0.0,
-                })
-        finally:
-            delete_monitor(rank_monitor_id)
-
-    all_ranked.sort(key=lambda item: (-item["total_ops"], item["name"].lower()))
-    return [{"id": item["id"], "name": item["name"]} for item in all_ranked[:_MAX_DRILL_OBJECTS]]
+    The previous chunked serial scan cost one create/query/delete monitor per
+    32 objects; 145 views measured 18 API calls and ~100 s of "stand by" on
+    the real cluster. vast_drill tries a single server-side topn request, then
+    the fewest batched rank monitors the cluster accepts, and caches the result
+    so re-entering the drill inside the cache window is free.
+    """
+    return DRILL.rank(
+        mode, objects,
+        object_type=cfg["object_type"],
+        rank_props=build_drill_rank_prop_list(mode),
+        score_fn=lambda sliced: _drill_score(mode, sliced),
+        time_frame=API_TIME_FRAME,
+        name_of=lambda obj: _obj_name(obj, cfg["name_fields"]),
+        no_aggregation=cfg.get("no_aggregation", False),
+    )
 
 
 def enter_drill_mode(mode):
@@ -1965,22 +1966,20 @@ def enter_drill_mode(mode):
 
     _cleanup_drill_monitors()
     prop_list = build_drill_prop_list(mode)
-    new_monitors = []
-    last_error = None
 
-    if _is_batch_drill_mode(mode):
-        try:
-            monitor_id = _create_monitor_raw(
-                f"{mode}_batch",
-                prop_list,
-                cfg["object_type"],
-                [obj["id"] for obj in DRILL_OBJECTS],
-                no_aggregation=cfg.get("no_aggregation", False),
-            )
-            new_monitors.append((monitor_id, None))
-        except RuntimeError as e:
-            last_error = str(e)
+    if mode in ("view", "tenant"):
+        # Batched into one monitor where the cluster allows it, with automatic
+        # fallback to per-object monitors when the batch is refused.
+        new_monitors, last_error = DRILL.create_monitors(
+            mode, DRILL_OBJECTS,
+            object_type=cfg["object_type"],
+            props=prop_list,
+            no_aggregation=cfg.get("no_aggregation", False),
+        )
     else:
+        # cnode: per-object monitors, unchanged from the pre-port behavior.
+        new_monitors = []
+        last_error = None
         for obj in DRILL_OBJECTS:
             try:
                 monitor_id = _create_monitor_raw(
@@ -2024,9 +2023,18 @@ def exit_drill_mode():
     DRILL_STATUS = None
 
 
-def fetch_drill_query():
+def fetch_drill_query(force=False):
+    """Re-query the active drill monitors, throttled for view/tenant unless *force*.
+
+    View and tenant metric families publish a new sample ~1/min, so a 5 s
+    dashboard tick re-fetched identical payloads; the space bar passes
+    force=True. cNode keeps its pre-port every-tick cadence.
+    """
     global LAST_DRILL_ROWS, DRILL_ERROR
     if not DRILL_MODE:
+        return
+    if DRILL_MODE in ("view", "tenant") and not DRILL.should_query(
+            force=force, have_data=bool(LAST_DRILL_ROWS)):
         return
     drill_rows = []
     query_errors = 0
@@ -2062,23 +2070,25 @@ def fetch_drill_query():
         )
 
 
-def switch_drill_mode(mode):
-    """Enter drill mode with a standby message during monitor setup."""
+def _set_drill_status(text):
     global DRILL_STATUS
-    cfg = _DRILL_CFG.get(mode, {})
+    DRILL_STATUS = text
+
+
+def switch_drill_mode(mode):
+    """Enter drill mode behind the shared loading interstitial.
+
+    The stand-by frame is painted before the blocking ranking/monitor work via
+    vast_drill.with_loading_status, and cleared afterwards even on error.
+    """
     exit_drill_mode()
-    label = cfg.get("label", mode.upper())
-    if mode in ("view", "tenant"):
-        DRILL_STATUS = f"Ranking {label} drill-down by activity, stand by..."
-    else:
-        DRILL_STATUS = f"Switching to {label} drill-down, stand by..."
-    render_screen()
-    try:
+
+    def _work():
         enter_drill_mode(mode)
         if DRILL_MODE:
-            fetch_drill_query()
-    finally:
-        DRILL_STATUS = None
+            fetch_drill_query(force=True)
+
+    vast_drill.with_loading_status(_set_drill_status, render_screen, mode, _work)
 
 
 def _render_drill_panel(width):
@@ -2188,9 +2198,9 @@ def poll_tick():
 
 
 def manual_refresh():
-    """Space-bar refresh: also force the auxiliary monitors in cluster view."""
+    """Space-bar refresh: bypass the drill throttle, or force auxiliary monitors."""
     if DRILL_MODE:
-        fetch_drill_query()
+        fetch_drill_query(force=True)
     else:
         fetch_monitor_query(force_aux=True)
 
@@ -2205,6 +2215,16 @@ def render_screen():
     finally:
         sys.stdout = real_stdout
     vast_common.flush_frame(buf.getvalue())
+
+
+# Canonical common controls (FR-A contract in vast_drill); SMB adds nothing
+# protocol-specific.
+_NAV_CONTROLS = vast_drill.nav_controls(("q", "c", "v", "t", "x", "space"))
+
+
+def _nav_legend_lines(width):
+    """Wrapped legend lines: controls wrap, they are never dropped."""
+    return vast_drill.nav_legend_lines(_NAV_CONTROLS, max(width - 4, 12))
 
 
 def _render_frame():
@@ -2231,7 +2251,11 @@ def _render_frame():
     ))
     print()
 
-    if DRILL_MODE or DRILL_ERROR or DRILL_STATUS:
+    if STARTUP_STATUS:
+        print(box_top("INITIALIZING", width))
+        print(box_row(c(STARTUP_STATUS, _YELLOW), width))
+        print(box_bottom(width))
+    elif DRILL_MODE or DRILL_ERROR or DRILL_STATUS:
         _render_drill_panel(width)
     else:
         deltas = compute_deltas(_all_panel_rows(LAST_ROWS), PREV_ROWS)
@@ -2241,15 +2265,8 @@ def _render_frame():
         print()
         _render_opcode_workflow_panel(LAST_ROWS, width)
         print()
-    print(box_row(
-        c("[q]", _BWHITE) + c(" Quit ", _DIM)
-        + c("|", _DIM) + c("[c]", _BWHITE) + c(" cNode ", _DIM)
-        + c("|", _DIM) + c("[v]", _BWHITE) + c(" View ", _DIM)
-        + c("|", _DIM) + c("[t]", _BWHITE) + c(" Tenant ", _DIM)
-        + c("|", _DIM) + c("[x]", _BWHITE) + c(" Exit drill ", _DIM)
-        + c("|", _DIM) + c("[space]", _BWHITE) + c(" Refresh", _DIM),
-        width,
-    ), flush=True)
+    for _line in _nav_legend_lines(width):
+        print(box_row(_line, width), flush=True)
 
 
 setup_keyboard = vast_common.setup_keyboard
@@ -2264,13 +2281,24 @@ def cleanup():
     global _CLEANED_UP
     if _CLEANED_UP:
         return
-    _CLEANED_UP = True
     restore_terminal()
+    # Shutdown feedback: the drain is a slow synchronous DELETE loop (and blocks
+    # signals), so announce it truthfully before blocking rather than leaving a
+    # silent pause. Count is known up front; no fake progress.
+    _pending = vast_common.pending_monitor_count()
+    if _pending:
+        vast_common.emit_stderr(vast_common.cleanup_message(_pending))
     vast_common.drain_monitors(delete_monitor)
+    # Set the guard only after the drain actually completes, so an interrupted
+    # or failed cleanup is retried by the atexit/finally backstop instead of
+    # being skipped. drain_monitors blocks signals internally, so it is not
+    # itself interruptible mid-loop.
+    _CLEANED_UP = True
     vast_api_log.close()
     openmetrics.close()
     for monitor_id, detail in vast_common.failed_deletes():
-        print(f"WARNING: monitor {monitor_id} not deleted: {detail}", file=sys.stderr)
+        vast_common.emit_stderr(
+            f"WARNING: monitor {monitor_id} not deleted: {detail}")
 
 
 def signal_handler(_signum, _frame):
@@ -2459,6 +2487,56 @@ def discover_metrics(write_report_path=None):
     return 0
 
 
+def _set_startup_status(text):
+    global STARTUP_STATUS
+    STARTUP_STATUS = text
+
+
+def initialize():
+    """Blocking startup behind a 'gathering initial metrics' status frame.
+
+    Auth, cluster resolution, headline-monitor creation and the first sample
+    fetch take several seconds against a real VMS (~30 s was observed); the
+    shared loading helper paints the status frame before that work so the
+    terminal never looks frozen, and clears it when the first frame is ready.
+    """
+    def _connect():
+        global CLUSTER_ID, CLUSTER_NAME
+        CLUSTER_ID, CLUSTER_NAME = get_current_cluster()
+        _capture_cluster_os()
+
+    def _prepare():
+        create_headline_monitors()
+        ensure_csv_file()
+
+    def _gather():
+        fetch_monitor_query()
+
+    vast_drill.with_startup_status(_set_startup_status, render_screen, [
+        (f"Connecting to {VMS}:{PORT}, please stand by...", _connect),
+        (lambda: f"Preparing metrics on {CLUSTER_NAME or VMS}, please stand by...", _prepare),
+        ("Gathering initial metrics, please stand by...", _gather),
+    ])
+
+
+def _dispatch_key(key):
+    """Handle one navigation key (see vast_drill.dispatch_queued_keys).
+
+    Returns "rendered" when the action painted already, "refresh" when a
+    repaint is owed after the queued batch drains, None for an unbound key.
+    """
+    if key == " ":
+        vast_common.guarded_poll(manual_refresh, render_screen)
+        return "rendered"
+    if key in ("c", "v", "t"):
+        switch_drill_mode({"c": "cnode", "v": "view", "t": "tenant"}[key])
+        return "refresh"
+    if key == "x":
+        exit_drill_mode()
+        return "refresh"
+    return None
+
+
 def main():
     """Entry point after init_config."""
     global HEADLINE_MONITOR_ID, CLUSTER_ID, CLUSTER_NAME
@@ -2470,12 +2548,7 @@ def main():
     vast_common.register_atexit(cleanup)
 
     setup_keyboard()
-    CLUSTER_ID, CLUSTER_NAME = get_current_cluster()
-    _capture_cluster_os()
-    create_headline_monitors()
-    ensure_csv_file()
-
-    fetch_monitor_query()
+    initialize()
     render_screen()
     next_refresh = time.time() + REFRESH_SECONDS
 
@@ -2484,19 +2557,9 @@ def main():
         if chars:
             if "\x03" in chars or "q" in chars.lower():
                 break
-            if "c" in chars.lower():
-                switch_drill_mode("cnode")
-            elif "v" in chars.lower():
-                switch_drill_mode("view")
-            elif "t" in chars.lower():
-                switch_drill_mode("tenant")
-            elif "x" in chars.lower():
-                exit_drill_mode()
-            elif " " in chars:
-                vast_common.guarded_poll(manual_refresh, render_screen)
+            # Every queued key, in arrival order - see vast_drill.
+            if vast_drill.dispatch_queued_keys(chars, _dispatch_key, render_screen):
                 next_refresh = time.time() + REFRESH_SECONDS
-                continue
-            render_screen()
             continue
 
         now = time.time()

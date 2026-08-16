@@ -51,6 +51,38 @@ outside the column. Sub-microsecond latencies rendered as `0 µs`. Both were
   width; the footer degrades legibly rather than vanishing or wrapping into
   garbage.
 
+### Startup and shutdown are loading states too
+
+- **Startup**: every engine's `main()` runs its blocking startup through
+  `initialize()` and `vast_drill.with_startup_status`, painting a frame before
+  each phase — `Connecting to {VMS}:{PORT}…` (the cluster name is unknown that
+  early, so the host is named), `Preparing metrics on {CLUSTER_NAME}…`,
+  `Gathering initial metrics…`. Real startup ran ~30–90 s on a live cluster
+  with a previously blank terminal. The message *changing* is the progress
+  signal — the engines are single-threaded, so there is no spinner, and adding
+  one would require the L1 concurrency decision below.
+- The startup/waiting frame renders through the footer-owning common path.
+  `nfs_v3` and `nvme_tcp` once did a bare `print("Waiting for data…"); return`
+  that bypassed the footer — the exact early-return defect this rule exists
+  for.
+- **Shutdown**: `cleanup()` announces `Cleaning up N temporary monitors,
+  please stand by...` before the slow, signal-blocking monitor drain
+  (~1 s/monitor on a real cluster). A silent multi-second quit reads as a
+  hang; a truthful count is shown, never fake progress.
+- `tests/test_startup_loading.py` and `tests/test_cleanup_lifecycle.py`
+  guard the ordering; the waiting/startup footer cases live in
+  `tests/test_render_navigation.py`.
+
+### Navigation keys follow the canonical contract
+
+Same concept → same key, label, and relative order in every engine:
+`vast_drill.CANONICAL_CONTROLS`, built per engine via `nav_controls()` and
+rendered by the shared `nav_legend()`. Protocol-specific controls come after
+the common set. **VIP is `[i]`, never `[v]`; exit-drill is `[x]`, never
+`[p]`.** The FR-A section of `tests/test_render_navigation.py` enforces this
+across all five engines; deliberate deviations are documented in
+[docs/REFACTOR_HANDOFF.md](../../docs/REFACTOR_HANDOFF.md).
+
 ### Paint a loading frame before blocking work
 
 - Any operation that can take more than a moment shows a user-visible status

@@ -513,11 +513,76 @@ def forget_monitor(monitor_id):
     _CREATED_MONITORS.discard(monitor_id)
 
 
+def emit_stderr(message):
+    """Best-effort stderr line: NEVER raises.
+
+    Cleanup output goes to a terminal that may already be gone - round 4
+    leaked the whole headline monitor set because the shutdown banner's
+    write to a dead PTY raised EIO and killed cleanup() before the drain
+    ran, on the signal path and the atexit retry alike. Rendering is
+    best-effort; monitor deletion is mandatory.
+    """
+    try:
+        print(message, file=sys.stderr, flush=True)
+    except Exception:
+        pass
+
+
 def drain_monitors(delete_fn):
-    """Delete every still-registered monitor using engine-supplied delete_fn."""
-    for monitor_id in list(_CREATED_MONITORS):
-        delete_fn(monitor_id)
-        _CREATED_MONITORS.discard(monitor_id)
+    """Delete every still-registered monitor using engine-supplied delete_fn.
+
+    The drain is a slow synchronous DELETE loop (~1 s per monitor on a real
+    cluster). Termination signals are blocked for its duration so a SIGTERM,
+    a second SIGINT, or a PTY hang-up SIGHUP arriving mid-drain cannot re-enter
+    the signal handler and ``sys.exit`` out of the loop, orphaning the monitors
+    it had not yet reached. Any such signal is deferred and delivered once the
+    mask is restored, so a clean shutdown still happens — after every monitor is
+    gone. The previous mask is always restored, so this is safe to call from
+    tests that keep running.
+    """
+    block = getattr(signal, "pthread_sigmask", None)
+    term_sigs = [getattr(signal, n) for n in ("SIGINT", "SIGTERM", "SIGHUP")
+                 if hasattr(signal, n)]
+    previous_mask = None
+    if block is not None and term_sigs:
+        try:
+            previous_mask = block(signal.SIG_BLOCK, term_sigs)
+        except (ValueError, OSError):
+            previous_mask = None
+    try:
+        # Continue through EVERY owned monitor even when one delete raises
+        # (engine delete wrappers normally record-and-swallow, but the drain
+        # must not depend on that), and show truthful progress on a long
+        # drain: the round-3 var203 shutdown was draining 206 monitors at
+        # ~2 s each - the observer gave up at 362 s with 9 to go, reading a
+        # working drain as a hang. Real counts only, no fake progress.
+        pending = list(_CREATED_MONITORS)
+        total = len(pending)
+        for done, monitor_id in enumerate(pending, 1):
+            try:
+                delete_fn(monitor_id)
+            except Exception as exc:              # noqa: BLE001 - report, keep draining
+                record_failed_delete(monitor_id, str(exc)[:80])
+            _CREATED_MONITORS.discard(monitor_id)
+            if total >= 20 and (done % 10 == 0 or done == total):
+                emit_stderr("  ... %d/%d monitors removed" % (done, total))
+    finally:
+        if previous_mask is not None:
+            try:
+                block(signal.SIG_SETMASK, previous_mask)
+            except (ValueError, OSError):
+                pass
+
+
+def pending_monitor_count():
+    """How many session monitors are still registered (awaiting teardown)."""
+    return len(_CREATED_MONITORS)
+
+
+def cleanup_message(count):
+    """Truthful shutdown banner for the monitor drain (no fake progress)."""
+    noun = "monitor" if count == 1 else "monitors"
+    return "Cleaning up %d temporary %s, please stand by..." % (count, noun)
 
 
 def record_failed_delete(monitor_id, detail):
@@ -729,6 +794,25 @@ def check_keypress():
     if not chunks:
         return ""
     return strip_escape_sequences(b"".join(chunks).decode(errors="ignore"))
+
+
+def input_pending():
+    """True when stdin has unread keystrokes (non-blocking, zero timeout).
+
+    Lets a long serial fetch cycle notice queued input BETWEEN API calls and
+    yield back to the main loop early: on var203 one refresh cycle is several
+    monitor queries at 2-38 s each, and a keypress used to wait for the whole
+    cycle - an ``x`` went unprocessed for 150+ s in the round-3 lab run.
+    False when keyboard polling is inactive (piped stdin, tests, non-POSIX),
+    so fetch loops behave exactly as before in those environments.
+    """
+    if not _TERM_ENABLED:
+        return False
+    try:
+        readable, _w, _e = select.select([sys.stdin.fileno()], [], [], 0)
+        return bool(readable)
+    except Exception:
+        return False
 
 
 def wait_for_input(timeout):

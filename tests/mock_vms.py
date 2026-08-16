@@ -72,6 +72,16 @@ VOLUMES = [
 
 VIPS = [{"id": 700 + i, "ip": f"10.1.0.{i + 1}", "name": f"vip-{i}"} for i in range(4)]
 
+# Modeled from real var203 evidence (probe rounds 2-4): /blockhosts/ returns
+# six objects, and blockhost-scoped monitors echo BlockMetrics unrewritten
+# while carrying no per-object rows on that build (the D-013 dead-scope
+# shape, reproduced via state.batch_unsplittable, not hardcoded here).
+BLOCKHOSTS = [
+    {"id": 1 + i, "name": f"blockhost-{i}",
+     "nqn": f"nqn.2014-08.org.nvmexpress:uuid:mock-{i:04d}"}
+    for i in range(6)
+]
+
 
 # Which views/tenants actually carry load, most-active first. Deliberately
 # placed deep in the /views/ listing so an implementation that ranks by
@@ -86,6 +96,19 @@ _ACTIVE_VIEW_IDS = {VIEWS[i]["id"]: rank
                     for rank, i in enumerate(_ACTIVE_VIEW_INDEXES)}
 _ACTIVE_TENANT_IDS = {TENANTS[i]["id"]: rank
                       for rank, i in enumerate(_ACTIVE_TENANT_INDEXES)}
+
+# Block (NVMe) activity, planted the same way: the busiest cNode is index 10
+# of 12 and the busiest VIP is index 3 of 4, so an engine that head-slices the
+# first 8 objects by API order misses the hot cNode entirely. Ranking
+# correctness is therefore observable, exactly as for views/tenants.
+_ACTIVE_BLOCK_INDEXES_CNODE = (10, 4, 1)
+_ACTIVE_BLOCK_INDEXES_VIP = (3, 0)
+_ACTIVE_BLOCK_IDS = dict(
+    [(CNODES[i]["id"], rank)
+     for rank, i in enumerate(_ACTIVE_BLOCK_INDEXES_CNODE)]
+    + [(VIPS[i]["id"], rank)
+       for rank, i in enumerate(_ACTIVE_BLOCK_INDEXES_VIP)]
+)
 
 
 # Metric names a VAST build advertises via /metrics/. The default set models
@@ -143,6 +166,10 @@ def _activity_scale(prop, object_id):
     if prop.startswith("TenantMetrics,"):
         rank = _ACTIVE_TENANT_IDS.get(object_id)
         return 0.0 if rank is None else 1.0 / (rank + 1)
+    if object_id is not None and (
+            prop.startswith("BlockMetrics,") or prop.startswith("VolumeMetrics,")):
+        rank = _ACTIVE_BLOCK_IDS.get(object_id)
+        return 0.0 if rank is None else 1.0 / (rank + 1)
     return 1.0
 
 
@@ -157,6 +184,12 @@ def _metric_value(prop, seed, t, object_id=None):
     if "__sum" in prop or "num_samples" in prop:
         # Cumulative counters: a large lifetime base plus monotonic growth
         # proportional to this object's activity, as VMS TenantMetrics do.
+        return round(base * 1_000_000.0 + t * base * 20.0 * scale, 1)
+    if prop.startswith("BlockMetrics,") and prop.endswith("_req"):
+        # BlockMetrics *_req are cumulative lifetime counters: the engine's
+        # own extraction differences them (rate_from_counter_delta /
+        # rate_from_timeseries, with counter-reset handling), so the mock
+        # publishes the matching monotonic shape rather than a gauge.
         return round(base * 1_000_000.0 + t * base * 20.0 * scale, 1)
     if scale == 0.0:
         return 0.0
@@ -333,6 +366,38 @@ class _State:
         # Prop-name prefixes that make POST /monitors/ fail outright, for
         # engines whose fallback path reacts to a rejected create.
         self.reject_prop_prefixes = ()
+        # object_type values POST /monitors/ rejects outright. Models a build
+        # that does not support a monitor scope at all (e.g. object_type=vip),
+        # so an engine's scope-specific fallback path is exercised.
+        self.reject_object_types = ()
+        # Observed on var203 (VAST OS 5.5.0.1): a multi-object_id monitor at
+        # object_type=vip / =blockhost is CREATED and QUERIED successfully but
+        # its response carries no usable per-object rows, while the same shape
+        # at object_type=cnode splits correctly. Creation succeeding is
+        # therefore not evidence that a batch layout is usable, and an engine
+        # must validate the response before committing to one.
+        # Maps object_type -> "no_object_id" (response omits the column) or
+        # "no_matching_rows" (column present, no rows for the requested ids).
+        # The exact var203 shape is not yet distinguished, so both are
+        # modelled and both must force the per-object fallback.
+        self.batch_unsplittable = {}
+        # Monitor ids whose DELETE fails with HTTP 500 (each id fails every
+        # attempt). Models the round-3 var203 shutdown, where one failing
+        # delete aborted the drain loop and orphaned the monitors after it.
+        self.fail_delete_ids = set()
+        # Population overrides for scaling tests: the dead-scope discovery
+        # cost must be O(1) in the object count (round 4: 378 VIPs devolved
+        # into 189 rank monitors), so tests need to grow these arbitrarily.
+        # None -> the module-level defaults.
+        self.vips = None
+        self.cnodes = None
+        self.blockhosts = None
+        # Names of every monitor created since the last reset_calls(), in
+        # order. calls() records only (ts, method, path, status), so tests
+        # that need to count monitors BY PURPOSE (rank vs batch vs headline)
+        # read this - filtering the calls tuple for a name matches nothing,
+        # which made two budget assertions vacuous until a storm slipped by.
+        self.created_names = []
         # Reproduce observed VMS 5.5.0.1 behavior: the newest bucket of an
         # object-scoped monitor is still filling, so every property except
         # the ones listed here comes back null in that row. Set to None to
@@ -415,11 +480,13 @@ class _Handler(BaseHTTPRequestHandler):
 
         simple = {
             "/api/clusters/": CLUSTERS,
-            "/api/cnodes/": CNODES,
+            "/api/cnodes/": self.state.cnodes if self.state.cnodes is not None else CNODES,
             "/api/views/": VIEWS,
             "/api/tenants/": TENANTS,
             "/api/volumes/": VOLUMES,
-            "/api/vips/": VIPS,
+            "/api/vips/": self.state.vips if self.state.vips is not None else VIPS,
+            "/api/blockhosts/": (self.state.blockhosts
+                                 if self.state.blockhosts is not None else BLOCKHOSTS),
         }
         if path in simple:
             return self._send(simple[path])
@@ -454,13 +521,21 @@ class _Handler(BaseHTTPRequestHandler):
             def block(prefix):
                 return [{"title": f"{prefix}{i}", "value": 1000.0 - i * 37}
                         for i in range(10)]
+
+            # Real VMS topn rows carry {title, total, read, write}; the vip
+            # topn-only fallback reads those, so model them for vip. External
+            # (non-192.168) titles so the fallback survives IP filtering.
+            def vip_block(scale):
+                return [{"title": f"10.1.0.{i + 1}", "total": scale - i * 40,
+                         "read": scale * 0.6 - i * 24, "write": scale * 0.4 - i * 16}
+                        for i in range(8)]
             return self._send({"data": {
                 "client": {"md_iops": block("10.2.0."), "iops": block("10.2.0."),
                            "bw": block("10.2.0."), "latency": block("10.2.0.")},
                 "view": {"md_iops": block("/view/"), "iops": block("/view/"),
                          "bw": block("/view/")},
-                "vip": {"iops": block("10.1.0."), "bw": block("10.1.0."),
-                        "latency": block("10.1.0.")},
+                "vip": {"iops": vip_block(500.0), "bw": vip_block(120.0),
+                        "latency": vip_block(800.0)},
                 "user": {"md_iops": block("user")},
             }})
 
@@ -552,10 +627,15 @@ class _Handler(BaseHTTPRequestHandler):
             for p in payload.get("prop_list") or []:
                 if str(p).startswith(tuple(self.state.reject_prop_prefixes)):
                     return self._error(400, f"unsupported metric: {p}")
+        if self.state.reject_object_types and \
+                payload.get("object_type") in self.state.reject_object_types:
+            return self._error(
+                400, f"unsupported object_type: {payload.get('object_type')}")
         cap = self.state.max_object_ids
         if cap is not None and len(payload.get("object_ids") or []) > cap:
             return self._error(400, f"too many object_ids (max {cap})")
         with self.state.lock:
+            self.state.created_names.append(str(payload.get("name", "")))
             monitor_id = self.state.next_monitor_id
             self.state.next_monitor_id += 1
             self.state.monitors[monitor_id] = {
@@ -573,6 +653,8 @@ class _Handler(BaseHTTPRequestHandler):
         if not m:
             return self._error(404, f"no mock route for {path}")
         monitor_id = int(m.group(1))
+        if monitor_id in self.state.fail_delete_ids:
+            return self._error(500, "delete failed (injected)")
         with self.state.lock:
             existed = self.state.monitors.pop(monitor_id, None)
         if existed is None:
@@ -592,7 +674,18 @@ class _Handler(BaseHTTPRequestHandler):
         ] if self.state.unsupported_prop_prefixes else mon["prop_list"]
         object_ids = mon["object_ids"] or [None]
         batch = len(object_ids) > 1
-        prop_list = ["timestamp"] + (["object_id"] if batch else []) + props
+        # A batch this "cluster build" accepts but cannot actually split. The
+        # request succeeds; the response is simply unusable per object.
+        unsplittable = (
+            self.state.batch_unsplittable.get(mon.get("object_type"))
+            if batch else None
+        )
+        if unsplittable == "no_matching_rows":
+            # object_id column present, but every row belongs to an id the
+            # caller did not ask for, so each requested id slices to zero rows.
+            object_ids = [-1]
+        batch_column = batch and unsplittable != "no_object_id"
+        prop_list = ["timestamp"] + (["object_id"] if batch_column else []) + props
 
         now = time.time() - self.state.t0
         partial = self.state.partial_newest_props
@@ -606,7 +699,7 @@ class _Handler(BaseHTTPRequestHandler):
             for oid in object_ids:
                 seed = 0 if oid is None else (int(oid) if str(oid).isdigit() else 0)
                 row = [stamp]
-                if batch:
+                if batch_column:
                     row.append(oid)
                 for p in props:
                     # The newest bucket is still filling on a real VMS: only
@@ -699,6 +792,12 @@ class MockVMS:
     def reset_calls(self):
         with self.state.lock:
             self.state.calls.clear()
+            self.state.created_names.clear()
+
+    def created_monitor_names(self):
+        """Names of monitors created since the last reset_calls(), in order."""
+        with self.state.lock:
+            return list(self.state.created_names)
 
     def counts(self):
         """Return {"METHOD normalized-path": count} with ids collapsed."""
