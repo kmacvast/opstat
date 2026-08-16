@@ -621,9 +621,52 @@ population-scaled ranking.
 honest notice and <= 3 creates each; session total ~20 creates (round 4:
 206); clean `q` with zero remaining ids.
 
+## Round-5 lab findings (var203, `--nvme-only`, HEAD 4657b108)
+
+**The monitor storm is gone - round 5 proves the round-4 architecture on the
+real cluster.** Session creates fell **206 -> 20** (8 headline + cNode
+rank/batch + one bounded probe create each for VIP and HOST + the nav-phase
+cNode re-entry), cleanup deleted **20/20** with **NONE remaining** by per-id
+GET, exit 0. Validated green: startup phases with dashboard at 78.16 s;
+cNode entry (13 calls, batch layout, 2 ranked rows) and `x`; VIP and HOST
+rendering the honest no-telemetry notice from **1 bounded probe create
+each**; the full navigation matrix (`p` unbound, `v` not VIP); shutdown
+frame before the drain.
+
+**Two round-5 numbers were validator artifacts, not product behavior:**
+
+1. **The "421s" / 93-98-call VIP and HOST entries were validator dead
+   time.** `_drill_scenario` waited the full 420 s `--drill-budget` for a
+   panel title the dead-scope path correctly never renders, and only then
+   checked `NO_TELEMETRY_MARKER` - booking ~7 minutes of ordinary
+   background polling against entries whose real work was one probe create
+   (~3-4 calls). Fixed in round 5B: readiness completes on the first
+   terminal state (`OpstatSession.wait_for_any_since`), so dead scopes
+   report true elapsed time, true entry calls, true creates.
+2. **The run's only red result, `nvme.cnode.manual_refresh FAIL "no
+   effect", was a validator measurement defect.** The check slept a fixed
+   6 s after space, but a single var203 call runs 2-38 s and
+   `manual_refresh` runs the full headline pass *before* the forced drill
+   query, so the first attributable log line can land 30-90 s after the
+   keypress (rounds 3 and 4 passed the same check by latency luck). The
+   product path - space -> `_dispatch_key` -> `manual_refresh` ->
+   `fetch_drill_query(force=True)`, throttle bypassed - is correct and
+   unchanged. Fixed in round 5B: the check polls the API log to a bounded
+   `--refresh-deadline` and PASSes only on evidence cadence cannot forge
+   (an aborted-and-restarted headline pass, or a query issued inside the
+   15 s cadence/throttle window after a cleanly separated burst), judged
+   from per-call issue times (completion stamp minus logged duration).
+   Ambiguous activity reports UNVERIFIED, never FAIL.
+
+**Round 5B is the final validator confirmation for this milestone** - a
+validator-only change (no production code), run from `main` after the merge,
+NVMe-only. Acceptance: cNode entry/batch/refresh/`x` green with the corrected
+measurement; VIP/HOST notice at true seconds-scale with <= 3 creates; nav
+green; clean shutdown, zero remaining ids; session creates ~20.
+
 ## Test architecture
 
-504 tests, green on Python 3.8 and the current interpreter, 0 skipped
+603 tests, green on Python 3.8 and the current interpreter, 0 skipped
 (re-derive with `./scripts/validate.sh`; the gate's collection floor is 465).
 
 | Suite | Tests | Covers |
@@ -640,7 +683,7 @@ honest notice and <= 3 creates each; session total ~20 creates (round 4:
 | `test_startup_loading.py` | 15 | Three-phase startup interstitial: frame before each blocking step, clear on error, host-not-cluster first message, all five engines |
 | `test_wizard.py` / `test_opstat_cli.py` | 14 / 13 | Wizard and CLI |
 | `test_nvme_tcp.py` | 13 | FR-C fabric percentages (literal values), drill throttle + forced refresh, FR-A footer, FR-B latency passthrough / zero-collapse |
-| `test_nvme_drill.py` | 11 | NVMe drill ranking (busy cNode planted at index 10 of 12), entry/re-poll budgets, batch splitting, per-object fallback, rank cache, cleanup in both layouts |
+| `test_nvme_drill.py` | 54 | NVMe drill ranking (busy cNode planted at index 10 of 12), entry/re-poll budgets, batch splitting, per-object fallback, rank cache, cleanup in both layouts, dead-scope O(1) probe at populations up to 1000, no-telemetry notice rendering, and the round-5B lab-validator measurements (wait-for-any readiness, forced-refresh judge, lifecycle) |
 | `test_globals_hygiene.py` | 10 | AST check: no function assigns an ALL_CAPS module global without `global` |
 | `test_tui_layout.py`, `test_openmetrics.py`, `test_cleanup_lifecycle.py`, `test_smb_helpers.py`, `test_nfs_v3_helpers.py` | 9 / 8 / 8 / 7 / 3 | Layout, export, cleanup lifecycle (signal-blocked drain, guard ordering, shutdown message), protocol helpers |
 
