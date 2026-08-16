@@ -1,0 +1,85 @@
+var203 continuation-pass probe - 2026-08-15T21:55:22Z
+target var203.selab.vastdata.com:443 as admin; time_frame 10m
+cluster: selab-var-203 (id 1)
+
+=== batch monitor probe: object_type=cnode ===
+  /cnodes/ -> 2 objects (using first 4)
+  created monitor 2645 (adhoc_opstat_probe_batch_cnode_1786830937)
+PROBE:batch.cnode.create PASS ids=[4, 3]
+PROBE:batch.cnode.query PASS prop_list=['timestamp', 'object_id', 'BlockMetrics,read_req', 'BlockMetrics,read_latency__avg']
+PROBE:batch.cnode.splittable PASS rows_per_object={"4": 120, "3": 120}
+
+=== batch monitor probe: object_type=vip ===
+  /vips/ -> 378 objects (using first 4)
+  created monitor 2646 (adhoc_opstat_probe_batch_vip_1786830957)
+PROBE:batch.vip.create PASS ids=[745, 776, 778, 775]
+PROBE:batch.vip.query PASS prop_list=['timestamp', 'object_id', 'TopNMetrics,read_req', 'TopNMetrics,read_latency__avg']
+PROBE:batch.vip.splittable FAIL rows_per_object={"745": 0, "776": 0, "778": 0, "775": 0}
+
+=== batch monitor probe: object_type=blockhost ===
+  /blockhosts/ -> 6 objects (using first 4)
+  created monitor 2647 (adhoc_opstat_probe_batch_blockhost_1786830988)
+PROBE:batch.blockhost.create PASS ids=[1, 2, 3, 4]
+PROBE:batch.blockhost.query PASS prop_list=['timestamp', 'object_id', 'BlockMetrics,read_req', 'BlockMetrics,read_latency__avg']
+PROBE:batch.blockhost.splittable FAIL rows_per_object={"1": 0, "2": 0, "3": 0, "4": 0}
+
+=== rank monitor probe: object_type=cnode ===
+  /cnodes/ -> 2 objects (using first 8)
+  created monitor 2648 (adhoc_opstat_probe_rank_cnode_1786830999)
+PROBE:rank.cnode.accepted PASS scores(read_req d/s)={"4": 1066.056, "3": 0.0}
+  NOTE: 2/2 objects yielded a delta; zeros on an idle cluster are expected (run the block loadgen for a rate signal)
+
+=== startup merge-legality probes (cluster scope) ===
+  created monitor 2649 (adhoc_opstat_probe_merge_data_pairs_1786831001)
+PROBE:merge.data_pairs FAIL rejected: GET https://var203.selab.vastdata.com:443/api/monitors/2649/query/ failed: HTTP 400: {"detail":"can't mix properties fro
+  deleted monitor 2649
+  created monitor 2650 (adhoc_opstat_probe_merge_data_plus_fabric_1786831025)
+PROBE:merge.data_plus_fabric FAIL rejected: GET https://var203.selab.vastdata.com:443/api/monitors/2650/query/ failed: HTTP 400: {"detail":"can't mix properties fro
+  deleted monitor 2650
+
+=== latency unit cross-checks ===
+  created monitor 2651 (adhoc_opstat_probe_lat_ref_1786831040)
+  reference NFS4Common read_latency__avg (PROVEN us): {'timestamp': '2026-08-15T21:57:23Z', 'object_id': 1, 'ProtoMetrics,proto_name=NFS4Common,read_latency__avg': 0} @ 2026-08-15T21:57:23Z
+PROBE:latency.reference PASS values={'timestamp': '2026-08-15T21:57:23Z', 'object_id': 1, 'ProtoMetrics,proto_name=NFS4Common,read_latency__avg': 0}
+  created monitor 2652 (adhoc_opstat_probe_lat_block_1786831045)
+  BlockMetrics read_latency__avg (unit UNPROVEN): {'timestamp': '2026-08-15T21:57:53Z', 'object_id': 1, 'BlockMetrics,read_latency__avg': 825.9} @ 2026-08-15T21:57:53Z
+PROBE:latency.blockmetrics PASS values={'timestamp': '2026-08-15T21:57:53Z', 'object_id': 1, 'BlockMetrics,read_latency__avg': 825.9}
+  host_view latency series (unit UNPROVEN):
+    vast_host_view_latency{alias="kmacs-block-ss",bucket="",cluster="selab-var-203",ip="172.200.14.198",path="/kmacs/block",protocol="BLOCK",share="",tenant="default"} 1.1608331664902898
+    vast_host_view_latency{alias="",bucket="",cluster="selab-var-203",ip="172.200.14.198",path="/kmacs/smb/opstat",protocol="SMB2",share="opstattest",tenant="default"} 0.9199248732802318
+    vast_host_view_latency{alias="",bucket="",cluster="selab-var-203",ip="172.200.14.253",path="/kmacs/smb/opstat",protocol="SMB2",share="opstattest",tenant="default"} 1.6104323834146907
+    vast_host_view_latency{alias="",bucket="csnow-db-203",cluster="selab-var-203",ip="172.200.13.190",path="/csnow-db-203",protocol="NDB",share="",tenant="default"} 0.9710016230002316
+    vast_host_view_latency{alias="",bucket="csnow-db-203",cluster="selab-var-203",ip="172.200.13.191",path="/csnow-db-203",protocol="NDB",share="",tenant="default"} 2.5332060717571294
+    vast_host_view_latency{alias="",bucket="csnow-db-203",cluster="selab-var-203",ip="172.200.13.192",path="/csnow-db-203",protocol="NDB",share="",tenant="default"} 2.4257868020304567
+PROBE:latency.host_view PASS 6 latency series
+  INTERPRETATION: same order of magnitude as the reference for the same traffic -> microseconds; ~1000x smaller -> ms; ~1000x larger -> ns.
+
+=== cleanup ===
+  deleted monitor 2645
+  deleted monitor 2646
+  deleted monitor 2647
+  deleted monitor 2648
+  deleted monitor 2649
+  deleted monitor 2650
+  deleted monitor 2651
+  deleted monitor 2652
+PROBE:cleanup.exact_ids PASS all 8 session ids confirmed gone by per-id GET
+
+=== RESULT SUMMARY ===
+PROBE:batch.cnode.create PASS ids=[4, 3]
+PROBE:batch.cnode.query PASS prop_list=['timestamp', 'object_id', 'BlockMetrics,read_req', 'BlockMetrics,read_latency__avg']
+PROBE:batch.cnode.splittable PASS rows_per_object={"4": 120, "3": 120}
+PROBE:batch.vip.create PASS ids=[745, 776, 778, 775]
+PROBE:batch.vip.query PASS prop_list=['timestamp', 'object_id', 'TopNMetrics,read_req', 'TopNMetrics,read_latency__avg']
+PROBE:batch.vip.splittable FAIL rows_per_object={"745": 0, "776": 0, "778": 0, "775": 0}
+PROBE:batch.blockhost.create PASS ids=[1, 2, 3, 4]
+PROBE:batch.blockhost.query PASS prop_list=['timestamp', 'object_id', 'BlockMetrics,read_req', 'BlockMetrics,read_latency__avg']
+PROBE:batch.blockhost.splittable FAIL rows_per_object={"1": 0, "2": 0, "3": 0, "4": 0}
+PROBE:rank.cnode.accepted PASS scores(read_req d/s)={"4": 1066.056, "3": 0.0}
+PROBE:merge.data_pairs FAIL rejected: GET https://var203.selab.vastdata.com:443/api/monitors/2649/query/ failed: HTTP 400: {"detail":"can't mix properties fro
+PROBE:merge.data_plus_fabric FAIL rejected: GET https://var203.selab.vastdata.com:443/api/monitors/2650/query/ failed: HTTP 400: {"detail":"can't mix properties fro
+PROBE:latency.reference PASS values={'timestamp': '2026-08-15T21:57:23Z', 'object_id': 1, 'ProtoMetrics,proto_name=NFS4Common,read_latency__avg': 0}
+PROBE:latency.blockmetrics PASS values={'timestamp': '2026-08-15T21:57:53Z', 'object_id': 1, 'BlockMetrics,read_latency__avg': 825.9}
+PROBE:latency.host_view PASS 6 latency series
+PROBE:cleanup.exact_ids PASS all 8 session ids confirmed gone by per-id GET
+monitors created this run: [2645, 2646, 2647, 2648, 2649, 2650, 2651, 2652]
