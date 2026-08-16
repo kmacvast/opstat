@@ -676,3 +676,164 @@ def test_live_blockhost_scope_opens_with_real_rows(nvme):
     assert engine.LAST_DRILL_ROWS, "live blockhost drill produced no rows"
     engine.exit_drill_mode()
     assert engine.DRILL_MODE is None
+
+
+# ---------------------------------------------------------------------------
+# Round-5B validator remediation. Round 5's only red result and its two
+# misleading numbers were validator measurement defects, not product ones:
+# the dead-scope notice was only checked after the full 420 s title wait
+# ("421s", 93/98 entry calls of accumulated background polling), and manual
+# refresh was judged by a fixed 6 s settle on a cluster where a single call
+# runs 2-38 s. These tests pin the corrected measurements.
+# ---------------------------------------------------------------------------
+import time as _time
+
+
+def _load_validator():
+    import importlib.util as _ilu
+
+    spec = _ilu.spec_from_file_location(
+        "run_var203_validation",
+        "scripts/var203_validation/run_var203_validation.py")
+    mod = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _bare_session(val, output):
+    sess = val.OpstatSession.__new__(val.OpstatSession)
+    sess.output = output
+    sess.started = _time.time()
+    sess._drain = lambda budget: _time.sleep(min(budget, 0.02))
+    return sess
+
+
+def test_wait_for_any_since_title_wins():
+    val = _load_validator()
+    sess = _bare_session(val, "noise CNODE PATHS noise")
+    needle, elapsed = sess.wait_for_any_since(
+        ("CNODE PATHS", val.NO_TELEMETRY_MARKER), 0, 5)
+    assert needle == "CNODE PATHS"
+    assert elapsed is not None
+
+
+def test_wait_for_any_since_marker_wins_without_waiting_out_the_budget():
+    """Round 5 reported '421s' for a VIP entry whose real work was one
+    bounded probe: the notice was only checked after the 420 s title wait."""
+    import nvme_tcp
+
+    val = _load_validator()
+    sess = _bare_session(
+        val, "Loading the VIP drill-down, please stand by...\n"
+        + nvme_tcp._no_telemetry_notice("vip"))
+    t0 = _time.time()
+    needle, elapsed = sess.wait_for_any_since(
+        ("VIP PATHS", val.NO_TELEMETRY_MARKER), 0, 420)
+    assert needle == val.NO_TELEMETRY_MARKER
+    assert elapsed is not None
+    assert _time.time() - t0 < 5, "marker match must not wait out the budget"
+
+
+def test_wait_for_any_since_timeout_is_honest():
+    val = _load_validator()
+    sess = _bare_session(val, "neither state ever renders")
+    t0 = _time.time()
+    needle, elapsed = sess.wait_for_any_since(("AAA", "BBB"), 0, 0.3)
+    assert needle is None and elapsed is None
+    assert _time.time() - t0 < 5
+
+
+def test_wait_for_any_since_ignores_output_before_the_offset():
+    """A stale previous frame containing the marker must not satisfy a new
+    wait - the same trap wait_for_since exists to close."""
+    val = _load_validator()
+    stale = "old frame: " + val.NO_TELEMETRY_MARKER + "\n"
+    sess = _bare_session(val, stale + "new frame: still loading")
+    needle, _elapsed = sess.wait_for_any_since(
+        ("VIP PATHS", val.NO_TELEMETRY_MARKER), len(stale), 0.3)
+    assert needle is None
+
+
+class _ScriptedSession:
+    """Stand-in for OpstatSession: output and API-log lines appear on send(),
+    or on a timed release schedule, never from a real PTY."""
+
+    def __init__(self, val, on_send):
+        self._val = val
+        self.output = ""
+        self.started = _time.time()
+        self.log_path = "<scripted>"
+        self._lines = ["session start scripted"]
+        self._pending = []          # (release_epoch, line)
+        self._on_send = on_send
+
+    def _release_due(self):
+        now = _time.time()
+        due = [line for at, line in self._pending if at <= now]
+        self._pending = [(at, line) for at, line in self._pending if at > now]
+        self._lines.extend(due)
+
+    def _drain(self, budget):
+        self._release_due()
+        _time.sleep(min(budget, 0.02))
+
+    def wait_for_since(self, needle, offset, budget):
+        return self._val.OpstatSession.wait_for_since(self, needle, offset, budget)
+
+    def wait_for_any_since(self, needles, offset, budget):
+        return self._val.OpstatSession.wait_for_any_since(
+            self, needles, offset, budget)
+
+    def api_lines(self):
+        self._release_due()
+        return list(self._lines)
+
+    def api_mark(self):
+        return len(self.api_lines())
+
+    def api_since(self, mark):
+        return self.api_lines()[mark:]
+
+    def send(self, keys, settle=0.0):
+        handler = self._on_send.get(keys)
+        if handler:
+            handler(self)
+        if settle:
+            self._drain(settle)
+
+
+def test_validator_dead_scope_stops_at_the_notice_not_the_budget():
+    """A dead scope's verdict is knowable the moment the notice renders; the
+    metrics must cover only the probe, not 420 s of background polling."""
+    import nvme_tcp
+
+    val = _load_validator()
+
+    def on_i(sess):
+        sess.output += "Loading the VIP drill-down, please stand by...\n"
+        sess.output += nvme_tcp._no_telemetry_notice("vip") + "\n"
+        sess._lines.append(
+            '2026-08-16 12:00:01 POST https://h:443/api/monitors/ 900ms '
+            'payload={"name": "adhoc_opstat_probe_vip_1"} '
+            '-> HTTP 201 (14 bytes) body={"id": 7001}')
+        sess._lines.append(
+            '2026-08-16 12:00:02 GET https://h:443/api/monitors/7001/query/ '
+            '800ms -> HTTP 200 (2 bytes) body={}')
+        sess._lines.append(
+            '2026-08-16 12:00:03 DELETE https://h:443/api/monitors/7001/ '
+            '400ms -> HTTP 204 (0 bytes)')
+
+    sess = _ScriptedSession(val, {"i": on_i, "x": lambda s: None})
+    args = SimpleNamespace(key_budget=30, drill_budget=420, drill_settle=0.01)
+    val.REPORT = val.Report()
+    t0 = _time.time()
+    out = val._drill_scenario(sess, "i", "vip", args)
+    took = _time.time() - t0
+    assert out["no_telemetry"] is True
+    assert took < 30, "dead-scope verdict took %.1fs of validator dead time" % took
+    results = {n: (s, d) for n, s, d in val.REPORT.results}
+    assert results["nvme.vip.open"][0] == val.PASS
+    assert results["nvme.vip.entry"][0] == val.PASS
+    assert "3 calls, 1 creates" in results["nvme.vip.entry"][1], (
+        "entry accounting must stop at the notice: %s"
+        % results["nvme.vip.entry"][1])

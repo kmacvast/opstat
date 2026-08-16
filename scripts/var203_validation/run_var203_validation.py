@@ -300,6 +300,27 @@ class OpstatSession(object):
         return (needle in strip_ansi(self.output[offset:])
                 and (time.time() - self.started) or None)
 
+    def wait_for_any_since(self, needles, offset, budget):
+        """First of *needles* to appear after *offset*: (needle, elapsed).
+
+        A drill has more than one legitimate terminal state - the panel
+        title, or the no-telemetry notice on a scope the cluster cannot
+        serve. Round 5 waited the full 420 s drill budget for the title
+        before checking the notice, booking ~7 minutes of validator dead
+        time (and ~90 ordinary background-polling calls) against a VIP
+        entry whose real work was one bounded probe. Returns (None, None)
+        on timeout; earlier entries in *needles* win a same-snapshot tie.
+        """
+        deadline = time.time() + budget
+        while True:
+            text = strip_ansi(self.output[offset:])
+            for needle in needles:
+                if needle in text:
+                    return needle, time.time() - self.started
+            if time.time() >= deadline:
+                return None, None
+            self._drain(0.5)
+
     def send(self, keys, settle=0.0):
         os.write(self._master, keys.encode())
         if settle:
@@ -612,18 +633,27 @@ def _drill_scenario(session, key, mode, args):
     # creation on the first lab run - the old fixed 120 s deadline expired
     # while opstat was doing exactly what it should.
     consumed = session.wait_for_since("stand by", consumed_at, args.key_budget) \
-        or session.wait_for_since(title, consumed_at, args.key_budget)
+        or session.wait_for_any_since((title, NO_TELEMETRY_MARKER),
+                                      consumed_at, args.key_budget)[0]
     if not consumed:
         REPORT.log("  WARN: no loading frame within %ss of '%s'"
                    % (args.key_budget, key))
-    opened = session.wait_for_since(title, consumed_at, args.drill_budget)
-    # Snapshot the log the instant the panel renders: anything after this is
-    # ordinary polling during the settle window, not part of drill entry.
+    # Readiness completes on the FIRST terminal state: the panel title, or
+    # the no-telemetry notice a dead scope correctly renders instead. Round 5
+    # waited the full 420 s title budget before checking the notice, so the
+    # honest 1-create VIP/HOST entries were reported as "421s" with ~90
+    # accumulated background-polling calls that were never entry work.
+    matched, _elapsed = session.wait_for_any_since(
+        (title, NO_TELEMETRY_MARKER), consumed_at, args.drill_budget)
+    opened = matched == title
+    # Snapshot the log the instant the terminal state renders: anything after
+    # this is ordinary polling during the settle window, not drill entry.
     entry_s = time.time() - t0
     entry_lines = session.api_since(api_mark)
     entry_calls = parse_calls(entry_lines)
     session._drain(args.drill_settle)
-    if not opened and NO_TELEMETRY_MARKER in strip_ansi(session.output[consumed_at:]):
+    if not opened and (matched == NO_TELEMETRY_MARKER
+                       or NO_TELEMETRY_MARKER in strip_ansi(session.output[consumed_at:])):
         # A scope that publishes no per-object telemetry renders an explicit
         # notice instead of fanning out monitors (round-3 remediation). On
         # builds like var203's 5.4.6 that IS the correct vip/blockhost
