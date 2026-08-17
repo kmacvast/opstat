@@ -4,6 +4,7 @@
 import atexit
 import json
 import os
+import tempfile
 from datetime import datetime
 
 _LOG_ENABLED = False
@@ -28,16 +29,28 @@ def _max_body_chars():
     return _DEFAULT_MAX_BODY_CHARS
 
 
-def configure(enabled, protocol, vms, port):
-    """Open the API log file under /tmp when enabled."""
+def configure(enabled, protocol, vms, port, directory=None):
+    """Open the API log file when enabled.
+
+    Destination precedence: explicit *directory* (validation tooling passes
+    its run-specific evidence directory so lab artifacts never land outside
+    the archive tree), then the ``OPSTAT_API_LOG_DIR`` environment variable,
+    then :func:`tempfile.gettempdir` — which honors ``TMPDIR`` and falls back
+    to ``/tmp``, preserving the historical default for ordinary runs. The
+    log content and lifecycle are unchanged; only the destination is
+    selectable.
+    """
     global _LOG_ENABLED, _LOG_PATH, _LOG_FILE
     close()
     _LOG_ENABLED = bool(enabled)
     if not _LOG_ENABLED:
         return None
+    log_dir = (directory
+               or os.environ.get("OPSTAT_API_LOG_DIR")
+               or tempfile.gettempdir())
     safe_vms = "".join(c if c.isalnum() or c in ".-_" else "_" for c in str(vms))
     _LOG_PATH = os.path.join(
-        "/tmp",
+        log_dir,
         f"opstat-api-{protocol}-{safe_vms}-{port}-{os.getpid()}.log",
     )
     # Create private (0600) so response bodies aren't world-readable in /tmp.

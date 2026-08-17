@@ -680,7 +680,10 @@ def main():
         args.user, args.vms, None, "opstat/telemetry-probe")
     vast_common.configure_connection(
         base, headers, ssl._create_unverified_context())
-    vast_api_log.configure(True, "telemetry-probe", args.vms, args.port)
+    # The API log is a lab artifact: keep it inside the run-specific
+    # evidence tree, never /tmp (owner artifact policy).
+    vast_api_log.configure(True, "telemetry-probe", args.vms, args.port,
+                           directory=EVIDENCE_DIR)
     log("api log: %s" % vast_api_log.log_path())
 
     log("telemetry-correctness probe - %s"
