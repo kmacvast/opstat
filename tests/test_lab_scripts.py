@@ -36,3 +36,9 @@ def test_lab_script_policy(script):
         "final archive must be integrity-checked and checksummed")
     assert "VAST_PASSWORD" in body and "echo $VAST_PASSWORD" not in body, (
         "credentials come from the environment and are never printed")
+    assert "kjmtmp/opstat" in body and 'DTS=$(date' in body, (
+        "artifacts must live under a unique DTS dir beneath ~/kjmtmp/opstat")
+    assert "OPSTAT_EXPECTED_HEAD" in body and "origin/main" in body, (
+        "an exact expected-SHA guard is required")
+    assert "tmp-before" in body and "tmp-after" in body, (
+        "the run must diff /tmp state and fail the policy check on new artifacts")
