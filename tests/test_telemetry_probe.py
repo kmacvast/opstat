@@ -227,10 +227,11 @@ def test_run_probes_contains_a_raising_section(monkeypatch):
     monkeypatch.setattr(probe, "probe_metadata",
                         lambda: (_ for _ in ()).throw(RuntimeError("boom")))
     monkeypatch.setattr(probe, "probe_nfs3_view_attribution",
-                        lambda *a: ran.append("fr1"))
+                        lambda *a, **k: ran.append("fr1"))
     monkeypatch.setattr(probe, "probe_latency_units",
-                        lambda *a: ran.append("fr3"))
-    args = type("A", (), {"attempts": 1, "interval": 0, "view_paths": ""})()
+                        lambda *a, **k: ran.append("fr3"))
+    args = type("A", (), {"attempts": 1, "interval": 0,
+                          "view_paths": "", "view_ids": ""})()
     probe.run_probes(args, cluster_id=1)
     assert ran == ["fr1", "fr3"], "later sections did not run after a failure"
     assert any("metadata.section FAIL" in line for line in probe.SUMMARY)
@@ -284,4 +285,22 @@ def test_choose_target_views_anchors_win_then_rank_order():
     assert len([p for p, _ in targets if p == "/kmacs"]) == 1
     # unknown anchor paths are skipped, not fabricated
     none = probe.choose_target_views(views, [], ["/does-not-exist"])
+    assert none == []
+
+
+def test_choose_target_views_id_anchors_pin_exact_objects():
+    """View paths are not unique (two '/' views on var203); the targeted
+    pass resolved '/' to id 217 and never display-monitored the root view
+    id 1. Id anchors must pin exact objects, ahead of path anchors."""
+    probe = _load_probe()
+    views = [{"id": 1, "path": "/"}, {"id": 217, "path": "/"},
+             {"id": 424, "path": "/kmacs/block"}]
+    ranked = [{"id": 424, "name": "/kmacs/block"}]
+    targets = probe.choose_target_views(
+        views, ranked, [], anchor_ids=(1, 217), cap=4)
+    assert targets[:2] == [("/", 1), ("/", 217)], (
+        "both root view OBJECTS must be pinned, path duplication or not")
+    assert ("/kmacs/block", 424) in targets
+    # unknown ids are skipped honestly, never fabricated
+    none = probe.choose_target_views(views, [], [], anchor_ids=(999,))
     assert none == []

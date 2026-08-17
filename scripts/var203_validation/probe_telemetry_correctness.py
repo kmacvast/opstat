@@ -277,17 +277,25 @@ def ratio_stats(pairs):
             "median": median, "mean": sum(ratios) / n}
 
 
-def choose_target_views(views, ranked, anchor_paths, cap=8):
-    """Ordered [(path, id)] to monitor: operator anchors first, then rank.
+def choose_target_views(views, ranked, anchor_paths, anchor_ids=(), cap=8):
+    """Ordered [(path, id)] to monitor: id anchors, then path anchors, then rank.
 
-    *anchor_paths* (--view-paths) are sampled even if the ranking missed
-    them - the 2026-08-17 run monitored eight head-of-list idle views while
-    the busy /kmacs view went unsampled, which is exactly the failure this
-    anchor exists to make impossible.
+    *anchor_ids* (--view-ids) pin exact view OBJECTS - required because view
+    paths are not unique (var203 has two views with path "/", and path-keyed
+    resolution picked id 217 over the root view id 1 in the targeted pass).
+    *anchor_paths* (--view-paths) are exact-match path anchors. Both are
+    sampled even if the ranking missed them - the 2026-08-17 run monitored
+    eight head-of-list idle views while the busy view went unsampled, which
+    is exactly the failure these anchors exist to make impossible.
     """
+    by_id = {v["id"]: v.get("path") or str(v["id"]) for v in views
+             if isinstance(v, dict) and "id" in v}
     by_path = {v.get("path"): v["id"] for v in views
                if isinstance(v, dict) and v.get("path") and "id" in v}
     chosen = []
+    for vid in anchor_ids:
+        if vid in by_id and all(i != vid for _p, i in chosen):
+            chosen.append((by_id[vid], vid))
     for path in anchor_paths:
         if path in by_path and all(p != path for p, _ in chosen):
             chosen.append((path, by_path[path]))
@@ -392,7 +400,7 @@ def probe_metadata():
 # ---------------------------------------------------------------------------
 # Section: FR1 side-by-side (ViewMetrics vs host_view protocol=NFS3)
 # ---------------------------------------------------------------------------
-def probe_nfs3_view_attribution(attempts, interval, anchor_paths):
+def probe_nfs3_view_attribution(attempts, interval, anchor_paths, anchor_ids=()):
     """ViewMetrics against the ACTUAL busy NFSv3 view.
 
     The 2026-08-17 run proved 5.4.6 publishes no NFS host_view series, so
@@ -409,7 +417,8 @@ def probe_nfs3_view_attribution(attempts, interval, anchor_paths):
     except RuntimeError as exc:
         verdict("fr1.views", False, str(exc)[:100])
         return
-    log("  /views/ -> %d views; anchors=%s" % (len(views), anchor_paths or "none"))
+    log("  /views/ -> %d views; path anchors=%s id anchors=%s"
+        % (len(views), anchor_paths or "none", list(anchor_ids) or "none"))
 
     # host_view protocol census: evidence, not targeting.
     try:
@@ -450,7 +459,8 @@ def probe_nfs3_view_attribution(attempts, interval, anchor_paths):
             "production-style ranking returned %d candidates: %s"
             % (len(ranked), [r.get("name") for r in ranked][:8]))
 
-    targets = choose_target_views(views, ranked, anchor_paths or [])
+    targets = choose_target_views(views, ranked, anchor_paths or [],
+                                  anchor_ids=anchor_ids)
     target_paths = [p for p, _ in targets]
     target_ids = [i for _, i in targets]
     verdict("fr1.targets", bool(targets),
@@ -573,6 +583,12 @@ def probe_latency_units(cluster_id, attempts, interval):
                 series = host_view_field_series(body, field, "BLOCK")
                 snap["hv_block_%s" % field] = (
                     sum(series) / len(series) if series else None)
+            # Production-parser conversion check (D-014): parse_host_view
+            # now converts the ms gauge to us at ingestion, so its output
+            # must land in the same band as BlockMetrics' raw microseconds.
+            prod = aggregate_by_path(host_view_rows(body, "BLOCK"))
+            busy = [r for r in prod if r["iops"] and r["latency"]]
+            snap["hv_block_prod_us"] = busy[0]["latency"] if busy else None
         except RuntimeError as exc:
             snap["hv_error"] = str(exc)[:120]
         append_jsonl("fr3-latency-samples.jsonl", snap)
@@ -612,6 +628,21 @@ def probe_latency_units(cluster_id, attempts, interval):
     else:
         verdict("fr3.block.read_pairing", False,
                 "no paired nonzero read-vs-read window in the bounded budget")
+    prod_pairs = [(s["block"], s["hv_block_prod_us"]) for s in samples
+                  if s.get("block") and s.get("hv_block_prod_us")]
+    pstats = ratio_stats(prod_pairs)
+    if pstats:
+        guess, _r = unit_hypothesis(pstats["median"], 1.0)
+        verdict("fr3.production_conversion", guess == "us",
+                "production parse_host_view latency_us=%.1f vs "
+                "BlockMetrics=%.1f (ratio median %.2f over %d pairs) - "
+                "D-014 conversion %s"
+                % (prod_pairs[-1][1], prod_pairs[-1][0], pstats["median"],
+                   pstats["count"],
+                   "VERIFIED" if guess == "us" else "NOT verified"))
+    else:
+        verdict("fr3.production_conversion", False,
+                "no paired window to verify the D-014 conversion")
     cstats = ratio_stats(combined_pairs)
     if cstats:
         log("  context: combined-gauge ratio median=%.1f over %d pairs "
@@ -636,7 +667,9 @@ def run_probes(args, cluster_id):
     sections = (
         ("metadata", lambda: probe_metadata()),
         ("fr1", lambda: probe_nfs3_view_attribution(
-            args.attempts, args.interval, anchors)),
+            args.attempts, args.interval, anchors,
+            anchor_ids=tuple(int(v) for v in (args.view_ids or "").split(",")
+                             if v.strip().isdigit()))),
         ("fr3", lambda: probe_latency_units(
             cluster_id, args.attempts, args.interval)),
     )
@@ -656,6 +689,10 @@ def main():
     parser.add_argument("--user", default="admin")
     parser.add_argument("--evidence-dir", default=None,
                         help="directory for raw evidence files")
+    parser.add_argument("--view-ids", default="",
+                        help="comma-separated view ids to always sample "
+                             "(exact-object anchors; view paths are not "
+                             "unique, so ids pin e.g. the root view id 1)")
     parser.add_argument("--view-paths", default="",
                         help="comma-separated view paths to always sample "
                              "(sanity anchors for the known-busy NFSv3 view)")
