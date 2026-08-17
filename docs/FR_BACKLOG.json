@@ -128,7 +128,7 @@
       "id": "FR2",
       "title": "NFSv4.1 delegation diagnostic",
       "priority": 1,
-      "status": "backlog",
+      "status": "in_progress",
       "class": "diagnostic",
       "summary": "Complete the intentionally deferred delegation diagnostic: on-demand, file/path-scoped delegation visibility with zero cost on the normal refresh path.",
       "scope": [
@@ -151,9 +151,11 @@
         "Delegation visibility needs a file/path-scoped interaction and must remain on-demand (D-008).",
         "The nfs4_delegs DELETE sibling must never be invoked; a test asserts it is not."
       ],
-      "notes": [],
+      "notes": [
+        "2026-08-17: Bundle 1 begins - Stage A repository/API analysis; design-first per owner instruction, D-008 governs."
+      ],
       "created": "2026-08-16",
-      "updated": "2026-08-16",
+      "updated": "2026-08-17",
       "completed": null
     },
     {
