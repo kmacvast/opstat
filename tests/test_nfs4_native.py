@@ -317,7 +317,7 @@ vast_host_view_iops{ip="10.0.0.4",path="/d",protocol="SMB",tenant="t2"} 800
 vast_host_view_read_iops{ip="10.0.0.2",path="/b",protocol="NFS4",tenant="t1"} 60
 vast_host_view_write_iops{ip="10.0.0.2",path="/b",protocol="NFS4",tenant="t1"} 30
 vast_host_view_bw{ip="10.0.0.2",path="/b",protocol="NFS4",tenant="t1"} 1048576
-vast_host_view_latency{ip="10.0.0.2",path="/b",protocol="NFS4",tenant="t1"} 812
+vast_host_view_latency{ip="10.0.0.2",path="/b",protocol="NFS4",tenant="t1"} 0.812
 """
 
 
@@ -479,3 +479,18 @@ def test_cnode_open_connections_are_reported(monkeypatch):
     assert all(r["connections"] is not None for r in rows), (
         "per-cNode open connections not parsed")
     assert collector.connections["cluster"] is not None
+
+
+def test_host_view_latency_gauge_is_milliseconds_d014():
+    """Literal regression for the ~1000x understatement (D-014): the real
+    var203 pairing read the BLOCK gauge at 0.64 while BlockMetrics measured
+    ~620 us for the same reads. The parser must convert ms -> us at
+    ingestion; the pre-fix passthrough displayed 0.64 as "0.64 us"."""
+    body = (
+        'vast_host_view_iops{ip="172.200.14.198",path="/kmacs/block",'
+        'protocol="NFS4",tenant="default"} 1453\n'
+        'vast_host_view_latency{ip="172.200.14.198",path="/kmacs/block",'
+        'protocol="NFS4",tenant="default"} 0.64\n')
+    rows = nfs4_native.parse_host_view(body, protocol="NFS4")
+    assert rows[0]["latency_us"] == 640.0, (
+        "0.64 ms must ingest as 640 us, not 0.64 us")

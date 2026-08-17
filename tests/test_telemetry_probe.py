@@ -108,8 +108,9 @@ def test_aggregate_by_path_sums_clients_and_weights_latency():
     assert agg["path"] == "/a"
     assert agg["clients"] == 2
     assert agg["iops"] == 400
-    # iops-weighted: (100*1.5 + 300*2.5) / 400 = 2.25
-    assert abs(agg["latency"] - 2.25) < 1e-9
+    # Gauges are ms (D-014); the production parser converts to us at
+    # ingestion, so iops-weighted: (100*1500 + 300*2500) / 400 = 2250 us.
+    assert abs(agg["latency"] - 2250.0) < 1e-9
 
 
 # ---------------------------------------------------------------------------

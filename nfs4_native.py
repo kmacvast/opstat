@@ -364,6 +364,7 @@ def parse_host_view(text, protocol="NFS4"):
 
     rows = []
     for (ip, path, tenant), fields in grouped.items():
+        latency_ms = fields.get("latency")
         rows.append({
             "ip": ip,
             "path": path,
@@ -375,7 +376,12 @@ def parse_host_view(text, protocol="NFS4"):
             "bw": fields.get("bw"),
             "read_bw": fields.get("read_bw"),
             "write_bw": fields.get("write_bw"),
-            "latency_us": fields.get("latency"),
+            # The gauge is native MILLISECONDS (D-014: same-traffic pairing
+            # against BlockMetrics-us, ratio median 969x over six samples).
+            # Convert at ingestion so every downstream consumer and formatter
+            # stays on the proven microsecond pipeline. The prior passthrough
+            # understated latency ~1000x on builds with NFS host_view series.
+            "latency_us": (latency_ms * 1000.0) if latency_ms is not None else None,
         })
     # Rank by activity, not by the order the exporter happened to emit.
     return sorted(rows, key=lambda r: (-(r["iops"] or 0.0), r["ip"], r["path"]))
