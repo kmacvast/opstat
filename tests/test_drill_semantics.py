@@ -31,6 +31,7 @@ from types import SimpleNamespace
 import pytest
 
 import vast_common
+import vast_drill
 from tests.mock_vms import (
     _ACTIVE_TENANT_INDEXES, _ACTIVE_VIEW_INDEXES, TENANTS, VIEWS, MockVMS,
 )
@@ -74,54 +75,93 @@ def _expected_top_views(n):
 # ---------------------------------------------------------------------------
 # Sample selection: the partial newest bucket must not define the row
 # ---------------------------------------------------------------------------
-def test_view_drill_reports_latency_and_bandwidth(engine, vms):
-    """Regression: latency/BW rendered '-' because the newest bucket nulled
-    every property except read_md_iops."""
+def test_view_drill_is_an_honest_unavailable_state(engine, vms):
+    """FR1/D-016: with no valid per-view NFSv3 source on this cluster the
+    VIEW drill must present a capability notice, not rank all-protocol
+    ViewMetrics under an NFSv3 heading (the old behavior surfaced SMB/BLOCK/
+    S3/NDB views on the real cluster)."""
     engine.enter_drill_mode("view")
-    assert engine.DRILL_ERROR is None
-    engine.fetch_drill_query()
-    rows = engine.LAST_DRILL_ROWS
-    assert rows, "view drill produced no rows"
+    assert engine.DRILL_MODE is None, "view drill must not open"
+    assert engine.DRILL_ERROR is not None
+    assert engine.VIEW_UNAVAILABLE_MARKER in engine.DRILL_ERROR
+    assert engine.LAST_DRILL_ROWS == [], "no rows may be presented as NFSv3"
 
-    active = [r for r in rows if (r["total_ops"] or 0) > 0]
-    assert active, "no view row carried activity"
-    for row in active:
-        assert row["latency_us"] is not None, f"{row['name']} lost latency"
-        assert row["bw_gbs"] is not None, f"{row['name']} lost bandwidth"
+    engine.exit_drill_mode()
+    assert engine.DRILL_ERROR is None, "x did not clear the notice"
+    assert engine.DRILL_MODE is None
 
 
-def test_view_drill_top_op_is_not_always_read_metadata(engine, vms):
-    """Regression: every row showed 'RD MD 100.0%' because read_md_iops was
-    the only non-null property in the newest bucket."""
+def test_view_unavailable_frame_is_a_notice_not_an_error(engine, vms, capsys):
+    """The screen must say per-view attribution is unavailable without
+    implying NFSv3 itself is broken, and the footer must survive."""
+    engine.fetch_monitor_query()
     engine.enter_drill_mode("view")
-    engine.fetch_drill_query()
-    active = [r for r in engine.LAST_DRILL_ROWS if (r["total_ops"] or 0) > 0]
-    assert active
-    assert not all(r["top_rpc"] == "RD MD" for r in active), (
-        "top op collapsed to RD MD for every row - partial newest sample "
-        "is still driving the row"
-    )
-    assert not all((r["top_rpc_pct"] or 0) >= 99.9 for r in active)
+    capsys.readouterr()
+    engine.render_screen()
+    frame = capsys.readouterr().out
+    assert engine.VIEW_UNAVAILABLE_NOTICE in frame
+    assert engine.VIEW_UNAVAILABLE_DETAIL in frame
+    assert "Error:" not in frame, "capability notice must not read as an error"
+    assert "[q] Quit" in frame, "footer lost in the unavailable state"
+    assert "Press x to return" in frame
+    engine.exit_drill_mode()
 
 
-def test_view_drill_counts_all_four_op_classes(engine, vms):
-    """READ/WRITE/RD MD/WR MD all contribute once the sample is complete."""
+def test_view_drill_entry_costs_zero_api_calls_and_zero_monitors(engine, vms):
+    """The old path fetched /views/, ranked 429 candidates and created
+    display monitors before discovering nothing valid; the unavailable state
+    must cost NOTHING (stronger than the old <=6-call budget)."""
+    vms.reset_calls()
     engine.enter_drill_mode("view")
-    engine.fetch_drill_query()
-    top = max(engine.LAST_DRILL_ROWS, key=lambda r: r["total_ops"] or 0)
-    # A row built from the partial bucket totals only the single read_md rate.
-    values, _idx, _s = engine._latest_complete_values(
-        engine._slice_result_for_object(
-            engine.api_request(
-                "GET", f"/monitors/{engine.DRILL_MONITORS[0][0]}/query/"),
-            [o["id"] for o in engine.DRILL_OBJECTS
-             if o["name"] == top["name"]][0],
-        )
-    )
-    read_md = engine.as_float(values.get(engine._VIEW_READ_MD)) or 0.0
-    assert top["total_ops"] > read_md * 1.5, (
-        "total ops still reflects only the read-metadata rate"
-    )
+    calls = vms.counts()
+    assert sum(calls.values()) == 0, f"unavailable view entry cost {calls}"
+    assert engine.DRILL_MONITORS == []
+    live = set(vms.live_monitors())
+    headline = {engine.RPC_MONITOR_ID, engine.BW_MONITOR_ID}
+    assert live <= headline, f"unavailable view entry left monitors: {live - headline}"
+    engine.exit_drill_mode()
+
+
+# ---------------------------------------------------------------------------
+# View-row builder regressions, preserved at the shared vast_drill layer.
+# These previously ran through the NFSv3 view drill; that drill is now an
+# honest unavailable state (FR1/D-016), and SMB/S3 still exercise the same
+# builder end-to-end. The literal payload shapes stay pinned here.
+# ---------------------------------------------------------------------------
+def _view_monitor_result(newest_props):
+    """A ViewMetrics monitor payload with a complete older row and a newest
+    row where only *newest_props* are populated - the literal real-cluster
+    shape that once blanked latency/BW and collapsed top-op to RD MD."""
+    props = ["timestamp", "object_id"] + vast_drill.view_display_props()
+    complete = ["2026-08-17T00:00:00Z", 7, 120.0, 80.0, 40.0, 10.0,
+                500.0, 700.0, 1048576.0, 2097152.0]
+    newest = ["2026-08-17T00:00:10Z", 7] + [
+        (val if prop in newest_props else None)
+        for prop, val in zip(props[2:], complete[2:])
+    ]
+    return {"prop_list": props, "data": [complete, newest]}
+
+
+def test_view_row_survives_partial_newest_bucket():
+    """Regression: latency/BW rendered '-' and top-op collapsed to 'RD MD
+    100.0%' because the newest bucket nulled everything except read_md."""
+    result = _view_monitor_result({vast_drill.VIEW_READ_MD})
+    row = vast_drill.build_view_row(result, "/busy")
+    assert row["latency_us"] is not None, "partial newest bucket lost latency"
+    assert row["bw_gbs"] is not None, "partial newest bucket lost bandwidth"
+    assert row["top_rpc"] != "RD MD" or (row["top_rpc_pct"] or 0) < 99.9, (
+        "partial newest sample is still driving the row")
+    assert (row["total_ops"] or 0) > 40.0 * 1.5, (
+        "total ops still reflects only the read-metadata rate")
+
+
+def test_view_row_survives_fully_null_newest_bucket():
+    """A newest bucket with nothing populated must fall through to the newest
+    complete row, not blank the object out."""
+    result = _view_monitor_result(set())
+    row = vast_drill.build_view_row(result, "/busy")
+    assert (row["total_ops"] or 0) > 0, "fully-null newest bucket blanked the row"
+    assert row["latency_us"] is not None
 
 
 def test_tenant_drill_reports_activity(engine, vms):
@@ -144,26 +184,24 @@ def test_tenant_drill_reports_activity(engine, vms):
 
 def test_drill_row_survives_fully_null_newest_bucket(engine, vms):
     """A newest bucket with nothing populated must fall through to the newest
-    row that does have data, not blank the object out."""
+    row that does have data, not blank the object out. (Runs through the
+    tenant drill since the NFSv3 view drill is an honest unavailable state
+    per FR1/D-016; the view-row builder variant is pinned above.)"""
     vms.state.partial_newest_props = ()   # newest row entirely null
-    engine.enter_drill_mode("view")
+    engine.enter_drill_mode("tenant")
     engine.fetch_drill_query()
     active = [r for r in engine.LAST_DRILL_ROWS if (r["total_ops"] or 0) > 0]
-    assert active, "a fully-null newest bucket blanked every view"
+    assert active, "a fully-null newest bucket blanked every tenant"
 
 
 # ---------------------------------------------------------------------------
 # Ranking correctness: most active, not first listed
 # ---------------------------------------------------------------------------
-def test_view_ranking_picks_the_most_active_views(engine, vms):
-    engine.enter_drill_mode("view")
-    assert engine.DRILL_ERROR is None
-    names = [o["name"] for o in engine.DRILL_OBJECTS]
-    expected = _expected_top_views(engine._MAX_DRILL_OBJECTS)
-    assert set(names) == set(expected), (
-        f"ranking selected {names}, expected the busiest views {expected}"
-    )
-
+# test_view_ranking_picks_the_most_active_views was retired with the
+# misleading NFSv3 view drill (FR1/D-016): the engine no longer ranks views.
+# Activity-ranking correctness stays covered by the tenant test below, the
+# cNode suite, and the SMB/S3 view/bucket suites that still rank the same
+# 429-view mock population through the shared DrillSession.
 
 def test_tenant_ranking_picks_the_most_active_tenants(engine, vms):
     engine.enter_drill_mode("tenant")
@@ -179,45 +217,17 @@ def test_tenant_ranking_picks_the_most_active_tenants(engine, vms):
 # ---------------------------------------------------------------------------
 # Ranking cost: must not scale with object count
 # ---------------------------------------------------------------------------
-def test_view_drill_entry_is_a_handful_of_calls(engine, vms):
-    """429 views previously cost 42 serial calls (14 chunks x POST/GET/DELETE)."""
-    assert len(VIEWS) > 400, "mock must hold a realistically large view list"
-    vms.reset_calls()
-    engine.enter_drill_mode("view")
-    calls = vms.counts()
-    total = sum(calls.values())
-    assert engine.DRILL_ERROR is None
-    assert total <= 6, f"view drill entry cost {total} API calls: {calls}"
-
-
-def test_view_drill_entry_without_topn_stays_bounded(engine, vms):
-    """Without /monitors/topn/, one batched rank monitor still beats chunking."""
-    vms.state.topn_enabled = False
-    vms.reset_calls()
-    engine.enter_drill_mode("view")
-    calls = vms.counts()
-    total = sum(calls.values())
-    assert engine.DRILL_ERROR is None
-    assert total <= 8, f"batched ranking cost {total} API calls: {calls}"
-    assert set(o["name"] for o in engine.DRILL_OBJECTS) == set(
-        _expected_top_views(engine._MAX_DRILL_OBJECTS)
-    )
-
-
-def test_ranking_adapts_to_a_cluster_object_id_cap(engine, vms):
-    """A cluster that caps object_ids per monitor must still rank correctly,
-    by discovering the cap and splitting - never by silently truncating."""
-    vms.state.topn_enabled = False
-    vms.state.max_object_ids = 64
-    engine.enter_drill_mode("view")
-    assert engine.DRILL_ERROR is None
-    assert set(o["name"] for o in engine.DRILL_OBJECTS) == set(
-        _expected_top_views(engine._MAX_DRILL_OBJECTS)
-    )
-
+# test_view_drill_entry_is_a_handful_of_calls,
+# test_view_drill_entry_without_topn_stays_bounded and
+# test_ranking_adapts_to_a_cluster_object_id_cap were retired with the
+# misleading NFSv3 view drill (FR1/D-016). Their replacement here is
+# stronger - test_view_drill_entry_costs_zero_api_calls_and_zero_monitors -
+# and the large-population budget/cap/topn-fallback protections remain
+# exercised in tests/test_smb_s3_drill.py (429-view ranking, max_object_ids
+# cap, topn-disabled fallback) and the NVMe rank-chunk suite.
 
 def test_drill_entry_leaves_no_ranking_monitors_behind(engine, vms):
-    engine.enter_drill_mode("view")
+    engine.enter_drill_mode("tenant")
     live = vms.live_monitors()
     drill_ids = {mid for mid, _n in engine.DRILL_MONITORS}
     headline = {engine.RPC_MONITOR_ID, engine.BW_MONITOR_ID}
@@ -227,11 +237,11 @@ def test_drill_entry_leaves_no_ranking_monitors_behind(engine, vms):
 
 
 def test_reentering_drill_reuses_the_cached_ranking(engine, vms):
-    engine.enter_drill_mode("view")
+    engine.enter_drill_mode("tenant")
     first = [o["name"] for o in engine.DRILL_OBJECTS]
     engine.exit_drill_mode()
     vms.reset_calls()
-    engine.enter_drill_mode("view")
+    engine.enter_drill_mode("tenant")
     second = [o["name"] for o in engine.DRILL_OBJECTS]
     calls = sum(vms.counts().values())
     assert second == first
@@ -273,7 +283,7 @@ def test_drill_query_is_throttled_between_headline_ticks(engine, vms):
     """View/tenant metrics advance about once a minute; polling them every
     5 s returned byte-identical payloads nine times in a row on the real
     cluster. poll_tick must not re-query the drill on every headline tick."""
-    engine.enter_drill_mode("view")
+    engine.enter_drill_mode("tenant")
     engine.fetch_drill_query()
     vms.reset_calls()
     for _ in range(4):
@@ -287,7 +297,7 @@ def test_drill_query_is_throttled_between_headline_ticks(engine, vms):
 
 
 def test_manual_refresh_forces_a_drill_query(engine, vms):
-    engine.enter_drill_mode("view")
+    engine.enter_drill_mode("tenant")
     engine.fetch_drill_query()
     vms.reset_calls()
     engine.manual_refresh()

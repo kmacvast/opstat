@@ -158,6 +158,15 @@ _DRILL_PROBE_LIMIT = 32     # smallest rank batch tried before giving up
 DRILL = None
 _DRILL_MIN_QUERY_INTERVAL = 15.0   # ViewMetrics/TenantMetrics publish ~1/min
 
+# Honest unavailable state for the VIEW drill (FR1, D-016). The marker is the
+# contract the lab validator imports; the wording is deliberately
+# cluster-scoped ("from this cluster"), never a universal claim about VAST,
+# and names no internal metric families.
+VIEW_UNAVAILABLE_MARKER = "Per-view NFSv3 attribution is not available"
+VIEW_UNAVAILABLE_NOTICE = (
+    "Per-view NFSv3 attribution is not available from this cluster.")
+VIEW_UNAVAILABLE_DETAIL = "Cluster-level NFSv3 telemetry remains available."
+
 
 # ---------------------------------------------------------------------------
 # Runtime configuration (initialized by init_config)
@@ -1236,12 +1245,36 @@ def _rank_drill_candidates(mode, objects, cfg):
     )
 
 
+def view_attribution_source():
+    """Decide the per-view NFSv3 attribution source for this cluster.
+
+    A capability result, not an eternal declaration (D-016). On the validated
+    VAST 5.4.6 environment there is none: host_view publishes no NFS series
+    under any protocol label, and ViewMetrics attributed ~0 of a proven
+    ~19,400 ops/s NFSv3 workload to the root view while carrying no protocol
+    dimension at all - so ranking it under an NFSv3 heading surfaced other
+    protocols' busiest views. Newer builds (5.5.0.1-class) are known to
+    publish protocol-labeled host_view series; when a validated capability
+    check for those exists, it replaces this deterministic result and returns
+    a usable source. Until then: None means "this cluster cannot answer the
+    per-view NFSv3 question honestly".
+    """
+    return None
+
+
 def enter_drill_mode(mode):
     global DRILL_MODE, DRILL_OBJECTS, DRILL_MONITORS, DRILL_ERROR, LAST_DRILL_ROWS
 
     cfg = _DRILL_CFG.get(mode)
     if not cfg:
         DRILL_ERROR = f"Unknown drill mode: {mode}"
+        return
+
+    if mode == "view" and view_attribution_source() is None:
+        # Honest unavailable state (FR1/D-016). Zero API cost on purpose:
+        # no view inventory fetch, no rank monitors, no display monitors
+        # for a question this cluster cannot answer.
+        DRILL_ERROR = VIEW_UNAVAILABLE_NOTICE
         return
 
     try:
@@ -1728,6 +1761,16 @@ def _render_drill_panel(width):
     if DRILL_STATUS:
         print(box_top("DRILL-DOWN", width))
         print(box_row(c(DRILL_STATUS, _YELLOW), width))
+        print(box_bottom(width))
+        return
+
+    if DRILL_ERROR and VIEW_UNAVAILABLE_MARKER in DRILL_ERROR:
+        # Capability notice, not an error: NFSv3 telemetry is healthy; this
+        # cluster simply has no valid per-view attribution source (D-016).
+        print(box_top("VIEW DRILL-DOWN", width))
+        print(box_row(c(DRILL_ERROR, _YELLOW), width))
+        print(box_row(c(VIEW_UNAVAILABLE_DETAIL, _DIM), width))
+        print(box_row(c("Press x to return to cluster view", _DIM), width))
         print(box_bottom(width))
         return
 
