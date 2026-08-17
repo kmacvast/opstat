@@ -2,8 +2,8 @@
   "schema_version": 1,
   "project": "opstat",
   "source_of_truth": true,
-  "updated": "2026-08-16",
-  "next_fr_number": 13,
+  "updated": "2026-08-17",
+  "next_fr_number": 14,
   "status_values": [
     "backlog",
     "ready",
@@ -53,7 +53,11 @@
       ],
       "dependencies": [],
       "blocked_by": [],
-      "related_decisions": ["D-001", "D-004", "D-011"],
+      "related_decisions": [
+        "D-001",
+        "D-004",
+        "D-011"
+      ],
       "related_legacy_frs": [],
       "evidence": [
         "Current NFSv3 VIEW path still uses ViewMetrics.",
@@ -67,9 +71,46 @@
       "completed": null
     },
     {
+      "id": "FR13",
+      "title": "Prominent startup/warm-up UX for slow-to-first-data telemetry paths",
+      "priority": 2,
+      "status": "backlog",
+      "class": "ux",
+      "summary": "A user launching an engine whose first meaningful numbers legitimately take 30-90 s must immediately see a prominent, plain-English explanation that opstat is connected and preparing data - never a mostly empty screen that looks hung.",
+      "scope": [
+        "Prominent plain-English startup/warm-up panel shown immediately at launch and through the warm-up window (between first paint and first meaningful numbers), clearing automatically when real data lands.",
+        "Communicate in user language: connected; performance monitoring being prepared; data actively being collected; some statistics need multiple measurements before they can be shown accurately; initial startup may take about a minute on some systems; the screen populates automatically; continuous updates follow.",
+        "No implementation jargon: no monitor ids, REST endpoints, property families, or VMS monitor architecture in user-facing text.",
+        "Only claim durations that are truthful for the engine/cluster (e.g. 'about a minute' where measured).",
+        "Applies at least to the Block/NVMe engine (proven 60-80 s to first meaningful numbers on var203); available to any engine whose warm-up is comparably long; footer and existing phase messages preserved.",
+        "Render-path tests for the new warm-up state (footer survival, width, clear-on-data)."
+      ],
+      "acceptance_criteria": [
+        "During a real slow startup the user sees, from the first seconds, a prominent explanation meeting the communication goals above, with no implementation jargon.",
+        "The explanation clears automatically when meaningful data displays, and normal refresh behavior is unchanged.",
+        "Footer renders in the warm-up state at every width; covered by render tests on both interpreters.",
+        "No change to VMS REST API behavior, call counts, or timing."
+      ],
+      "dependencies": [],
+      "blocked_by": [],
+      "related_decisions": [],
+      "related_legacy_frs": [],
+      "evidence": [
+        "Rounds 2-5B measured NVMe startup at 58-157 s of honest serial VMS REST time (8 monitor creates + 8 first queries at 2-38 s per call on var203), plus a two-measurement warm-up for counter-based rows.",
+        "Owner acceptance pass (2026-08-17): SMB and Block/NVMe both exceeded one minute to useful telemetry; the existing phase messages were not enough to make the wait legible.",
+        "Need is established by Block/NVMe alone; independent of the separate SMB startup attribution measurement."
+      ],
+      "notes": [
+        "Starting-point copy (to refine): 'Preparing performance data... opstat is connected and setting up performance monitoring with the cluster. Some statistics require multiple measurements before they can be displayed accurately. Initial startup may take about a minute. Once ready, this screen will update continuously.'"
+      ],
+      "created": "2026-08-17",
+      "updated": "2026-08-17",
+      "completed": null
+    },
+    {
       "id": "FR2",
       "title": "NFSv4.1 delegation diagnostic",
-      "priority": 2,
+      "priority": 3,
       "status": "backlog",
       "class": "diagnostic",
       "summary": "Complete the intentionally deferred delegation diagnostic: on-demand, file/path-scoped delegation visibility with zero cost on the normal refresh path.",
@@ -85,7 +126,9 @@
       ],
       "dependencies": [],
       "blocked_by": [],
-      "related_decisions": ["D-008"],
+      "related_decisions": [
+        "D-008"
+      ],
       "related_legacy_frs": [],
       "evidence": [
         "Delegation visibility needs a file/path-scoped interaction and must remain on-demand (D-008).",
@@ -99,7 +142,7 @@
     {
       "id": "FR3",
       "title": "Latency source-unit certainty",
-      "priority": 3,
+      "priority": 4,
       "status": "backlog",
       "class": "correctness",
       "summary": "Remove the remaining uncertainty about native latency units; every user-visible latency source gets a proven unit, explicit conversion and literal regression tests.",
@@ -115,8 +158,12 @@
       ],
       "dependencies": [],
       "blocked_by": [],
-      "related_decisions": ["D-006"],
-      "related_legacy_frs": ["FR-B"],
+      "related_decisions": [
+        "D-006"
+      ],
+      "related_legacy_frs": [
+        "FR-B"
+      ],
       "evidence": [
         "Nfs4Metrics latency is proven microseconds.",
         "Three generic cross-check attempts failed to produce a useful non-zero known-microseconds reference (idle NFS4 windows).",
@@ -130,7 +177,7 @@
     {
       "id": "FR4",
       "title": "Exporter scrape responsiveness",
-      "priority": 4,
+      "priority": 5,
       "status": "backlog",
       "class": "performance",
       "summary": "Determine with measurement whether the synchronous exporter scrape causes objectionable TUI stalls; do not change architecture on this FR alone.",
@@ -145,7 +192,9 @@
       ],
       "dependencies": [],
       "blocked_by": [],
-      "related_decisions": ["D-005"],
+      "related_decisions": [
+        "D-005"
+      ],
       "related_legacy_frs": [],
       "evidence": [
         "Observed exporter scrape cost approximately 1.2-2.4 s on drill entry.",
@@ -161,7 +210,7 @@
     {
       "id": "FR5",
       "title": "Windows validation / CI coverage",
-      "priority": 5,
+      "priority": 6,
       "status": "backlog",
       "class": "platform",
       "summary": "Exercise the Windows path instead of merely guarding it syntactically; the release workflow ships a Windows executable that no CI runs.",
@@ -190,7 +239,7 @@
     {
       "id": "FR6",
       "title": "Protocol API-efficiency re-audit",
-      "priority": 6,
+      "priority": 7,
       "status": "backlog",
       "class": "performance",
       "summary": "Establish a fresh post-refactor API-cost baseline for all five engines; audit only, no optimization in this FR.",
@@ -207,7 +256,10 @@
       ],
       "dependencies": [],
       "blocked_by": [],
-      "related_decisions": ["D-004", "D-010"],
+      "related_decisions": [
+        "D-004",
+        "D-010"
+      ],
       "related_legacy_frs": [],
       "evidence": [
         "The instrumented mock (tests/mock_vms.py) records every call and is the measurement instrument.",
@@ -223,7 +275,7 @@
     {
       "id": "FR7",
       "title": "Release / product hardening",
-      "priority": 7,
+      "priority": 8,
       "status": "backlog",
       "class": "release",
       "summary": "Make opstat cleanly installable, documented, packaged and releasable from a fresh environment on supported systems.",
@@ -254,7 +306,7 @@
     {
       "id": "FR8",
       "title": "Validation tooling disposition",
-      "priority": 8,
+      "priority": 9,
       "status": "backlog",
       "class": "technical_debt",
       "summary": "Decide deliberately which refactor-era probe/validator machinery becomes permanent, and archive or remove the rest safely.",
@@ -284,7 +336,7 @@
     {
       "id": "FR9",
       "title": "Validator attribution polish",
-      "priority": 9,
+      "priority": 10,
       "status": "backlog",
       "class": "technical_debt",
       "summary": "Fix the two non-blocking Round-5B attribution imperfections found in the raw API log; validator precision only, not production defects.",
@@ -313,7 +365,7 @@
     {
       "id": "FR10",
       "title": "Drill input responsiveness refinement",
-      "priority": 10,
+      "priority": 11,
       "status": "backlog",
       "class": "performance",
       "summary": "Evaluate whether the drill-query loop should become input-aware like the headline loop; measure first, refine only if users experience the bounded latency as objectionable.",
@@ -341,7 +393,7 @@
     {
       "id": "FR11",
       "title": "Startup-loading UX as general invariant",
-      "priority": 11,
+      "priority": 12,
       "status": "backlog",
       "class": "architecture",
       "summary": "Decide whether the startup loading-frame pattern should be codified as a formal invariant for future engines/features, or whether current rule coverage already suffices.",
@@ -381,7 +433,9 @@
       ],
       "dependencies": [],
       "blocked_by": [],
-      "related_decisions": ["D-010"],
+      "related_decisions": [
+        "D-010"
+      ],
       "related_legacy_frs": [],
       "evidence": [
         "var203 VAST OS 5.4.6 rejects the attempted property combinations at query time (HTTP 400 \"can't mix properties\").",
