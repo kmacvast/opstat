@@ -23,8 +23,8 @@ set -u
 # ------------------------------------------------------------------ variables
 REPO="${OPSTAT_REPO:-$HOME/git/opstat}"
 VMS="${OPSTAT_VMS:-var203.selab.vastdata.com}"
-NFS41_MOUNT="/mnt/nfs41test"          # client mount of the NFSv4.1 view
-NFS41_SERVER_PREFIX="/kmacs/nfstest"  # server-side path of that mount
+NFS41_MOUNT="${OPSTAT_NFS41_MOUNT:-/mnt/nfs41test}"   # client mount of the NFSv4.1 view
+FIO_WAIT_S=90                          # bounded wait for a loadgen fio phase
 DTS=$(date +%Y%m%d-%H%M%S)
 RUN="$HOME/kjmtmp/opstat/fr2-$DTS"
 ZIP="$HOME/opstat-fr2-delegation-discovery-$DTS.zip"
@@ -75,18 +75,43 @@ grep -q "$NFS41_MOUNT" "$RUN/logs/mounts.txt" \
   && pass "NFSv4.1 mount present: $NFS41_MOUNT" \
   || warn "$NFS41_MOUNT not mounted; file candidates may be empty"
 
-# --------------------------------- 4. candidate file paths + pre-run state
-section "4. candidate files (client-side truth)"
-FILES=""
-for f in $(ls "$NFS41_MOUNT"/nfs41_loadgen/*.bin "$NFS41_MOUNT"/nfs41_loadgen/*.dat 2>/dev/null | head -5); do
-  rel=${f#"$NFS41_MOUNT"}
-  FILES="${FILES:+$FILES,}$NFS41_SERVER_PREFIX$rel"
+# --------------------------------- 4. mount facts + real file candidates
+section "4. mount derivation and real file candidates (client-side truth)"
+EXPORT=$(mount | awk -v mp="$NFS41_MOUNT" '$3 == mp {split($1, a, ":"); print a[2]}' | head -1)
+if [ -z "$EXPORT" ]; then
+  err "no mount found at $NFS41_MOUNT; cannot derive the export path"; EXPORT="unknown"
+else
+  pass "mount: server export $EXPORT on $NFS41_MOUNT"
+fi
+# Prefer files the loadgen holds OPEN right now (best delegation odds):
+# wait bounded time for an fio phase, then read /proc/<pid>/fd symlinks.
+OPEN_FILES=""
+DEADLINE=$(( $(date +%s) + FIO_WAIT_S ))
+while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+  for pid in $(pgrep -x fio 2>/dev/null); do
+    for fd in /proc/$pid/fd/*; do
+      tgt=$(readlink "$fd" 2>/dev/null) || continue
+      case "$tgt" in
+        "$NFS41_MOUNT"/*) OPEN_FILES="$OPEN_FILES$tgt"$'\n' ;;
+      esac
+    done
+  done
+  [ -n "$OPEN_FILES" ] && break
+  sleep 5
 done
-DIRS="$NFS41_SERVER_PREFIX/nfs41_loadgen,$NFS41_SERVER_PREFIX"
-echo "file candidates : ${FILES:-none}" | tee "$RUN/candidates.txt"
-echo "dir candidates  : $DIRS" | tee -a "$RUN/candidates.txt"
-[ -n "$FILES" ] && pass "real loadgen files found for live-delegation queries" \
-  || warn "no loadgen files found; only shape/empty/error semantics will be settled"
+OPEN_FILES=$(printf '%s' "$OPEN_FILES" | sort -u | head -4)
+# Always also enumerate existing regular files (works between fio phases).
+FOUND_FILES=$(find "$NFS41_MOUNT" -maxdepth 4 -type f -size +0 2>/dev/null | head -6)
+CLIENT_FILES=$(printf '%s\n%s\n' "$OPEN_FILES" "$FOUND_FILES" | grep . | sort -u | head -6 | paste -sd, -)
+{
+  echo "export path     : $EXPORT"
+  echo "open-by-fio     : ${OPEN_FILES:-none}"
+  echo "found files     : ${FOUND_FILES:-none}"
+  echo "client files    : ${CLIENT_FILES:-none}"
+} | tee "$RUN/candidates.txt"
+ls -la "$NFS41_MOUNT" "$NFS41_MOUNT"/* > "$RUN/logs/mount-listing.txt" 2>&1
+if [ -n "$CLIENT_FILES" ]; then pass "real file candidates discovered"
+else err "no real files found beneath $NFS41_MOUNT - targeting cannot be proven"; fi
 cat /proc/self/mountstats > "$RUN/logs/mountstats-before.txt" 2>/dev/null
 ls -1 /tmp/opstat-* > "$RUN/logs/tmp-before.txt" 2>/dev/null || : > "$RUN/logs/tmp-before.txt"
 {
@@ -100,7 +125,9 @@ date '+PROBE-START %F %T' | tee "$RUN/timestamps.txt"
 section "5. delegation endpoint discovery (GET-only)"
 python3 scripts/var203_validation/probe_fr2_delegations.py \
   --vms "$VMS" --user admin \
-  --file-paths "$FILES" --dir-paths "$DIRS" \
+  --mountpoint "$NFS41_MOUNT" --export-path "$EXPORT" \
+  --client-files "$CLIENT_FILES" \
+  --dir-paths "$EXPORT/nfs41_loadgen" \
   --evidence-dir "$RUN/raw" 2>&1 | tee "$RUN/probe-output.txt"
 PROBE_RC=${PIPESTATUS[0]}
 echo "PROBE-RC $PROBE_RC" | tee -a "$RUN/timestamps.txt"

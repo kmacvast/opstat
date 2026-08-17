@@ -134,3 +134,99 @@ def test_probe_one_reports_an_empty_result_honestly(tmp_path, monkeypatch):
     line = [l for l in probe.SUMMARY if "deleg.file0" in l][0]
     assert "PASS" in line and "0 record(s)" in line
     assert probe.FIELDS_SEEN == {}, "no fields may be invented from emptiness"
+
+
+# ---------------------------------------------------------------------------
+# Pass-2 targeting: derive mount -> view -> tenant, never tenant-list order.
+# Pass 1 queried tenants 37/25/51 by API order and every path returned
+# GetHandleByPathCode.ILLEGAL_PATH - wrong tenants, not a broken endpoint.
+# ---------------------------------------------------------------------------
+def test_server_path_for_maps_client_paths_exactly():
+    probe = _load_probe()
+    assert probe.server_path_for(
+        "/mnt/nfs41test/nfs41_loadgen/fio_iops.bin",
+        "/mnt/nfs41test", "/kmacs/nfstest") == (
+        "/kmacs/nfstest/nfs41_loadgen/fio_iops.bin")
+    assert probe.server_path_for("/mnt/nfs41test", "/mnt/nfs41test",
+                                 "/kmacs/nfstest") == "/kmacs/nfstest"
+    assert probe.server_path_for("/mnt/other/file", "/mnt/nfs41test",
+                                 "/kmacs/nfstest") is None, (
+        "paths outside the mountpoint must never be guessed into the export")
+
+
+_VIEWS = [
+    {"id": 1, "path": "/", "protocols": ["NFS", "NFS4"],
+     "tenant_id": 1, "tenant_name": "default"},
+    {"id": 217, "path": "/", "protocols": ["NFS"],
+     "tenant_id": 9, "tenant_name": "other"},
+    {"id": 424, "path": "/kmacs/block", "protocols": ["BLOCK"],
+     "tenant_id": 1, "tenant_name": "default"},
+    {"id": 500, "path": "/kmacs/nfstest", "protocols": ["NFS4"],
+     "tenant_id": 2, "tenant_name": "nfs-tenant"},
+]
+
+
+def test_candidate_views_exact_match_beats_root_prefix():
+    probe = _load_probe()
+    cands = probe.candidate_views(_VIEWS, "/kmacs/nfstest")
+    assert (cands[0][0]["id"], cands[0][1]) == (500, "exact")
+    # root views trail as prefix matches; the BLOCK view never qualifies
+    ids = [v["id"] for v, _k in cands]
+    assert 424 not in ids
+    assert set(ids) >= {1, 217}
+
+
+def test_candidate_views_fall_back_to_the_root_view():
+    """The FR1 lesson: with no exact view, NFS mounts traverse the root
+    view - the root must be a candidate, not a dead end."""
+    probe = _load_probe()
+    cands = probe.candidate_views(_VIEWS, "/kmacs/nfstest/nfs41_loadgen/a.bin")
+    kinds = {v["id"]: k for v, k in cands}
+    assert kinds[500] == "prefix", "longest prefix view must qualify"
+    assert cands[0][0]["id"] == 500, "longest prefix ordered first"
+    assert kinds[1] == "prefix" and kinds[217] == "prefix"
+
+
+def test_candidate_tenants_dedup_order_and_ambiguity_cap():
+    probe = _load_probe()
+    cands = probe.candidate_views(_VIEWS, "/kmacs/nfstest/nfs41_loadgen/a.bin")
+    tenants, ambiguous = probe.candidate_tenants(cands)
+    assert [t[0] for t in tenants] == [2, 1, 9], (
+        "derived order: exact/longest-prefix tenant first")
+    assert ambiguous is False
+    many = [({"id": i, "path": "/", "tenant_id": i, "tenant_name": i}, "prefix")
+            for i in range(6)]
+    capped, ambiguous = probe.candidate_tenants(many)
+    assert len(capped) == 3 and ambiguous is True, (
+        "more than the cap of distinct tenants must be reported as ambiguity")
+
+
+def test_path_representations_are_derived_bounded_and_deduped():
+    probe = _load_probe()
+    reps = probe.path_representations(
+        "/kmacs/nfstest/nfs41_loadgen/a.bin", "/kmacs/nfstest", "/kmacs/nfstest")
+    assert reps == ["/kmacs/nfstest/nfs41_loadgen/a.bin",
+                    "/nfs41_loadgen/a.bin"], "view==export dedups to two"
+    # root view: only the namespace path remains
+    assert probe.path_representations(
+        "/kmacs/nfstest/a.bin", "/", "/kmacs/nfstest") == [
+        "/kmacs/nfstest/a.bin", "/a.bin"]
+    assert len(probe.path_representations("/a/b/c", "/a", "/a/b")) <= 3
+
+
+def test_probe_one_records_illegal_path_verbatim(tmp_path, monkeypatch):
+    """The pass-1 failure shape must be preserved exactly - ILLEGAL_PATH is
+    evidence of wrong targeting, and hiding or truncating it away cost the
+    first run its diagnosis."""
+    probe = _load_probe()
+    probe.EVIDENCE_DIR = str(tmp_path)
+    msg = ("GET .../nfs4_delegs/?file_path=%2Fx failed: HTTP 400: "
+           "{\"detail\":\"get_handle_by_path returned an error : "
+           "GetHandleByPathCode.ILLEGAL_PATH\"}")
+    monkeypatch.setattr(probe.vast_common, "request",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError(msg)))
+    out = probe.probe_one("try0", 1, "default", "/x")
+    assert out is None
+    line = [l for l in probe.SUMMARY if "deleg.try0" in l][0]
+    assert "FAIL" in line and "ILLEGAL_PATH" in line
+    assert "ILLEGAL_PATH" in (tmp_path / "deleg-try0-t1.txt").read_text()

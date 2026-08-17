@@ -149,7 +149,9 @@
       "related_legacy_frs": [],
       "evidence": [
         "Delegation visibility needs a file/path-scoped interaction and must remain on-demand (D-008).",
-        "The nfs4_delegs DELETE sibling must never be invoked; a test asserts it is not."
+        "The nfs4_delegs DELETE sibling must never be invoked; a test asserts it is not.",
+        "2026-08-17 discovery pass 1 (var203/5.4.6, HEAD 5c7eb30): GET /tenants/{id}/nfs4_delegs/ EXISTS on 5.4.6 and still requires file_path (HTTP 400 'field required' without it, consistently). GET-only contract held; lab artifact policy clean (API log in-tree, /tmp unchanged).",
+        "Pass 1 was inconclusive on record shape: no real file candidate was discovered (loadgen in a sleep phase; *.bin glob empty), and guessed directory paths queried against the first three tenants in API order (37/25/51) all returned HTTP 400 get_handle_by_path GetHandleByPathCode.ILLEGAL_PATH - evidence of wrong-tenant/wrong-target queries, NOT an endpoint defect. Correct view->tenant correlation and a real existing file are prerequisites; record fields, empty-success shape and pagination semantics remain unproven."
       ],
       "notes": [
         "2026-08-17: Bundle 1 begins - Stage A repository/API analysis; design-first per owner instruction, D-008 governs."
