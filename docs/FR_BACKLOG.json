@@ -73,7 +73,8 @@
       "notes": [
         "2026-08-17: grouped with FR3 into the Telemetry Correctness milestone (coordinated investigation; shared host_view evidence).",
         "2026-08-17 owner decision language: PROVISIONAL KEEP VIEWMETRICS - HIGH confidence that a host_view REBUILD/HYBRID is not viable on 5.4.6 (no NFS host_view series); MEDIUM confidence that ViewMetrics is the final solution, pending the busy-view test (probe never exercised the actual active NFSv3 view).",
-        "2026-08-17 targeted-pass verdict: leaning NO VALID NFSV3 VIEW ATTRIBUTION SOURCE ON 5.4.6, pending one surgical check (display-monitor the root view id 1 under load; rank evidence already says ~0). Probe imperfections recorded: --view-paths anchors require exact match and skip silently; duplicate view paths resolve to the last-listed id (id 217 was monitored for '/', not id 1)."
+        "2026-08-17 targeted-pass verdict: leaning NO VALID NFSV3 VIEW ATTRIBUTION SOURCE ON 5.4.6, pending one surgical check (display-monitor the root view id 1 under load; rank evidence already says ~0). Probe imperfections recorded: --view-paths anchors require exact match and skip silently; duplicate view paths resolve to the last-listed id (id 217 was monitored for '/', not id 1).",
+        "2026-08-17: surgical check prepared - probe --view-ids 1,217 pins both path-'/' view objects; committed lab script scripts/opstat-lab-fr3-fr1-validation.sh runs it under proven NFSv3 load with client-side mountstats deltas. Expected outcome ~0 ViewMetrics activity on both, finalizing NO VALID NFSV3 VIEW ATTRIBUTION SOURCE ON 5.4.6."
       ],
       "created": "2026-08-16",
       "updated": "2026-08-17",
@@ -188,7 +189,8 @@
       ],
       "notes": [
         "2026-08-17: grouped with FR1 into the Telemetry Correctness milestone (coordinated investigation; shared host_view evidence).",
-        "2026-08-17: host_view latency unit -> CONTRADICTORY-to-current-code (strong inference: ms). Production nfs4_native stores it as latency_us and nfs_v41 h/v drills format it as microseconds - a likely ~1000x understatement on builds where NFS host_view series exist (e.g. 5.5.0.1); on 5.4.6 those panels render their honest empty state, so the defect is latent on var203."
+        "2026-08-17: host_view latency unit -> CONTRADICTORY-to-current-code (strong inference: ms). Production nfs4_native stores it as latency_us and nfs_v41 h/v drills format it as microseconds - a likely ~1000x understatement on builds where NFS host_view series exist (e.g. 5.5.0.1); on 5.4.6 those panels render their honest empty state, so the defect is latent on var203.",
+        "2026-08-17: D-014 fix IMPLEMENTED - parse_host_view converts the ms gauge to us at ingestion; decision records D-014 (host_view latency is milliseconds) and D-015 (catalog units field is display convention) recorded; literal regression test pins 0.64 -> 640 us. Real-VMS validation of the implemented conversion rides in scripts/opstat-lab-fr3-fr1-validation.sh (fr3.production_conversion verdict). Remaining scope: SMB/S3 per-op stay ASSUMED, VolumeMetrics unit unproven (volume scope queryable, values null in the sampled window)."
       ],
       "created": "2026-08-16",
       "updated": "2026-08-17",

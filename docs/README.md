@@ -21,6 +21,7 @@ settled decision buried in a branch handoff disappears when the branch merges.
 | [REFACTOR_HANDOFF.md](REFACTOR_HANDOFF.md) | State of the `refactor/tui-performance` effort: baseline, measurements, per-protocol status, open work | **Point-in-time** |
 | [CLAUDE_HANDOFF.md](CLAUDE_HANDOFF.md) | Concise cross-AI handoff: current state, pending real-VMS validation, blocked items | **Point-in-time** |
 | [../scripts/var203_validation/](../scripts/var203_validation/README.md) | Work-laptop validation package: automated probes + interactive checklist for the remaining live-cluster questions | Point-in-time |
+| `../scripts/opstat-lab-*.sh` | **Committed one-shot lab scripts** — the authoritative executable handoff for each Linux lab evidence/validation workflow (per-run DTS directory under `~/kjmtmp/opstat/`, no `/tmp` artifacts, single ZIP deliverable; policy tests in `tests/test_lab_scripts.py`) | Durable per workflow |
 | [WORKSTATION_BOOTSTRAP.md](WORKSTATION_BOOTSTRAP.md) | Setting up a machine to continue the work | Durable procedure |
 
 ## Agent configuration
