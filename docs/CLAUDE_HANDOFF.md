@@ -12,14 +12,19 @@ before relying on it. Depth lives elsewhere — this file is the map:
 
 ---
 
-## Where things stand
+## Where things stand — MILESTONE CLOSED
+
+**The TUI performance/refactor milestone is complete, merged to `main`, and
+closed by Round-5B real-VMS validation (var203, 2026-08-16, all checks PASS,
+none FAIL, none UNVERIFIED). `main` is the source of truth for subsequent
+work.** Full record: REFACTOR_HANDOFF's Round-5B closeout.
 
 | | |
 |---|---|
-| Branch | `refactor/tui-performance-local-continuation-wip` |
-| Last commit | `96f284e` (continuation branch published through the round-1/round-2 lab runs) |
-| Working tree | **Uncommitted round-2 reconciliation** (footer wrap, NVMe key dispatch + drill loading frame, validator fixes, docs). Do not discard; do not commit/push without explicit owner instruction |
-| Gate | `./scripts/validate.sh` → PASS on current Python and Python 3.8, 0 skipped; doc links valid (counts in REFACTOR_HANDOFF) |
+| Branch | `main` (milestone merge `38b66ce`; continuation branch retained as an ancestor) |
+| Working tree | Clean |
+| Gate | `./scripts/validate.sh` → PASS: 603 passed / 0 skipped on current Python **and** 3.8; doc links valid |
+| Final validation | Round 5B on `main` @ `1aaa359`: monitor creates 206 → 20, cleanup 20/20, remaining NONE; cNode drill + API-evidence-verified manual refresh green; VIP/HOST dead scopes bounded with honest notices; navigation and clean shutdown green |
 | Real clusters | `var203.selab.vastdata.com` only, from the owner's **work laptop** only. `var204` unavailable until the owner says otherwise. No cluster is reachable from the personal laptop |
 
 ## Objective
@@ -39,9 +44,10 @@ cluster did not return.
 - Cleanup-interruption fix (signal-blocked drain, guard-after-drain) across
   all five engines.
 
-## Complete locally in the current working tree (this pass)
+## Completed in the continuation refactor (now merged to `main`)
 
-All mock/unit-proven, on both interpreters:
+All mock/unit-proven on both interpreters, and since real-VMS validated
+through rounds 3–5B:
 
 - **FR-A navigation, all five engines.** Canonical contract in
   `vast_drill.CANONICAL_CONTROLS` / `nav_controls()` / shared `nav_legend()`
@@ -67,16 +73,23 @@ All mock/unit-proven, on both interpreters:
   floor raised 395 → 465; startup/shutdown + navigation invariants promoted
   into `.claude/rules/tui-behavior.md`.
 
-## IMPLEMENTED / REAL-VMS VALIDATION PENDING
+## Settled by rounds 3–5B (var203; milestone-closing evidence)
 
-Implementation is done and deterministically tested; var203 only confirms:
+Everything previously listed as REAL-VMS VALIDATION PENDING is confirmed:
 
-1. NVMe batch monitors accepted (multi-`object_id` at cnode/vip/blockhost
-   scope) — engine falls back per-object if not.
-2. NVMe blockhost drill end-to-end (mock deliberately does not model
-   `/blockhosts/`).
-3. NVMe real BEFORE/AFTER call counts; startup + shutdown UX appearance;
-   FR-A footers on real screens; FR-C BLOCK screen.
+1. NVMe batch acceptance is **scope-dependent** (D-013): cNode batches and
+   splits; vip/blockhost accept create+query but return zero per-object rows
+   → verdict-before-cost probe/rank, honest no-telemetry notice, no fan-out.
+2. NVMe cNode drill end-to-end green: 13-call entry, batch layout, ranked
+   rows, forced refresh proven from API-log evidence, `x` exits.
+3. Session monitor budget **206 (round 4) → 20 (round 5B)**, cleanup 20/20,
+   remaining NONE by per-id GET; startup/shutdown UX, FR-A footers and the
+   FR-C BLOCK screen validated on real frames.
+4. Round-5's "421 s" VIP/HOST figures and its manual-refresh FAIL were both
+   validator measurement defects (dead-time wait; fixed 6 s window), fixed
+   in 5B. The 5B PASS detail "issued -0.9s after the keypress" is a
+   second-granularity timestamp-reconstruction artifact, not a product
+   timing defect (see REFACTOR_HANDOFF Round-5B footnotes).
 
 ## BLOCKED ON REAL-VMS EVIDENCE
 
@@ -145,15 +158,10 @@ counts, shapes and cleanup results were kept.
 
 ## Remaining live dependencies
 
-One command on the Linux lab host answers the rest, unattended:
-
-```bash
-python3 scripts/var203_validation/run_var203_validation.py
-```
-
-It drives `opstat` through a PTY (startup/shutdown UX, drill entry cost and
-cadence, ranking, navigation, Fabric screen, per-id cleanup) and writes
-`/tmp/opstat-var203-validation.txt`. See
+None for this milestone — Round 5B closed it. The unattended lab validator
+(`python3 scripts/var203_validation/run_var203_validation.py`, with
+`--nvme-only` for the narrow mode) remains available for future passes; it
+writes `/tmp/opstat-var203-validation.txt`. See
 [../scripts/var203_validation/](../scripts/var203_validation/README.md).
 
 ## Outstanding work (not started)
@@ -164,15 +172,17 @@ cadence, ranking, navigation, Fabric screen, per-id cleanup) and writes
   consequence in D-005; L1).
 - Windows build path untested in CI (`pthread_sigmask` is getattr-guarded but
   never exercised; `test.yml` is Linux-only, `release.yml` ships an .exe).
-- Logical commit breakdown + final real-VMS pass, then publication (owner).
+- Latency source units still UNVERIFIED (`host_view` gauge; NVMe
+  BlockMetrics/VolumeMetrics µs assumption) — needs the cross-check under
+  real NFS4 load; displays stay marked UNVERIFIED until then.
+- ~~Logical commit breakdown + final real-VMS pass, then publication~~ —
+  **done; milestone closed by Round 5B.**
 
 ## Recommended next step
 
-Commit the round-2 reconciliation (owner-approved split), then re-run
-`run_var203_validation.py` on the lab host with the fixed validator: it should
-now show the cNode drill fully green, the true drill AFTER costs, vip/blockhost
-fallback behavior, the merge-legality probe verdicts (startup lever), and —
-with NFS4 load active during the probe window — a usable latency cross-check.
+The refactor milestone is closed. Pick the next item from the backlog above
+(or REFACTOR_HANDOFF's *Known defects / unfinished work*) with the owner —
+work starts from `main`.
 
 ## Ground rules for any AI resuming here
 

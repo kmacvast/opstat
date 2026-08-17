@@ -60,11 +60,11 @@ logs, or in this handoff.
 
 | Item | Value at time of writing |
 |---|---|
-| Branch | `refactor/tui-performance-local-continuation-wip` |
-| Base | `main` @ `77549f06` (unchanged throughout) |
-| WIP checkpoint | `779cd6e` — *wip: preserve interrupted opstat refactor state* (work-laptop snapshot; also on `handoff/work-laptop-wip-20260814`) |
-| HEAD | `03f72a2` + a large **uncommitted** working tree (this continuation pass: FR-A/FR-B, NVMe ranking+batching, exporter-fixture fix, docs) |
-| Tests | 504 collected, all passing, 0 skipped, on Python 3.8 and the current interpreter |
+| Branch | **`main` — the milestone is merged and closed; main is the source of truth for subsequent work** |
+| Milestone merge | `38b66ce` — *Merge opstat TUI performance refactor + real-VMS validated NVMe remediation* (`--no-ff`, gate-validated before and after) |
+| Continuation branch | `refactor/tui-performance-local-continuation-wip` @ `85f6075` — retained, published, an ancestor of `main` |
+| Final real-VMS validation | Round 5B, `main` @ `1aaa359`, var203, 2026-08-16 — all checks PASS (see Round-5B closeout below) |
+| Tests | 603 collected, all passing, 0 skipped, on Python 3.8 and the current interpreter |
 
 Determine the live state rather than trusting the table:
 
@@ -658,11 +658,64 @@ frame before the drain.
    from per-call issue times (completion stamp minus logged duration).
    Ambiguous activity reports UNVERIFIED, never FAIL.
 
-**Round 5B is the final validator confirmation for this milestone** - a
-validator-only change (no production code), run from `main` after the merge,
-NVMe-only. Acceptance: cNode entry/batch/refresh/`x` green with the corrected
-measurement; VIP/HOST notice at true seconds-scale with <= 3 creates; nav
-green; clean shutdown, zero remaining ids; session creates ~20.
+## Round-5B closeout — MILESTONE CLOSED (var203, `main` @ `1aaa359`, 2026-08-16)
+
+**Round 5B was the final real-VMS validation for this milestone. All 20
+checks PASS; FAIL: none; UNVERIFIED: none.** Validator-only changes since
+round 5; no production code changed. The monitor-storm remediation is
+**accepted and closed**, and `main` is now the source of truth.
+
+Observed, and independently re-verified against the raw pid-1924558 API log:
+
+- **Monitor budget:** session creates **206 (round 4) -> 20 (round 5B)**;
+  all 20 owned monitors deleted (per-id GET, 404 = gone); remaining **NONE**.
+  The 20 reconcile exactly: 8 headline, cNode rank + 4 batch, 1 VIP probe,
+  1 HOST rank, nav-phase cNode rank + 4 batch — every one deleted on its
+  own path (drill exits, probe/rank teardown, shutdown drain).
+- **cNode:** entry 13 calls / 5 monitors / batch layout / 2 ranked rows;
+  no per-object fan-out anywhere in the log; `x` exits.
+- **Manual refresh: PASS with API evidence.** The raw log contains the
+  unforgeable signature: the in-flight cadence headline pass was aborted
+  after two queries by the pending space (issued 23:35:20-21), and the
+  dispatched refresh then ran the full headline pass (23:36:03-23:36:32)
+  followed immediately by the forced drill queries — a truncated-then-
+  restarted pass that only a dispatched key can produce.
+- **VIP dead scope:** bounded — `GET /vips/` + one probe create/query/
+  delete (4 calls, 1 create, 21 s to the honest notice). Zero ranking of
+  the 378-VIP population.
+- **HOST dead scope:** bounded — `GET /blockhosts/` + one rank create/
+  query/delete, no batch attempt, no fan-out, honest notice.
+- **Navigation:** canonical footer bindings; `p` unbound and does not exit
+  a confirmed-open drill; `v` does not open VIP.
+- **Shutdown:** cleanup frame before the drain, exit 0 in 28.34 s.
+- Whole session: 140 API calls (95 queries, 20 creates, 20 deletes,
+  5 inventory/cluster GETs).
+
+**Round-5 artifacts, settled:** the round-5 "421 s" VIP/HOST figures were
+validator dead time, not product latency, and the round-5 manual-refresh red
+result was the validator's fixed 6-second observation window — both fixed in
+5B and closed.
+
+**Measurement footnotes (recorded so they are not mistaken for defects
+later; conclusions above were verified from the raw log, not these rows):**
+
+- The PASS detail *"query issued -0.9s after the keypress"* is a timestamp
+  reconstruction artifact: issue time = second-granularity completion stamp
+  minus the logged call duration, compared against a sub-second wall clock
+  inside the judge's designed +/-2 s slack. Small negative values near zero
+  are expected. **Not a product timing defect.** (The specific query that
+  row cites was in fact part of the in-flight cadence burst — a var203
+  mid-burst latency gap defeated the throttle-window proof's clean-burst
+  precondition — but the verdict is independently correct: the
+  abort/restart evidence above is in the same log.)
+- The HOST row's "2 calls, 0 creates, 29s" under-counted its own window:
+  `NO_TELEMETRY_MARKER` is scope-agnostic, and residual VIP-notice text
+  during the `x`->`h` transition satisfied the wait before the host work
+  ran. True host entry cost from the log: 4 calls, 1 create (rank 2898,
+  deleted 1 s later), ~35 s — still inside every acceptance bound.
+
+Both footnotes are validator display/attribution imprecision only; optional
+polish, not milestone work.
 
 ## Test architecture
 
@@ -735,16 +788,18 @@ Verified against the repository at the time of writing.
 
 ### Outstanding
 
-1. **NVMe ranking and drill batching — batch acceptance settled per scope
-   ([D-013](decisions/D-013-nvme-drill-batching-is-scope-dependent.md)):
-   cnode batches, vip/blockhost fall back.** Still real-cluster-only: a full
-   drill AFTER measurement with the fixed validator (the first run's drill
-   FAILs were swallowed keys + too-short deadlines, not the drill), and the
-   blockhost drill end-to-end.
-2. **NVMe startup cost (157 s real, cluster-adjacent).** 17 serial calls at
-   2–38 s each; no duplicated work to remove. The one structural lever —
-   fewer startup monitors — is BLOCKED ON REAL-VMS EVIDENCE pending the
-   merge-legality probes now in `probe_var203.py`.
+1. ~~NVMe ranking and drill batching real-cluster confirmation~~ **CLOSED by
+   rounds 4–5B** ([D-013](decisions/D-013-nvme-drill-batching-is-scope-dependent.md)):
+   cNode drill fully validated (13-call entry, batch layout, ranked rows,
+   API-evidence-verified forced refresh, `x`); vip/blockhost dead scopes
+   bounded (probe/rank verdict, honest notice, no fan-out); session monitor
+   budget 206 -> 20 with exact-id cleanup. See the Round-5B closeout.
+2. **NVMe startup cost (~60-78 s real in rounds 4-5B).** Honest serial API
+   time; no duplicated work to remove. The one structural lever — fewer
+   startup monitors — is **closed on this build**: the round-3 merge-legality
+   probes were rejected at query time (HTTP 400 "can't mix properties"), so
+   headline consolidation is ruled out on var203/5.4.6 (L1 to revisit on new
+   evidence from another build).
 2b. ~~Queued-key drop~~ **RESOLVED in all five engines** — shared
    `vast_drill.dispatch_queued_keys` + per-engine `_dispatch_key`;
    multi-key buffers regression-tested per engine
@@ -1062,7 +1117,7 @@ not replace real-VMS validation for cluster-only semantic questions.
 3. Read this document for branch state and open work.
 4. Inspect the repository — `git log --oneline origin/main..HEAD`,
    `git status`, `git rev-parse HEAD` vs origin. Note unpublished commits.
-5. Run `./scripts/validate.sh`. Expect ~400 passing on current Python **and**
+5. Run `./scripts/validate.sh`. Expect ~603 passing on current Python **and**
    3.8, with nothing skipped.
 6. Pick the next item from **Known defects / unfinished work**.
 7. Read the relevant [.claude/rules/](../.claude/rules/) file before working in
