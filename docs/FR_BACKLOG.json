@@ -35,7 +35,7 @@
       "id": "FR1",
       "title": "NFSv3 VIEW attribution / host_view rebuild",
       "priority": 1,
-      "status": "backlog",
+      "status": "in_progress",
       "class": "architecture",
       "summary": "Decide with evidence whether the NFSv3 VIEW drill should be rebuilt around the exporter's host_view series, which carries protocol=NFS3, instead of ViewMetrics.",
       "scope": [
@@ -65,9 +65,11 @@
         "The NFSv4.1 host_view rebuild may be portable.",
         "Recorded at milestone close as the largest remaining honest-telemetry opportunity."
       ],
-      "notes": [],
+      "notes": [
+        "2026-08-17: grouped with FR3 into the Telemetry Correctness milestone (coordinated investigation; shared host_view evidence)."
+      ],
       "created": "2026-08-16",
-      "updated": "2026-08-16",
+      "updated": "2026-08-17",
       "completed": null
     },
     {
@@ -145,7 +147,7 @@
       "id": "FR3",
       "title": "Latency source-unit certainty",
       "priority": 3,
-      "status": "backlog",
+      "status": "in_progress",
       "class": "correctness",
       "summary": "Remove the remaining uncertainty about native latency units; every user-visible latency source gets a proven unit, explicit conversion and literal regression tests.",
       "scope": [
@@ -171,9 +173,11 @@
         "Three generic cross-check attempts failed to produce a useful non-zero known-microseconds reference (idle NFS4 windows).",
         "Magnitude alone is not proof; displays remain unchanged and marked UNVERIFIED until evidence is decisive."
       ],
-      "notes": [],
+      "notes": [
+        "2026-08-17: grouped with FR1 into the Telemetry Correctness milestone (coordinated investigation; shared host_view evidence)."
+      ],
       "created": "2026-08-16",
-      "updated": "2026-08-16",
+      "updated": "2026-08-17",
       "completed": null
     },
     {
