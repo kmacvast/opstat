@@ -16,6 +16,7 @@ settled decision buried in a branch handoff disappears when the branch merges.
 |---|---|---|
 | [../AGENTS.md](../AGENTS.md) | **Read first.** The behavioral contract for working on this repository — architecture, Python floor, command contract, decision hierarchy, API efficiency, VMS safety, TUI requirements, git policy, definition of done | Durable policy |
 | [../CLAUDE.md](../CLAUDE.md) | Claude Code entrypoint; imports `AGENTS.md` and adds tool-specific routing | Durable policy |
+| [FR_BACKLOG.json](FR_BACKLOG.json) | **Authoritative feature request / engineering backlog and priority state.** The one live backlog; handoffs summarize, this file decides. Rules: [../.claude/rules/backlog.md](../.claude/rules/backlog.md) | Durable; reconciled every pass |
 | [decisions/](decisions/) | Settled engineering decisions with the evidence that settled them | Durable; superseded, never rewritten |
 | [REFACTOR_HANDOFF.md](REFACTOR_HANDOFF.md) | State of the `refactor/tui-performance` effort: baseline, measurements, per-protocol status, open work | **Point-in-time** |
 | [CLAUDE_HANDOFF.md](CLAUDE_HANDOFF.md) | Concise cross-AI handoff: current state, pending real-VMS validation, blocked items | **Point-in-time** |

@@ -202,6 +202,17 @@ counts and outstanding work from the repo.
   bandwidth-scoping loss was introduced by a change on this branch. Those are
   different reports and different obligations.
 
+### Backlog
+
+**[docs/FR_BACKLOG.json](docs/FR_BACKLOG.json) is the authoritative
+feature-request / engineering backlog and priority state.** Read it before
+beginning backlog work; keep item status, dates and priorities current as
+work starts, blocks, completes or is deferred; allocate new FR numbers from
+`next_fr_number` and never reuse or delete one. Handoff documents may
+summarize work but are never a competing backlog — on conflict, the JSON
+wins. `scripts/check_fr_backlog.py` (run by the gate) enforces the
+structure. Long form: [.claude/rules/backlog.md](.claude/rules/backlog.md).
+
 ---
 
 ## Evidence requirements

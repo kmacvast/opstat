@@ -164,25 +164,18 @@ None for this milestone — Round 5B closed it. The unattended lab validator
 writes `/tmp/opstat-var203-validation.txt`. See
 [../scripts/var203_validation/](../scripts/var203_validation/README.md).
 
-## Outstanding work (not started)
+## Outstanding work
 
-- NFSv3 VIEW drill: possible `host_view` rebuild (carries `protocol=NFS3`).
-- Delegation diagnostic (needs a path-entry interaction; D-008).
-- Background-threading question for the synchronous exporter scrape (open
-  consequence in D-005; L1).
-- Windows build path untested in CI (`pthread_sigmask` is getattr-guarded but
-  never exercised; `test.yml` is Linux-only, `release.yml` ships an .exe).
-- Latency source units still UNVERIFIED (`host_view` gauge; NVMe
-  BlockMetrics/VolumeMetrics µs assumption) — needs the cross-check under
-  real NFS4 load; displays stay marked UNVERIFIED until then.
-- ~~Logical commit breakdown + final real-VMS pass, then publication~~ —
-  **done; milestone closed by Round 5B.**
+The authoritative backlog — items, priorities, statuses — lives in
+**[FR_BACKLOG.json](FR_BACKLOG.json)** and only there
+(rule: [../.claude/rules/backlog.md](../.claude/rules/backlog.md)). This
+document summarizes state; it is not a backlog. Priority 1 at the time of
+writing: FR1, the NFSv3 VIEW attribution / `host_view` rebuild decision.
 
 ## Recommended next step
 
-The refactor milestone is closed. Pick the next item from the backlog above
-(or REFACTOR_HANDOFF's *Known defects / unfinished work*) with the owner —
-work starts from `main`.
+The refactor milestone is closed. Read `FR_BACKLOG.json`, confirm priority 1
+with the owner, and work from `main`.
 
 ## Ground rules for any AI resuming here
 

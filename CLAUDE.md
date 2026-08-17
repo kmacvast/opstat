@@ -37,6 +37,9 @@ what automated enforcement cannot catch:
   — before changing tests, the mock, or claiming validation.
 - [.claude/rules/tui-behavior.md](.claude/rules/tui-behavior.md) — before
   touching rendering, drills, footers, or loading states.
+- [.claude/rules/backlog.md](.claude/rules/backlog.md) — before starting,
+  finishing, deferring, or adding backlog work.
+  [docs/FR_BACKLOG.json](docs/FR_BACKLOG.json) is the one live backlog.
 
 Do not restate these rules in new files. One statement, linked from everywhere.
 

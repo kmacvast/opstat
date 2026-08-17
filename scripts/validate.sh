@@ -142,6 +142,15 @@ else
   FAILED=1
 fi
 rm -f "$DOC_OUT"
+FR_OUT="$(mktemp)"
+if "$PY" scripts/check_fr_backlog.py >"$FR_OUT" 2>&1; then
+  note "backlog" "$(cat "$FR_OUT")"
+else
+  note "backlog" "FAILED"
+  cat "$FR_OUT"
+  FAILED=1
+fi
+rm -f "$FR_OUT"
 echo
 
 # ------------------------------------------------------------- collection ---

@@ -1,0 +1,398 @@
+{
+  "schema_version": 1,
+  "project": "opstat",
+  "source_of_truth": true,
+  "updated": "2026-08-16",
+  "next_fr_number": 13,
+  "status_values": [
+    "backlog",
+    "ready",
+    "in_progress",
+    "blocked",
+    "deferred",
+    "done",
+    "superseded"
+  ],
+  "project_constraints": [
+    "Real-VMS evidence outranks assumptions encoded in mocks; where they disagree, the cluster is right and the mock is a bug.",
+    "Mock behavior must remain evidence-based: model observed cluster shapes, never invent semantics.",
+    "var204.selab.vastdata.com remains unavailable until the owner explicitly restores it; var203 is the only real-VMS target.",
+    "Re-measure before optimizing; request volume is a first-class regression dimension.",
+    "Credentials are environment-sourced (VAST_PASSWORD / VAST_TOKEN); never in argv, files, logs, or documentation.",
+    "Never enumerate-and-delete unrelated adhoc_opstat_* monitors; cleanup is exact-id only.",
+    "Do not rerun tests merely to turn an unexplained flake green; capture the failing output instead.",
+    "Known flake on record: test_smb_merged_monitor_single_query_per_refresh failed once, unreproduced, on Python 3.8; if it recurs, capture the evidence rather than hiding it.",
+    "Interactive responsiveness still lacks a committed PTY benchmark harness; interactive claims are unproven without a PTY run or a real-cluster session."
+  ],
+  "legacy_frs": {
+    "FR-A": "Navigation standardization - DONE. Canonical contract (vast_drill.CANONICAL_CONTROLS) across all five engines; real-VMS validated through round 5B (p unbound, v is not VIP).",
+    "FR-B": "Latency source-unit certainty - PARTIAL. Nfs4Metrics latency proven microseconds; remaining source units are open work tracked as FR3.",
+    "FR-C": "Block fabric percentages - DONE. Read/write/reclaim as shares of actual I/O workload with fabric separate; real-VMS validated on live and idle frames.",
+    "FR-D": "Unit testing / quality gate - DONE as infrastructure. scripts/validate.sh (both interpreters, zero skips, collection floor, doc links); testing remains an engineering practice, not an active FR."
+  },
+  "items": [
+    {
+      "id": "FR1",
+      "title": "NFSv3 VIEW attribution / host_view rebuild",
+      "priority": 1,
+      "status": "backlog",
+      "class": "architecture",
+      "summary": "Decide with evidence whether the NFSv3 VIEW drill should be rebuilt around the exporter's host_view series, which carries protocol=NFS3, instead of ViewMetrics.",
+      "scope": [
+        "Inspect the current NFSv3 VIEW attribution path (ViewMetrics).",
+        "Characterize host_view with protocol=NFS3 on a real cluster.",
+        "Compare attribution correctness between the two sources.",
+        "Compare API cost, drill-entry cost and steady-state cost.",
+        "Determine whether host_view should replace or augment the current path.",
+        "If implementation changes, model the proven real payload shape in the mock.",
+        "Real-VMS validate any implementation change."
+      ],
+      "acceptance_criteria": [
+        "An evidence-backed decision to retain the current architecture or move NFSv3 VIEW attribution to host_view.",
+        "Correctness and API-efficiency comparison results recorded."
+      ],
+      "dependencies": [],
+      "blocked_by": [],
+      "related_decisions": ["D-001", "D-004", "D-011"],
+      "related_legacy_frs": [],
+      "evidence": [
+        "Current NFSv3 VIEW path still uses ViewMetrics.",
+        "host_view carries protocol=NFS3.",
+        "The NFSv4.1 host_view rebuild may be portable.",
+        "Recorded at milestone close as the largest remaining honest-telemetry opportunity."
+      ],
+      "notes": [],
+      "created": "2026-08-16",
+      "updated": "2026-08-16",
+      "completed": null
+    },
+    {
+      "id": "FR2",
+      "title": "NFSv4.1 delegation diagnostic",
+      "priority": 2,
+      "status": "backlog",
+      "class": "diagnostic",
+      "summary": "Complete the intentionally deferred delegation diagnostic: on-demand, file/path-scoped delegation visibility with zero cost on the normal refresh path.",
+      "scope": [
+        "Design a path-entry or path-selection interaction.",
+        "Query delegation state only on explicit request.",
+        "Keep the diagnostic off the normal refresh path.",
+        "Add mock coverage.",
+        "Validate against real VMS."
+      ],
+      "acceptance_criteria": [
+        "A user can explicitly inspect delegation information for a file/path without adding API cost to normal NFSv4.1 polling."
+      ],
+      "dependencies": [],
+      "blocked_by": [],
+      "related_decisions": ["D-008"],
+      "related_legacy_frs": [],
+      "evidence": [
+        "Delegation visibility needs a file/path-scoped interaction and must remain on-demand (D-008).",
+        "The nfs4_delegs DELETE sibling must never be invoked; a test asserts it is not."
+      ],
+      "notes": [],
+      "created": "2026-08-16",
+      "updated": "2026-08-16",
+      "completed": null
+    },
+    {
+      "id": "FR3",
+      "title": "Latency source-unit certainty",
+      "priority": 3,
+      "status": "backlog",
+      "class": "correctness",
+      "summary": "Remove the remaining uncertainty about native latency units; every user-visible latency source gets a proven unit, explicit conversion and literal regression tests.",
+      "scope": [
+        "Create targeted probes instead of depending on generic validator timing.",
+        "Deliberately generate/select traffic that produces a usable non-zero known-microseconds reference.",
+        "Prove the native unit of each unresolved source: NVMe BlockMetrics, VolumeMetrics, host_view latency, SMB per-operation, S3 per-operation.",
+        "Lock conversion paths with literal tests.",
+        "Add or update a decision record if warranted."
+      ],
+      "acceptance_criteria": [
+        "Every user-visible latency source has a proven native unit, explicit conversion, explicit display unit, and literal regression tests."
+      ],
+      "dependencies": [],
+      "blocked_by": [],
+      "related_decisions": ["D-006"],
+      "related_legacy_frs": ["FR-B"],
+      "evidence": [
+        "Nfs4Metrics latency is proven microseconds.",
+        "Three generic cross-check attempts failed to produce a useful non-zero known-microseconds reference (idle NFS4 windows).",
+        "Magnitude alone is not proof; displays remain unchanged and marked UNVERIFIED until evidence is decisive."
+      ],
+      "notes": [],
+      "created": "2026-08-16",
+      "updated": "2026-08-16",
+      "completed": null
+    },
+    {
+      "id": "FR4",
+      "title": "Exporter scrape responsiveness",
+      "priority": 4,
+      "status": "backlog",
+      "class": "performance",
+      "summary": "Determine with measurement whether the synchronous exporter scrape causes objectionable TUI stalls; do not change architecture on this FR alone.",
+      "scope": [
+        "Measure scrape duration.",
+        "Measure the input/UI stall attributable to the scrape.",
+        "Determine whether synchronous behavior is acceptable.",
+        "If unacceptable, stop and present evidence before any architecture change."
+      ],
+      "acceptance_criteria": [
+        "Either synchronous scrape responsiveness is demonstrated acceptable, or evidence justifies an explicitly approved asynchronous design."
+      ],
+      "dependencies": [],
+      "blocked_by": [],
+      "related_decisions": ["D-005"],
+      "related_legacy_frs": [],
+      "evidence": [
+        "Observed exporter scrape cost approximately 1.2-2.4 s on drill entry.",
+        "Whether that is actually unacceptable in practice remains unresolved."
+      ],
+      "notes": [
+        "Background threading/concurrency is an L1 architectural decision; do NOT implement threading merely because this FR exists. Measure first."
+      ],
+      "created": "2026-08-16",
+      "updated": "2026-08-16",
+      "completed": null
+    },
+    {
+      "id": "FR5",
+      "title": "Windows validation / CI coverage",
+      "priority": 5,
+      "status": "backlog",
+      "class": "platform",
+      "summary": "Exercise the Windows path instead of merely guarding it syntactically; the release workflow ships a Windows executable that no CI runs.",
+      "scope": [
+        "Add Windows execution/build coverage where practical.",
+        "Exercise the packaged executable.",
+        "Verify guarded signal behavior (pthread_sigmask getattr-guard).",
+        "Catch platform-specific packaging/runtime defects."
+      ],
+      "acceptance_criteria": [
+        "The supported Windows executable path is exercised by repeatable CI or equivalent release validation."
+      ],
+      "dependencies": [],
+      "blocked_by": [],
+      "related_decisions": [],
+      "related_legacy_frs": [],
+      "evidence": [
+        "pthread_sigmask is getattr-guarded but never exercised.",
+        "test.yml is Linux-only; release.yml ships a Windows .exe."
+      ],
+      "notes": [],
+      "created": "2026-08-16",
+      "updated": "2026-08-16",
+      "completed": null
+    },
+    {
+      "id": "FR6",
+      "title": "Protocol API-efficiency re-audit",
+      "priority": 6,
+      "status": "backlog",
+      "class": "performance",
+      "summary": "Establish a fresh post-refactor API-cost baseline for all five engines; audit only, no optimization in this FR.",
+      "scope": [
+        "Measure NFSv3, NFSv4.1, SMB, S3 and NVMe/TCP.",
+        "Capture startup calls, startup monitor creates, and time to first usable screen.",
+        "Capture normal refresh calls and steady-state query rate.",
+        "Capture drill-entry calls, drill-entry monitor creates, and drill steady-state calls.",
+        "Capture cleanup calls and create/delete balance.",
+        "Identify remaining O(N) paths and the largest remaining API consumers."
+      ],
+      "acceptance_criteria": [
+        "A ranked, evidence-backed inventory of remaining performance/API costs from which future optimization FRs can be created."
+      ],
+      "dependencies": [],
+      "blocked_by": [],
+      "related_decisions": ["D-004", "D-010"],
+      "related_legacy_frs": [],
+      "evidence": [
+        "The instrumented mock (tests/mock_vms.py) records every call and is the measurement instrument.",
+        "Round-5B whole-session NVMe baseline: 140 calls, 20 creates, 20 deletes, 95 queries."
+      ],
+      "notes": [
+        "Audit first. Do not turn this directly into an optimization pass."
+      ],
+      "created": "2026-08-16",
+      "updated": "2026-08-16",
+      "completed": null
+    },
+    {
+      "id": "FR7",
+      "title": "Release / product hardening",
+      "priority": 7,
+      "status": "backlog",
+      "class": "release",
+      "summary": "Make opstat cleanly installable, documented, packaged and releasable from a fresh environment on supported systems.",
+      "scope": [
+        "CLI consistency and help accuracy.",
+        "README reconciliation and documentation cleanup.",
+        "Narrow-terminal visual sweep and resize behavior.",
+        "Clean install/bootstrap and packaging validation.",
+        "Upgrade sanity and backward-compatibility sanity.",
+        "Windows packaging.",
+        "Final release gate and versioning/release preparation."
+      ],
+      "acceptance_criteria": [
+        "Supported systems can install and run opstat from a clean environment.",
+        "Documentation matches actual behavior.",
+        "Packaging is repeatably validated and the release gate is green."
+      ],
+      "dependencies": [],
+      "blocked_by": [],
+      "related_decisions": [],
+      "related_legacy_frs": [],
+      "evidence": [],
+      "notes": [],
+      "created": "2026-08-16",
+      "updated": "2026-08-16",
+      "completed": null
+    },
+    {
+      "id": "FR8",
+      "title": "Validation tooling disposition",
+      "priority": 8,
+      "status": "backlog",
+      "class": "technical_debt",
+      "summary": "Decide deliberately which refactor-era probe/validator machinery becomes permanent, and archive or remove the rest safely.",
+      "scope": [
+        "Inventory probe/validator machinery.",
+        "Retain reusable regression tooling.",
+        "Distinguish CI tests from real-VMS diagnostics.",
+        "Identify one-off forensic scripts.",
+        "Remove/archive obsolete machinery safely.",
+        "Prevent the repository from becoming a museum of every investigation ever performed."
+      ],
+      "acceptance_criteria": [
+        "Validation tooling has a deliberate permanent structure."
+      ],
+      "dependencies": [],
+      "blocked_by": [],
+      "related_decisions": [],
+      "related_legacy_frs": [],
+      "evidence": [
+        "scripts/var203_validation/ carries the round-1..5B validator and probes; some parts are durable regression tooling, some were forensic one-offs."
+      ],
+      "notes": [],
+      "created": "2026-08-16",
+      "updated": "2026-08-16",
+      "completed": null
+    },
+    {
+      "id": "FR9",
+      "title": "Validator attribution polish",
+      "priority": 9,
+      "status": "backlog",
+      "class": "technical_debt",
+      "summary": "Fix the two non-blocking Round-5B attribution imperfections found in the raw API log; validator precision only, not production defects.",
+      "scope": [
+        "Make no-telemetry completion scope-aware or require a fresh repaint so consecutive dead-scope notices cannot cross-match.",
+        "Tighten manual-refresh throttle-window attribution against mid-burst latency gaps.",
+        "Improve quiet detection so one slow in-flight call is not mistaken for a quiet interval."
+      ],
+      "acceptance_criteria": [
+        "Validator attribution matches raw API chronology without relying on residual screen state or ambiguous burst reconstruction."
+      ],
+      "dependencies": [],
+      "blocked_by": [],
+      "related_decisions": [],
+      "related_legacy_frs": [],
+      "evidence": [
+        "Round-5B HOST row reported 2 calls / 0 creates because residual VIP-notice text matched the scope-agnostic marker; raw-log truth was 4 calls / 1 create.",
+        "Round-5B manual-refresh PASS cited a throttle-window query that was actually part of the in-flight cadence burst; the verdict was independently correct via the abort/restart evidence.",
+        "Round-5B verdict is accepted; these are precision improvements only."
+      ],
+      "notes": [],
+      "created": "2026-08-16",
+      "updated": "2026-08-16",
+      "completed": null
+    },
+    {
+      "id": "FR10",
+      "title": "Drill input responsiveness refinement",
+      "priority": 10,
+      "status": "backlog",
+      "class": "performance",
+      "summary": "Evaluate whether the drill-query loop should become input-aware like the headline loop; measure first, refine only if users experience the bounded latency as objectionable.",
+      "scope": [
+        "Measure actual drill input latency.",
+        "Determine whether users experience it as objectionable.",
+        "If worthwhile, design the smallest safe interruptible-query refinement."
+      ],
+      "acceptance_criteria": [
+        "Either the existing bounded latency is accepted with evidence, or an evidence-backed refinement is implemented and validated."
+      ],
+      "dependencies": [],
+      "blocked_by": [],
+      "related_decisions": [],
+      "related_legacy_frs": [],
+      "evidence": [
+        "Worst-case keypress latency inside a drill is approximately one drill-query set, roughly 15-50 s on var203.",
+        "x works within budget; this is not a correctness defect."
+      ],
+      "notes": [],
+      "created": "2026-08-16",
+      "updated": "2026-08-16",
+      "completed": null
+    },
+    {
+      "id": "FR11",
+      "title": "Startup-loading UX as general invariant",
+      "priority": 11,
+      "status": "backlog",
+      "class": "architecture",
+      "summary": "Decide whether the startup loading-frame pattern should be codified as a formal invariant for future engines/features, or whether current rule coverage already suffices.",
+      "scope": [
+        "Inspect existing rule coverage (.claude/rules/tui-behavior.md).",
+        "Determine whether the pattern is already sufficiently codified.",
+        "Promote it to a durable invariant only if useful."
+      ],
+      "acceptance_criteria": [
+        "Explicit decision to either codify the pattern generally or leave current behavior as sufficient."
+      ],
+      "dependencies": [],
+      "blocked_by": [],
+      "related_decisions": [],
+      "related_legacy_frs": [],
+      "evidence": [
+        "Carried from the milestone closeout's open decision note (open decision #6 in REFACTOR_HANDOFF)."
+      ],
+      "notes": [],
+      "created": "2026-08-16",
+      "updated": "2026-08-16",
+      "completed": null
+    },
+    {
+      "id": "FR12",
+      "title": "Future monitor consolidation re-evaluation",
+      "priority": 12,
+      "status": "deferred",
+      "class": "deferred",
+      "summary": "Revisit cross-family/headline monitor consolidation only when VAST API behavior changes; the current split is evidence-backed and consolidation is ruled out on var203/5.4.6.",
+      "scope": [
+        "Re-probe merge legality when a new VAST release provides new evidence.",
+        "Only then evaluate whether consolidation is legal and beneficial."
+      ],
+      "acceptance_criteria": [
+        "A future VAST release provides new evidence that consolidation is legal and beneficial; otherwise remain deferred."
+      ],
+      "dependencies": [],
+      "blocked_by": [],
+      "related_decisions": ["D-010"],
+      "related_legacy_frs": [],
+      "evidence": [
+        "var203 VAST OS 5.4.6 rejects the attempted property combinations at query time (HTTP 400 \"can't mix properties\").",
+        "Cross-family behavior has been build-inconsistent."
+      ],
+      "notes": [
+        "Do not spend current engineering time forcing this."
+      ],
+      "created": "2026-08-16",
+      "updated": "2026-08-16",
+      "completed": null
+    }
+  ]
+}

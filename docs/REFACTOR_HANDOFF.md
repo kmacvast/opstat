@@ -784,7 +784,11 @@ The full contract is in [../AGENTS.md](../AGENTS.md#command-and-test-contract).
 
 ## Known defects / unfinished work
 
-Verified against the repository at the time of writing.
+Verified against the repository at the time of writing. **Historical
+record** — the live backlog with current priorities is
+[FR_BACKLOG.json](FR_BACKLOG.json) (rule:
+[../.claude/rules/backlog.md](../.claude/rules/backlog.md)); open items
+below are tracked there by FR number.
 
 ### Outstanding
 
@@ -978,6 +982,10 @@ and S3.
 
 ## Feature backlog (owner-requested FRs)
 
+**Historical record of the refactor-era letter FRs (FR-A..FR-D).** The
+live numeric backlog is [FR_BACKLOG.json](FR_BACKLOG.json); its
+`legacy_frs` map records these outcomes (FR-B's remaining work is FR3).
+
 Lightweight backlog — no external issue tracker. Status is updated in place as
 each FR is folded into engine work.
 
@@ -1119,7 +1127,8 @@ not replace real-VMS validation for cluster-only semantic questions.
    `git status`, `git rev-parse HEAD` vs origin. Note unpublished commits.
 5. Run `./scripts/validate.sh`. Expect ~603 passing on current Python **and**
    3.8, with nothing skipped.
-6. Pick the next item from **Known defects / unfinished work**.
+6. Pick the next item from [FR_BACKLOG.json](FR_BACKLOG.json) — the
+   authoritative backlog and priority order.
 7. Read the relevant [.claude/rules/](../.claude/rules/) file before working in
    its area.
 
