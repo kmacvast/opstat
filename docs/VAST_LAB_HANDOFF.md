@@ -1,177 +1,509 @@
-OPSTAT RETURN
+Yes. I’d make the lab script fully self-contained and establish one hard rule:
 
-#############
-It took only 8 seconds this time to start up the app and get a result screen from the SMB path.  Must have been an anomoly last night in the lab environment. 
+Every transient artifact, API log, raw capture, journal, status file, and scratch file lives under one DTS-named directory beneath ~/kjmtmp/opstat/. The only thing written outside that tree is the final ZIP in $HOME.
 
-  VAST SMB opstat v0.1.2   VMS var203.selab.vastdata.com:443   cluster selab-var-203   refresh 5s
-  sample 2026-08-17T16:11:24Z   frame 10m   source SMBCommon   vast-os-release-5.4.6.0
+I’d also explicitly redirect the process temp environment into that evidence directory via TMPDIR, TMP, and TEMP. That should catch anything using the normal Python/system temporary-directory mechanism. If opstat itself has a literal /tmp/... path hard-coded somewhere, the script will detect that condition rather than silently accepting it.
 
-┌─ SMB HEALTH & WORKLOAD ──────────────────────────────────────────────────────────────────────────────────────────────┐
-│ [ HEALTHY ]   1,776.00 ops/s   ● Lat 944 µs   BW 117.20 MB/s                                                         │
-│ Workload  metadata-elevated mixed workload                                                                           │
-│ Metadata  ████████████░░░░░░░░░░  56.4%                                                                              │
-│ Read      █████░░░░░░░░░░░░░░░░░  21.7%                                                                              │
-│ Write     █████░░░░░░░░░░░░░░░░░  21.9%                                                                              │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+Here’s the complete one-shot script in the format you want:
 
-┌─ PERFORMANCE INSIGHTS ───────────────────────────────────────────────────────────────────────────────────────────────┐
-│ Top Contributor  METADATA  50.0% of ops                                                                              │
-│ Highest Latency  WRITE   ● 1333 µs                                                                                   │
-│ Data Consumer    READ  107.56 MB/s                                                                                   │
-│ Metadata Load    1,002.0 ops/s  (56.4% of total)                                                                     │
-│ Top Client       172.200.14.253 [default]  md 721.9 ops/s                                                            │
-│ Top Share        /kmacs/smb/opstat (opstattest) [default]  md 890.0 ops/s                                            │
-│ Observation      metadata-elevated mixed workload                                                                    │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+#!/usr/bin/env bash
+# ==============================================================================
+# Script Name : opstat-telemetry-targeted-lab.sh
+# Description : Executes the targeted FR1/FR3 telemetry-correctness evidence
+#               pass against the VAST lab cluster.
+#
+#               The script:
+#                 - updates and verifies the opstat repository
+#                 - verifies the exact expected Git SHA
+#                 - verifies credentials and load generators
+#                 - captures client-side NFS and block evidence
+#                 - redirects temporary files into the evidence directory
+#                 - runs the telemetry correctness probe
+#                 - captures API logs and service evidence
+#                 - captures final repository state
+#                 - packages everything into one ZIP file
+#
+# Artifact Rule:
+#               ALL working artifacts are written below:
+#
+#                 $HOME/kjmtmp/opstat/<DTS>/
+#
+#               Nothing from this run should be written to /tmp.
+#
+# Final Output:
+#
+#                 $HOME/opstat-telemetry2-<DTS>.zip
+#
+# Dependencies: git, python3, systemctl, journalctl, zip, unzip, sha256sum
+#
+# Target:
+#               var203.selab.vastdata.com
+#
+# Expected Git:
+#               main @ 17b22240643a7433e43c30241bb6640eae324ca4
+# ==============================================================================
+set -uo pipefail
+EXPECTED_SHA="17b22240643a7433e43c30241bb6640eae324ca4"
+VMS="var203.selab.vastdata.com"
+VMS_USER="admin"
+VIEW_ANCHORS="/kmacs"
+REPO="$HOME/git/opstat"
+BASE="$HOME/kjmtmp/opstat"
+DTS=$(date +%Y%m%d-%H%M%S)
+EV="$BASE/$DTS"
+RAW="$EV/raw"
+RUNTMP="$EV/tmp"
+ARCHIVE="$HOME/opstat-telemetry2-$DTS.zip"
+export VAST_PASSWORD="${VAST_PASSWORD:-123456}"
+mkdir -p "$RAW"
+mkdir -p "$RUNTMP"
+export TMPDIR="$RUNTMP"
+export TMP="$RUNTMP"
+export TEMP="$RUNTMP"
+cd "$REPO" || exit 1
+echo
+echo "======================================================================"
+echo "  OPSTAT TARGETED TELEMETRY CORRECTNESS LAB RUN"
+echo "======================================================================"
+echo
+echo "Run ID       : $DTS"
+echo "Evidence Dir : $EV"
+echo "Final ZIP    : $ARCHIVE"
+echo "Target VMS   : $VMS"
+echo
+echo
+echo "======================================================================"
+echo "  1. UPDATE AND VERIFY REPOSITORY"
+echo "======================================================================"
+git status --short
+git fetch origin
+git checkout main
+git merge --ff-only origin/main
+ACTUAL_SHA=$(git rev-parse HEAD)
+BRANCH=$(git rev-parse --abbrev-ref HEAD)
+echo
+echo "Branch : $BRANCH"
+echo "HEAD   : $ACTUAL_SHA"
+echo "Expect : $EXPECTED_SHA"
+if [ "$BRANCH" != "main" ]; then
+    echo
+    echo "ERROR: Repository is not on main."
+    exit 1
+fi
+if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+    echo
+    echo "ERROR: HEAD DOES NOT MATCH EXPECTED PROBE SHA."
+    echo "Evidence collection will not run against an unexpected revision."
+    exit 1
+fi
+if [ -n "$(git status --short)" ]; then
+    echo
+    echo "ERROR: WORKING TREE IS NOT CLEAN."
+    git status --short
+    exit 1
+fi
+echo
+echo "Repository checkpoint verified."
+echo
+echo "======================================================================"
+echo "  2. VERIFY CREDENTIALS"
+echo "======================================================================"
+if [ -n "${VAST_TOKEN:-}" ]; then
+    echo "Credential : VAST_TOKEN present"
+elif [ -n "${VAST_PASSWORD:-}" ]; then
+    echo "Credential : VAST_PASSWORD present"
+else
+    echo
+    echo "ERROR: No VAST credential available."
+    exit 1
+fi
+echo
+echo "======================================================================"
+echo "  3. VERIFY LOAD GENERATORS"
+echo "======================================================================"
+LOADGEN_OK=1
+for u in nfs3-loadgen nfs41-loadgen block-loadgen smb-loadgen; do
+    STATE=$(systemctl is-active "$u.service" 2>&1 || true)
+    printf "%-18s : %s\n" "$u" "$STATE"
+    case "$u" in
+        nfs3-loadgen|block-loadgen)
+            if [ "$STATE" != "active" ]; then
+                LOADGEN_OK=0
+            fi
+            ;;
+    esac
+done
+echo
+if [ "$LOADGEN_OK" -ne 1 ]; then
+    echo "ERROR: A required load generator is not active."
+    echo
+    echo "Required for this pass:"
+    echo "  nfs3-loadgen.service"
+    echo "  block-loadgen.service"
+    echo
+    echo "Fix the workload before collecting evidence."
+    exit 1
+fi
+echo "Required load generators are active."
+echo
+echo "======================================================================"
+echo "  4. CAPTURE PRE-RUN STATE"
+echo "======================================================================"
+{
+    echo "run id        : $DTS"
+    echo "hostname      : $(hostname)"
+    echo "collected     : $(date '+%F %T %Z')"
+    echo "branch        : $(git rev-parse --abbrev-ref HEAD)"
+    echo "HEAD          : $(git rev-parse HEAD)"
+    echo "expected HEAD : $EXPECTED_SHA"
+    echo "python        : $(python3 -V 2>&1)"
+    echo "target        : $VMS"
+    echo "view anchors  : $VIEW_ANCHORS"
+    echo "TMPDIR        : $TMPDIR"
+    if [ -n "${VAST_TOKEN:-}" ]; then
+        echo "credential    : VAST_TOKEN present"
+    else
+        echo "credential    : VAST_PASSWORD present"
+    fi
+    echo
+    echo "working tree:"
+    git status --short
+    echo
+    echo "load generators:"
+    for u in nfs3-loadgen nfs41-loadgen block-loadgen smb-loadgen; do
+        echo "$u : $(systemctl is-active "$u.service" 2>&1 || true)"
+    done
+    echo
+    echo "recent commits:"
+    git log -10 --oneline --decorate
+    echo
+    echo "tags at HEAD:"
+    git tag --points-at HEAD
+} | tee "$EV/prereqs.txt"
+echo
+echo "======================================================================"
+echo "  5. CAPTURE LOAD GENERATOR STATE"
+echo "======================================================================"
+for u in nfs3-loadgen nfs41-loadgen block-loadgen smb-loadgen; do
+    systemctl status "$u.service" --no-pager -l \
+        > "$EV/${u}-status-before.txt" 2>&1 || true
+    journalctl -u "$u.service" -n 200 --no-pager \
+        > "$EV/${u}-journal-before.txt" 2>&1 || true
+done
+echo
+echo "======================================================================"
+echo "  6. CAPTURE NFS CLIENT STATE BEFORE PROBE"
+echo "======================================================================"
+mount > "$EV/mounts-all.txt" 2>&1
+mount | grep -iE 'type nfs|nfs3|nfs4|vast' \
+    > "$EV/mounts-nfs.txt" 2>&1 || true
+cat /proc/self/mountstats \
+    > "$EV/mountstats-before.txt" 2>&1 || true
+if command -v nfsiostat >/dev/null 2>&1; then
+    nfsiostat 1 3 \
+        > "$EV/nfsiostat-before.txt" 2>&1 || true
+else
+    echo "nfsiostat not installed" \
+        > "$EV/nfsiostat-before.txt"
+fi
+ps -ef \
+    > "$EV/processes-before.txt"
+ps -ef | grep -E '[f]io|[n]fs3|[n]fs41|[b]lock-loadgen' \
+    > "$EV/loadgen-processes-before.txt" 2>&1 || true
+echo
+echo "======================================================================"
+echo "  7. CAPTURE TEMPORARY-FILE BASELINE"
+echo "======================================================================"
+find "$RUNTMP" -maxdepth 2 -type f -print \
+    > "$EV/runtime-files-before.txt"
+find /tmp -maxdepth 1 \
+    -name 'opstat-api-telemetry-probe-*' \
+    -printf '%T@ %p\n' 2>/dev/null \
+    > "$EV/preexisting-tmp-opstat-files.txt" || true
+echo
+echo "======================================================================"
+echo "  8. RUN TARGETED TELEMETRY PROBE"
+echo "======================================================================"
+date '+PROBE-START %F %T %Z' \
+    | tee "$EV/timestamps.txt"
+python3 scripts/var203_validation/probe_telemetry_correctness.py \
+    --vms "$VMS" \
+    --user "$VMS_USER" \
+    --view-paths "$VIEW_ANCHORS" \
+    --evidence-dir "$RAW" \
+    2>&1 | tee "$EV/probe-output.txt"
+PROBE_RC=${PIPESTATUS[0]}
+echo "PROBE-RC $PROBE_RC" \
+    | tee -a "$EV/timestamps.txt"
+date '+PROBE-END %F %T %Z' \
+    | tee -a "$EV/timestamps.txt"
+echo
+echo "Probe return code: $PROBE_RC"
+echo
+echo "======================================================================"
+echo "  9. CAPTURE NFS CLIENT STATE AFTER PROBE"
+echo "======================================================================"
+cat /proc/self/mountstats \
+    > "$EV/mountstats-after.txt" 2>&1 || true
+if command -v nfsiostat >/dev/null 2>&1; then
+    nfsiostat 1 3 \
+        > "$EV/nfsiostat-after.txt" 2>&1 || true
+else
+    echo "nfsiostat not installed" \
+        > "$EV/nfsiostat-after.txt"
+fi
+ps -ef | grep -E '[f]io|[n]fs3|[n]fs41|[b]lock-loadgen' \
+    > "$EV/loadgen-processes-after.txt" 2>&1 || true
+echo
+echo "======================================================================"
+echo "  10. CAPTURE BLOCK CLIENT LATENCY EVIDENCE"
+echo "======================================================================"
+if sudo -n true >/dev/null 2>&1; then
+    sudo -n journalctl \
+        -u block-loadgen.service \
+        -n 400 \
+        --no-pager \
+        > "$EV/block-loadgen-journal-after.txt" 2>&1 || true
+else
+    journalctl \
+        -u block-loadgen.service \
+        -n 400 \
+        --no-pager \
+        > "$EV/block-loadgen-journal-after.txt" 2>&1 || true
+fi
+echo
+echo "======================================================================"
+echo "  11. CAPTURE POST-RUN LOAD GENERATOR STATE"
+echo "======================================================================"
+for u in nfs3-loadgen nfs41-loadgen block-loadgen smb-loadgen; do
+    systemctl status "$u.service" --no-pager -l \
+        > "$EV/${u}-status-after.txt" 2>&1 || true
+    journalctl -u "$u.service" -n 200 --no-pager \
+        > "$EV/${u}-journal-after.txt" 2>&1 || true
+done
+echo
+echo "======================================================================"
+echo "  12. LOCATE THIS RUN'S API LOG"
+echo "======================================================================"
+find "$RUNTMP" -type f -print \
+    > "$EV/runtime-files-after.txt" 2>&1 || true
+APILOG=$(find "$EV" \
+    -type f \
+    -name 'opstat-api-telemetry-probe-*' \
+    -printf '%T@ %p\n' 2>/dev/null \
+    | sort -nr \
+    | head -1 \
+    | cut -d' ' -f2-)
+if [ -n "${APILOG:-}" ] && [ -f "$APILOG" ]; then
+    echo "API log: $APILOG" \
+        | tee "$EV/api-log-location.txt"
+else
+    echo "API log not found beneath evidence directory." \
+        | tee "$EV/api-log-location.txt"
+fi
+echo
+echo "======================================================================"
+echo "  13. VERIFY NOTHING NEW WAS WRITTEN TO /tmp"
+echo "======================================================================"
+find /tmp -maxdepth 1 \
+    -name 'opstat-api-telemetry-probe-*' \
+    -printf '%T@ %p\n' 2>/dev/null \
+    > "$EV/postrun-tmp-opstat-files.txt" || true
+python3 - "$EV/preexisting-tmp-opstat-files.txt" \
+          "$EV/postrun-tmp-opstat-files.txt" \
+          "$EV/tmp-artifact-check.txt" <<'PY'
+import sys
+before_path, after_path, out_path = sys.argv[1:4]
+def read(path):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return set(line.rstrip("\n") for line in fh if line.strip())
+    except OSError:
+        return set()
+before = read(before_path)
+after = read(after_path)
+new = sorted(after - before)
+with open(out_path, "w", encoding="utf-8") as fh:
+    if new:
+        fh.write("FAIL: new opstat telemetry artifacts appeared in /tmp\n")
+        for line in new:
+            fh.write(line + "\n")
+    else:
+        fh.write("PASS: no new opstat telemetry artifacts appeared in /tmp\n")
+if new:
+    print("WARNING: probe created new opstat telemetry artifacts in /tmp")
+else:
+    print("PASS: no new opstat telemetry artifacts created in /tmp")
+PY
+TMP_CHECK_RC=$?
+echo
+echo "======================================================================"
+echo "  14. CAPTURE FINAL REPOSITORY STATE"
+echo "======================================================================"
+git fetch origin
+{
+    echo "branch        : $(git rev-parse --abbrev-ref HEAD)"
+    echo "HEAD          : $(git rev-parse HEAD)"
+    echo "origin/main   : $(git rev-parse origin/main)"
+    echo "expected HEAD : $EXPECTED_SHA"
+    echo
+    echo "working tree:"
+    git status --short
+    echo
+    echo "recent history:"
+    git log -10 --oneline --decorate
+    echo
+    echo "tags at HEAD:"
+    git tag --points-at HEAD
+} > "$EV/git-final-state.txt"
+echo
+echo "======================================================================"
+echo "  15. BUILD MANIFEST"
+echo "======================================================================"
+{
+    echo "OPSTAT TARGETED TELEMETRY EVIDENCE MANIFEST"
+    echo
+    echo "Run ID          : $DTS"
+    echo "Host            : $(hostname)"
+    echo "Start/End:"
+    cat "$EV/timestamps.txt"
+    echo
+    echo "Repository:"
+    echo "  Branch        : $(git rev-parse --abbrev-ref HEAD)"
+    echo "  HEAD          : $(git rev-parse HEAD)"
+    echo "  Expected HEAD : $EXPECTED_SHA"
+    echo
+    echo "Probe:"
+    echo "  Return code   : $PROBE_RC"
+    echo
+    echo "Target:"
+    echo "  VMS           : $VMS"
+    echo "  View anchors  : $VIEW_ANCHORS"
+    echo
+    echo "Artifact root:"
+    echo "  $EV"
+    echo
+    echo "/tmp policy:"
+    cat "$EV/tmp-artifact-check.txt"
+    echo
+    echo "API log:"
+    cat "$EV/api-log-location.txt"
+} > "$EV/MANIFEST.txt"
+echo
+echo "======================================================================"
+echo "  16. INVENTORY EVIDENCE DIRECTORY"
+echo "======================================================================"
+find "$EV" \
+    -type f \
+    -printf '%P\t%k KB\n' \
+    | sort \
+    > "$EV/file-inventory.txt"
+cat "$EV/file-inventory.txt"
+echo
+echo "======================================================================"
+echo "  17. BUILD FINAL ZIP"
+echo "======================================================================"
+rm -f "$ARCHIVE"
+(
+    cd "$BASE" || exit 1
+    zip -qr "$ARCHIVE" "$DTS"
+)
+if [ ! -f "$ARCHIVE" ]; then
+    echo
+    echo "ERROR: ZIP archive was not created."
+    exit 1
+fi
+echo
+echo "======================================================================"
+echo "  18. VERIFY FINAL ZIP"
+echo "======================================================================"
+unzip -t "$ARCHIVE"
+echo
+echo "Archive inventory:"
+unzip -l "$ARCHIVE"
+echo
+echo "======================================================================"
+echo "  19. FINAL RESULT"
+echo "======================================================================"
+echo
+echo "Probe return code : $PROBE_RC"
+echo "Repository HEAD   : $(git rev-parse HEAD)"
+echo "Evidence directory:"
+echo
+echo "  $EV"
+echo
+echo "Final deliverable:"
+echo
+echo "  $ARCHIVE"
+echo
+echo "Archive size:"
+ls -lh "$ARCHIVE"
+echo
+echo "SHA256:"
+sha256sum "$ARCHIVE"
+echo
+echo "Evidence files in /tmp:"
+cat "$EV/tmp-artifact-check.txt"
+echo
+echo "======================================================================"
+if [ "$PROBE_RC" -ne 0 ]; then
+    echo
+    echo "WARNING: Probe returned non-zero."
+    echo "The evidence archive was still preserved for analysis."
+fi
+if [ "$TMP_CHECK_RC" -ne 0 ]; then
+    echo
+    echo "WARNING: Unexpected /tmp artifact check condition."
+fi
+echo
+echo "RETURN THIS ONE FILE:"
+echo
+echo "  $ARCHIVE"
+echo
+echo "======================================================================"
 
-┌─ SMB2 OPCODE WORKFLOW ───────────────────────────────────────────────────────────────────────────────────────────────┐
-│ No active SMB opcodes this refresh                                                                                   │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+One thing I want Claude to change permanently
 
-│ [q] Quit |[c] cNode |[v] View |[t] Tenant |[x] Exit drill |[space] Refresh                                           │
-Cleaning up 1 temporary monitor, please stand by...
+The shell script sets:
 
-real	0m8.686s
-user	0m0.134s
-sys	0m0.036s
-vastdata@kevin-mcdonald-ubu-01:~/git/opstat$
+TMPDIR="$EV/tmp"
+TMP="$EV/tmp"
+TEMP="$EV/tmp"
 
+so any sane temp-file implementation will stay under your run directory. But because we’ve historically seen:
 
-Block only took 12 seconds, both acceptable really. 
+/tmp/opstat-api-telemetry-probe-...
 
-  VAST NVMe-oTCP opstat v0.1.2
-  Cluster selab-var-203   VMS var203.selab.vastdata.com:443   Refresh 5s   vast-os-release-5.4.6.0
-────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-┌─ BLOCK HEALTH & WORKLOAD ────────────────────────────────────────────────────────────────────────────────────────────┐
-│ Scope  All Volumes                                                                                                   │
-│ [ IDLE ]   - ops/s   •  ● - ms   ► 0.380 GB/s                                                                        │
-│ Workload  fabric-overhead dominant / idle data workload                                                              │
-│ Read      ░░░░░░░░░░░░░░░░░░░░░░   0.0%                                                                              │
-│ Write     ░░░░░░░░░░░░░░░░░░░░░░   0.0%                                                                              │
-│ Reclaim   ░░░░░░░░░░░░░░░░░░░░░░   0.0%                                                                              │
-│ Fabric    ██████████████████████  100.0%  of all activity                                                            │
-│ Sample: 2026-08-17T16:14:04Z (warming up - need 2nd sample)   Mode: latest   Frame: 10m                              │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌─ PERFORMANCE INSIGHTS ───────────────────────────────────────────────────────────────────────────────────────────────┐
-│ Top Contributor  FABRIC REQ HANDLE  50.0% of ops                                                                     │
-│ Highest Latency  FABRIC REQ HANDLE   ● 939 µs                                                                        │
-│ Data Consumer    -                                                                                                   │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌─ OPERATIONS ─────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│ Operation                         IOPS      Throughput      Avg Size         Latency                                 │
-├──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
-│ READ                                 -     384.44 MB/s             -               -                                 │
-│ WRITE                                -       4.80 MB/s             -               -                                 │
-│ COMPARE & WRITE                      -               -             -               -                                 │
-│ UNMAP (TRIM)                         -               -             -               -                                 │
-│ WRITE ZEROES                         -               -             -               -                                 │
-│ FABRIC DISCOVERY                     -               -             -               -                                 │
-│ FABRIC REQ HANDLE              1,244.1               -             -          939 µs                                 │
-│ FABRIC XPORT FREE              1,244.1               -             -           25 µs                                 │
-│ ADMIN GET NS                         -               -             -               -                                 │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-  [q] Quit |[c] cNode |[i] VIP |[x] Exit drill |[space] Refresh |[h] Host |[r] Reset stats
-Cleaning up 8 temporary monitors, please stand by...
+I don’t want to merely hope the logging code respects TMPDIR.
 
-real	0m12.178s
-user	0m0.109s
-sys	0m0.030s
-vastdata@kevin-mcdonald-ubu-01:~/git/opstat$
+The script therefore compares /tmp before and after and explicitly tells us whether the probe cheated.
 
+If it reports:
 
-############################
+PASS: no new opstat telemetry artifacts appeared in /tmp
 
-  VAST SMB opstat v0.1.2   VMS var203.selab.vastdata.com:443   cluster selab-var-203   refresh 5s
-  sample 2026-08-17T16:15:44Z   frame 10m   source SMBCommon   vast-os-release-5.4.6.0
+we’re done.
 
-┌─ SMB HEALTH & WORKLOAD ──────────────────────────────────────────────────────────────────────────────────────────────┐
-│ [ MODERATE LATENCY ]   1,754.00 ops/s   ● Lat 1.32 ms   BW 152.03 MB/s                                               │
-│ Workload  metadata-elevated mixed workload                                                                           │
-│ Metadata  ████████████░░░░░░░░░░  56.4%                                                                              │
-│ Read      █████░░░░░░░░░░░░░░░░░  23.1%                                                                              │
-│ Write     █████░░░░░░░░░░░░░░░░░  20.5%                                                                              │
-│ Δ  ▼ -21.00 ops/s   ▲ +25.37 MB/s   ▲ Lat +530.4 µs [WRITE]                                                          │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+If it reports a new /tmp/opstat-api-... file, then the next Claude instruction should be to make the API-log destination honor TMPDIR or an explicit log-directory option. That’s a tooling hygiene change, not production telemetry behavior.
 
-┌─ PERFORMANCE INSIGHTS ───────────────────────────────────────────────────────────────────────────────────────────────┐
-│ Top Contributor  METADATA  50.0% of ops                                                                              │
-│ Highest Latency  WRITE   ● 2113 µs                                                                                   │
-│ Data Consumer    READ  143.02 MB/s                                                                                   │
-│ Metadata Load    989.0 ops/s  (56.4% of total)                                                                       │
-│ Top Client       172.200.14.253 [default]  md 729.3 ops/s                                                            │
-│ Top Share        /kmacs/smb/opstat (opstattest) [default]  md 888.4 ops/s                                            │
-│ Top Δ            READ   ▲ +77.00/s                                                                                   │
-│ Observation      metadata-elevated mixed workload                                                                    │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+From here forward, I’d use this filesystem convention for every lab run:
 
-┌─ SMB2 OPCODE WORKFLOW ───────────────────────────────────────────────────────────────────────────────────────────────┐
-│ No active SMB opcodes this refresh                                                                                   │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+$HOME/
+├── git/
+│   └── opstat/
+│
+├── kjmtmp/
+│   └── opstat/
+│       ├── 20260817-153512/
+│       │   ├── MANIFEST.txt
+│       │   ├── prereqs.txt
+│       │   ├── raw/
+│       │   ├── tmp/
+│       │   └── ...
+│       │
+│       └── 20260817-181304/
+│           └── ...
+│
+└── opstat-telemetry2-20260817-153512.zip
 
-│ [q] Quit |[c] cNode |[v] View |[t] Tenant |[x] Exit drill |[space] Refresh                                           │
-Cleaning up 1 temporary monitor, please stand by...
-
-real	0m35.541s
-user	0m0.242s
-sys	0m0.057s
-vastdata@kevin-mcdonald-ubu-01:~/git/opstat$ cd ~/kjmtmp/opstat/
-vastdata@kevin-mcdonald-ubu-01:~/kjmtmp/opstat$ ls
-opstat-api-nvme-tcp-var203.selab.vastdata.com-443-1344505.log  opstat-api-nvme-tcp-var203.selab.vastdata.com-443-2266877.log  opstat-var203-validation.txt
-opstat-api-nvme-tcp-var203.selab.vastdata.com-443-1924558.log  opstat-api-nvme-tcp-var203.selab.vastdata.com-443-3359875.log
-opstat-api-nvme-tcp-var203.selab.vastdata.com-443-2044111.log  opstat-api-nvme-tcp-var203.selab.vastdata.com-443-3930933.log
-vastdata@kevin-mcdonald-ubu-01:~/kjmtmp/opstat$
-LOG=$(ls -t /tmp/opstat-api-smb-*.log | head -1)
-echo "LOG=$LOG"
-grep -oE "^[0-9-]+ [0-9:]+ (GET|POST|DELETE) [^ ]+ [0-9]+ms" "$LOG" |
-sed -E 's#https://[^ ]+/api##'
-grep -oE " [0-9]+ms" "$LOG" |
-tr -dc '0-9\n' |
-awk '{t+=$1} END {printf "Total API time: %.1fs\n", t/1000}'
-LOG=/tmp/opstat-api-smb-var203.selab.vastdata.com-443-2340242.log
-2026-08-17 16:15:16 GET /clusters/ 497ms
-2026-08-17 16:15:16 POST /monitors/ 207ms
-2026-08-17 16:15:16 GET /monitors/2943/query/ 159ms
-2026-08-17 16:15:16 GET /monitors/2943/query/ 161ms
-2026-08-17 16:15:17 GET /monitors/topn/?object_type=view&prop_list=ViewMetrics,read_iops__rate&time_frame=10m&limit=10 298ms
-2026-08-17 16:15:17 GET /openfilehandles/?protocol=SMB&page_size=8 123ms
-2026-08-17 16:15:22 GET /monitors/2943/query/ 166ms
-2026-08-17 16:15:27 GET /monitors/2943/query/ 326ms
-2026-08-17 16:15:33 GET /monitors/2943/query/ 157ms
-2026-08-17 16:15:38 GET /monitors/2943/query/ 265ms
-2026-08-17 16:15:43 GET /monitors/2943/query/ 165ms
-2026-08-17 16:15:48 GET /monitors/2943/query/ 254ms
-2026-08-17 16:15:49 GET /monitors/topn/?object_type=view&prop_list=ViewMetrics,read_iops__rate&time_frame=10m&limit=10 244ms
-2026-08-17 16:15:49 GET /openfilehandles/?protocol=SMB&page_size=8 207ms
-2026-08-17 16:15:51 DELETE /monitors/2943/ 354ms
-Total API time: 3.6s
-vastdata@kevin-mcdonald-ubu-01:~/kjmtmp/opstat$
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+Nice clean crime-scene bags: every run isolated, timestamped, self-describing, and one ZIP sitting in $HOME waiting to be hauled back.
