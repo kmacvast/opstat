@@ -68,13 +68,15 @@
         "2026-08-17 targeted pass (HEAD 0bced30): NFSv3 workload PROVEN in-window by client mountstats deltas over the 130 s probe (READ 12,273/s, WRITE 6,613/s, plus GETATTR/SETATTR/LOOKUP/CREATE/REMOVE/MKDIR activity) against mount 172.200.202.6:/kmacs (vers=3).",
         "/views/ is a complete bare-list response (239,857 bytes, 147 views, no pagination). No view object has path /kmacs or /kmacs/nfstest - the NFSv3 export maps into the ROOT view (path /, id 1, protocols NFS+NFS4), so per-view NFSv3 attribution is structurally coarse on this cluster layout.",
         "One rank monitor covered all 147 views; the root view scored ~0 while ~18,900 NFSv3 ops/s flowed, and the top-ranked views were SMB/BLOCK/S3/NDB. Strong evidence ViewMetrics does not attribute NFSv3 on 5.4.6 (mirror of D-006's NFSv4 finding), and CONFIRMED that the production NFSv3 VIEW drill's own ranking surfaces other-protocol views inside an NFSv3 screen.",
-        "Neither ViewMetrics nor TenantMetrics carries any NFS protocol discriminator in the catalog; host_view has no NFS series. No source on 5.4.6 can answer 'which views carry NFSv3 right now' per-view."
+        "Neither ViewMetrics nor TenantMetrics carries any NFS protocol discriminator in the catalog; host_view has no NFS series. No source on 5.4.6 can answer 'which views carry NFSv3 right now' per-view.",
+        "2026-08-17 FINAL surgical evidence (lab run fr3-fr1-20260817-220404): with id anchors pinning BOTH path-'/' view objects and client mountstats proving ~12,600 READ/s + 6,800 WRITE/s NFSv3 through the root namespace during the window, ViewMetrics reported id 1 at 0.03 md-ops/s with zero data IOPS/BW, and id 217 at zero across 10 samples. Combined with host_view publishing no NFS series and ViewMetrics having no protocol discriminator: NO VALID NFSV3 VIEW ATTRIBUTION SOURCE ON VAST 5.4.6. The current NFSv3 VIEW drill surfaces other protocols' busiest views under an NFSv3 heading (rank evidence, two runs)."
       ],
       "notes": [
         "2026-08-17: grouped with FR3 into the Telemetry Correctness milestone (coordinated investigation; shared host_view evidence).",
         "2026-08-17 owner decision language: PROVISIONAL KEEP VIEWMETRICS - HIGH confidence that a host_view REBUILD/HYBRID is not viable on 5.4.6 (no NFS host_view series); MEDIUM confidence that ViewMetrics is the final solution, pending the busy-view test (probe never exercised the actual active NFSv3 view).",
         "2026-08-17 targeted-pass verdict: leaning NO VALID NFSV3 VIEW ATTRIBUTION SOURCE ON 5.4.6, pending one surgical check (display-monitor the root view id 1 under load; rank evidence already says ~0). Probe imperfections recorded: --view-paths anchors require exact match and skip silently; duplicate view paths resolve to the last-listed id (id 217 was monitored for '/', not id 1).",
-        "2026-08-17: surgical check prepared - probe --view-ids 1,217 pins both path-'/' view objects; committed lab script scripts/opstat-lab-fr3-fr1-validation.sh runs it under proven NFSv3 load with client-side mountstats deltas. Expected outcome ~0 ViewMetrics activity on both, finalizing NO VALID NFSV3 VIEW ATTRIBUTION SOURCE ON 5.4.6."
+        "2026-08-17: surgical check prepared - probe --view-ids 1,217 pins both path-'/' view objects; committed lab script scripts/opstat-lab-fr3-fr1-validation.sh runs it under proven NFSv3 load with client-side mountstats deltas. Expected outcome ~0 ViewMetrics activity on both, finalizing NO VALID NFSV3 VIEW ATTRIBUTION SOURCE ON 5.4.6.",
+        "2026-08-17: recommended product direction (NOT yet implemented, awaiting owner approval): honest unavailable-state notice on builds without a valid source (D-009/NVMe dead-scope pattern), with future capability detection - use host_view protocol=NFS3 when a build publishes it (5.5.0.1-class evidence) and fall back to the honest notice otherwise. Explicit all-protocol relabel rejected as primary: it keeps a misleading-adjacent panel under an NFSv3 screen while SMB/S3 engines already own their per-protocol view drills."
       ],
       "created": "2026-08-16",
       "updated": "2026-08-17",
@@ -83,7 +85,7 @@
     {
       "id": "FR13",
       "title": "Prominent startup/warm-up UX for slow-to-first-data telemetry paths",
-      "priority": 12,
+      "priority": 11,
       "status": "backlog",
       "class": "ux",
       "summary": "Defensive UX: when first meaningful numbers legitimately take a long time (slow cluster/API periods), the user must immediately see a prominent, plain-English explanation that opstat is connected and preparing data - never a mostly empty screen that looks hung.",
@@ -154,8 +156,8 @@
     {
       "id": "FR3",
       "title": "Latency source-unit certainty",
-      "priority": 3,
-      "status": "in_progress",
+      "priority": 0,
+      "status": "done",
       "class": "correctness",
       "summary": "Remove the remaining uncertainty about native latency units; every user-visible latency source gets a proven unit, explicit conversion and literal regression tests.",
       "scope": [
@@ -185,21 +187,23 @@
         "The planned decisive NFS4 same-family proof is impossible on var203: host_view has no NFS series on 5.4.6. Strongest remaining local proof: pair vast_host_view_read_latency (same op class, present in the raw exposition but not parsed by production) against BlockMetrics read_latency__avg, plus client-side fio latency from the block loadgen.",
         "VolumeMetrics,read_latency__avg at cluster scope is NOT queryable on 5.4.6: monitor created (HTTP 201) but every query returned HTTP 400 'metrics not available' (property_error) - 20/20. The probe summary line 'never nonzero' understated this; the raw API log is authoritative.",
         "2026-08-17 targeted pass: SAME-OP-CLASS pairing - BlockMetrics,read_latency__avg vs raw vast_host_view_read_latency (BLOCK) - 6 paired nonzero samples: 581.33-727.01 vs constant 0.64; ratio min 908.3 / max 1136.0 / median 969.1 / mean 987.6. VERY STRONG EVIDENCE: host_view latency gauges are milliseconds, BlockMetrics microseconds. Implementation may proceed on this; no further real-VMS evidence required for the FR3 host_view fix.",
-        "VolumeMetrics at VOLUME scope (2 of 16 volumes): queries succeeded (no property_error, unlike cluster scope) but every sample returned no complete value in the window - queryable, unit still unproven."
+        "VolumeMetrics at VOLUME scope (2 of 16 volumes): queries succeeded (no property_error, unlike cluster scope) but every sample returned no complete value in the window - queryable, unit still unproven.",
+        "2026-08-17 REAL-VMS VALIDATED (lab run fr3-fr1-20260817-220404, HEAD 4374f21): the implemented D-014 conversion verified against live data - raw hv_read 0.59-0.65 vs BlockMetrics 577-651 (6 pairs, ratio 902.7-1032.9, median 913.6, re-confirming ms); production parse_host_view produced 787.7 us vs BlockMetrics 581.1 us (combined-vs-read ratio 0.69, same microsecond band) - the ~1000x understatement is eliminated through the real production parser path. fr3.production_conversion PASS; exact-id cleanup PASS. Final unit ledger: Nfs4Metrics us PROVEN (D-003); NFS4Common us PROVEN; host_view ms VERY STRONG EVIDENCE + implemented (D-014); BlockMetrics us VERY STRONG EVIDENCE (no display change needed); SMB/S3 ProtoMetrics us STRONG INFERENCE; SmbMetrics/S3Metrics/ViewMetrics/TenantMetrics per-op us ASSUMED (displays already consistent, no change warranted); VolumeMetrics UNKNOWN (cluster scope unqueryable, volume scope null-valued in sampled windows). Catalog units field is display convention (D-015)."
       ],
       "notes": [
         "2026-08-17: grouped with FR1 into the Telemetry Correctness milestone (coordinated investigation; shared host_view evidence).",
         "2026-08-17: host_view latency unit -> CONTRADICTORY-to-current-code (strong inference: ms). Production nfs4_native stores it as latency_us and nfs_v41 h/v drills format it as microseconds - a likely ~1000x understatement on builds where NFS host_view series exist (e.g. 5.5.0.1); on 5.4.6 those panels render their honest empty state, so the defect is latent on var203.",
-        "2026-08-17: D-014 fix IMPLEMENTED - parse_host_view converts the ms gauge to us at ingestion; decision records D-014 (host_view latency is milliseconds) and D-015 (catalog units field is display convention) recorded; literal regression test pins 0.64 -> 640 us. Real-VMS validation of the implemented conversion rides in scripts/opstat-lab-fr3-fr1-validation.sh (fr3.production_conversion verdict). Remaining scope: SMB/S3 per-op stay ASSUMED, VolumeMetrics unit unproven (volume scope queryable, values null in the sampled window)."
+        "2026-08-17: D-014 fix IMPLEMENTED - parse_host_view converts the ms gauge to us at ingestion; decision records D-014 (host_view latency is milliseconds) and D-015 (catalog units field is display convention) recorded; literal regression test pins 0.64 -> 640 us. Real-VMS validation of the implemented conversion rides in scripts/opstat-lab-fr3-fr1-validation.sh (fr3.production_conversion verdict). Remaining scope: SMB/S3 per-op stay ASSUMED, VolumeMetrics unit unproven (volume scope queryable, values null in the sampled window).",
+        "2026-08-17: DONE. The actionable defect (host_view ~1000x) is fixed and real-VMS validated; remaining sources are recorded at their honest confidence with no code change warranted. Contradictory future evidence opens a new FR, not this one."
       ],
       "created": "2026-08-16",
       "updated": "2026-08-17",
-      "completed": null
+      "completed": "2026-08-17"
     },
     {
       "id": "FR4",
       "title": "Exporter scrape responsiveness",
-      "priority": 4,
+      "priority": 3,
       "status": "backlog",
       "class": "performance",
       "summary": "Determine with measurement whether the synchronous exporter scrape causes objectionable TUI stalls; do not change architecture on this FR alone.",
@@ -232,7 +236,7 @@
     {
       "id": "FR5",
       "title": "Windows validation / CI coverage",
-      "priority": 5,
+      "priority": 4,
       "status": "backlog",
       "class": "platform",
       "summary": "Exercise the Windows path instead of merely guarding it syntactically; the release workflow ships a Windows executable that no CI runs.",
@@ -261,7 +265,7 @@
     {
       "id": "FR6",
       "title": "Protocol API-efficiency re-audit",
-      "priority": 6,
+      "priority": 5,
       "status": "backlog",
       "class": "performance",
       "summary": "Establish a fresh post-refactor API-cost baseline for all five engines; audit only, no optimization in this FR.",
@@ -297,7 +301,7 @@
     {
       "id": "FR7",
       "title": "Release / product hardening",
-      "priority": 7,
+      "priority": 6,
       "status": "backlog",
       "class": "release",
       "summary": "Make opstat cleanly installable, documented, packaged and releasable from a fresh environment on supported systems.",
@@ -328,7 +332,7 @@
     {
       "id": "FR8",
       "title": "Validation tooling disposition",
-      "priority": 8,
+      "priority": 7,
       "status": "backlog",
       "class": "technical_debt",
       "summary": "Decide deliberately which refactor-era probe/validator machinery becomes permanent, and archive or remove the rest safely.",
@@ -358,7 +362,7 @@
     {
       "id": "FR9",
       "title": "Validator attribution polish",
-      "priority": 9,
+      "priority": 8,
       "status": "backlog",
       "class": "technical_debt",
       "summary": "Fix the two non-blocking Round-5B attribution imperfections found in the raw API log; validator precision only, not production defects.",
@@ -387,7 +391,7 @@
     {
       "id": "FR10",
       "title": "Drill input responsiveness refinement",
-      "priority": 10,
+      "priority": 9,
       "status": "backlog",
       "class": "performance",
       "summary": "Evaluate whether the drill-query loop should become input-aware like the headline loop; measure first, refine only if users experience the bounded latency as objectionable.",
@@ -415,7 +419,7 @@
     {
       "id": "FR11",
       "title": "Startup-loading UX as general invariant",
-      "priority": 11,
+      "priority": 10,
       "status": "backlog",
       "class": "architecture",
       "summary": "Decide whether the startup loading-frame pattern should be codified as a formal invariant for future engines/features, or whether current rule coverage already suffices.",
