@@ -61,12 +61,14 @@
       "related_legacy_frs": [],
       "evidence": [
         "Current NFSv3 VIEW path still uses ViewMetrics.",
-        "host_view carries protocol=NFS3.",
         "The NFSv4.1 host_view rebuild may be portable.",
-        "Recorded at milestone close as the largest remaining honest-telemetry opportunity."
+        "Recorded at milestone close as the largest remaining honest-telemetry opportunity.",
+        "2026-08-17 real-VMS run (var203/5.4.6, HEAD fa79751): host_view publishes NO NFS series under any protocol label (0 matches in the raw exposition) while heavy live NFSv3 fio traffic was proven running - only BLOCK/NDB/S3/SMB2 appear. The 'host_view carries protocol=NFS3' premise is build-dependent and FALSE on 5.4.6; a rebuild/hybrid on host_view is not viable on the supported cluster.",
+        "Same run: ViewMetrics view-scope batch monitor (8 views, one create, no_aggregation) worked correctly and returned measured zeros - but the probe monitored head-of-list idle views, not the loadgen's /kmacs view, so whether ViewMetrics attributes the NFSv3 load remains the one open FR1 fact."
       ],
       "notes": [
-        "2026-08-17: grouped with FR3 into the Telemetry Correctness milestone (coordinated investigation; shared host_view evidence)."
+        "2026-08-17: grouped with FR3 into the Telemetry Correctness milestone (coordinated investigation; shared host_view evidence).",
+        "2026-08-17 owner decision language: PROVISIONAL KEEP VIEWMETRICS - HIGH confidence that a host_view REBUILD/HYBRID is not viable on 5.4.6 (no NFS host_view series); MEDIUM confidence that ViewMetrics is the final solution, pending the busy-view test (probe never exercised the actual active NFSv3 view)."
       ],
       "created": "2026-08-16",
       "updated": "2026-08-17",
@@ -171,10 +173,15 @@
       "evidence": [
         "Nfs4Metrics latency is proven microseconds.",
         "Three generic cross-check attempts failed to produce a useful non-zero known-microseconds reference (idle NFS4 windows).",
-        "Magnitude alone is not proof; displays remain unchanged and marked UNVERIFIED until evidence is decisive."
+        "Magnitude alone is not proof; displays remain unchanged and marked UNVERIFIED until evidence is decisive.",
+        "2026-08-17 real-VMS run: the /metrics/ catalog carries a per-metric 'units' field, but it labels *_latency__avg 'ms' uniformly INCLUDING the D-003-proven-raw-microseconds NFS4Common metric, and is self-inconsistent (KafkaViewMetrics/qos 'us') - it reflects the VMS UI display convention, not the wire value. Exporter # HELP text and the 19.6 MB swagger carry no unit information. Mechanism A is exhausted.",
+        "Block pairing, 20 paired nonzero samples: BlockMetrics read_latency__avg 576.6-683.1 (median 619.5) vs vast_host_view_latency BLOCK 0.811-0.873 (median 0.838); ratio 663-815, median 739, mean 745 +/- 46. Only consistent with BlockMetrics=us and host_view=ms (a ~0.74 semantic factor from combined-vs-read-only latency and differing windows); rules out same-unit and ns. host_view-as-us is CONTRADICTED.",
+        "The planned decisive NFS4 same-family proof is impossible on var203: host_view has no NFS series on 5.4.6. Strongest remaining local proof: pair vast_host_view_read_latency (same op class, present in the raw exposition but not parsed by production) against BlockMetrics read_latency__avg, plus client-side fio latency from the block loadgen.",
+        "VolumeMetrics,read_latency__avg at cluster scope is NOT queryable on 5.4.6: monitor created (HTTP 201) but every query returned HTTP 400 'metrics not available' (property_error) - 20/20. The probe summary line 'never nonzero' understated this; the raw API log is authoritative."
       ],
       "notes": [
-        "2026-08-17: grouped with FR1 into the Telemetry Correctness milestone (coordinated investigation; shared host_view evidence)."
+        "2026-08-17: grouped with FR1 into the Telemetry Correctness milestone (coordinated investigation; shared host_view evidence).",
+        "2026-08-17: host_view latency unit -> CONTRADICTORY-to-current-code (strong inference: ms). Production nfs4_native stores it as latency_us and nfs_v41 h/v drills format it as microseconds - a likely ~1000x understatement on builds where NFS host_view series exist (e.g. 5.5.0.1); on 5.4.6 those panels render their honest empty state, so the defect is latent on var203."
       ],
       "created": "2026-08-16",
       "updated": "2026-08-17",
