@@ -229,7 +229,58 @@ def test_run_probes_contains_a_raising_section(monkeypatch):
                         lambda *a: ran.append("fr1"))
     monkeypatch.setattr(probe, "probe_latency_units",
                         lambda *a: ran.append("fr3"))
-    args = type("A", (), {"attempts": 1, "interval": 0})()
+    args = type("A", (), {"attempts": 1, "interval": 0, "view_paths": ""})()
     probe.run_probes(args, cluster_id=1)
     assert ran == ["fr1", "fr3"], "later sections did not run after a failure"
     assert any("metadata.section FAIL" in line for line in probe.SUMMARY)
+
+
+# ---------------------------------------------------------------------------
+# Second-pass helpers: raw field series, ratio stats, anchored targeting
+# ---------------------------------------------------------------------------
+_EXPO2 = "\n".join([
+    'vast_host_view_read_latency{ip="1.1.1.1",path="/kmacs/block",protocol="BLOCK",tenant="t"} 0.62',
+    'vast_host_view_write_latency{ip="1.1.1.1",path="/kmacs/block",protocol="BLOCK",tenant="t"} 1.4',
+    'vast_host_view_latency{ip="1.1.1.1",path="/kmacs/block",protocol="BLOCK",tenant="t"} 0.84',
+    'vast_host_view_read_latency{ip="2.2.2.2",path="/x",protocol="SMB2",tenant="t"} 9.9',
+])
+
+
+def test_host_view_field_series_isolates_field_and_protocol():
+    """read_latency must not be conflated with write_latency or the combined
+    gauge, and other protocols must not leak in - the read-vs-read pairing
+    is only same-op-class if the extraction is exact."""
+    probe = _load_probe()
+    assert probe.host_view_field_series(_EXPO2, "read_latency", "BLOCK") == [0.62]
+    assert probe.host_view_field_series(_EXPO2, "write_latency", "BLOCK") == [1.4]
+    assert probe.host_view_field_series(_EXPO2, "latency", "BLOCK") == [0.84]
+    assert probe.host_view_field_series(_EXPO2, "read_latency", "SMB2") == [9.9]
+    assert probe.host_view_field_series(_EXPO2, "read_latency", "NFS3") == []
+
+
+def test_ratio_stats_over_paired_samples():
+    probe = _load_probe()
+    stats = probe.ratio_stats([(620.0, 0.62), (700.0, 0.70), (0, 0.5), (500.0, None)])
+    assert stats["count"] == 2
+    assert abs(stats["median"] - 1000.0) < 1e-9
+    assert abs(stats["min"] - 1000.0) < 1e-9
+    assert probe.ratio_stats([]) is None
+    assert probe.ratio_stats([(0, 1.0)]) is None
+
+
+def test_choose_target_views_anchors_win_then_rank_order():
+    """The 2026-08-17 run monitored eight idle head-of-list views while the
+    busy /kmacs view went unsampled; anchors must make that impossible."""
+    probe = _load_probe()
+    views = [{"id": i, "path": "/v%d" % i} for i in range(10)]
+    views.append({"id": 99, "path": "/kmacs"})
+    ranked = [{"id": 3, "name": "/v3"}, {"id": 1, "name": "/v1"},
+              {"id": 99, "name": "/kmacs"}]
+    targets = probe.choose_target_views(views, ranked, ["/kmacs"], cap=3)
+    assert targets[0] == ("/kmacs", 99), "anchor must be sampled first"
+    assert targets[1:] == [("/v3", 3), ("/v1", 1)]
+    # anchor deduplicated when the ranking also found it
+    assert len([p for p, _ in targets if p == "/kmacs"]) == 1
+    # unknown anchor paths are skipped, not fabricated
+    none = probe.choose_target_views(views, [], ["/does-not-exist"])
+    assert none == []

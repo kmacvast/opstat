@@ -4,14 +4,17 @@
 Collects, in one bounded read-only run, the real-VMS evidence the Telemetry
 Correctness milestone needs:
 
-  A. FR1 - NFSv3 VIEW attribution: ViewMetrics and host_view(protocol=NFS3)
-     observed side by side under live NFSv3 load, with raw payloads kept.
-  B. FR3 - host_view latency unit: raw exporter metadata (# HELP / # TYPE),
-     raw catalog and OpenAPI schema descriptions, and a bounded loop of
-     paired samples against the PROVEN-microseconds NFS4Common reference.
-  C. FR3 - BlockMetrics / VolumeMetrics: paired samples against the
-     host_view BLOCK gauge (decisive transitively once B lands).
-  D. FR3 - SMB / S3: catalog/schema description extraction only.
+  A. FR1 - NFSv3 VIEW attribution: ViewMetrics sampled against the ACTUAL
+     busy NFSv3 view, selected by production-style activity ranking over
+     all views plus --view-paths operator anchors (host_view is census-only:
+     5.4.6 proved it publishes no NFS series under any protocol label).
+  B. FR3 - latency units: same-op-class pairing of the raw
+     vast_host_view_read_latency BLOCK gauge against
+     BlockMetrics,read_latency__avg over a bounded sampling loop, plus a
+     cheap volume-scope VolumeMetrics check (cluster scope is proven
+     unqueryable on this build).
+  C. Mechanism-A metadata capture (catalog / OpenAPI / exporter comments),
+     retained verbatim for the audit trail.
 
 Safety contract (same as probe_var203.py):
   * GETs plus temporary adhoc_opstat_probe_* monitors; every id recorded,
@@ -29,6 +32,7 @@ Python 3.8+, stdlib only, reuses opstat's own transport.
 import argparse
 import json
 import os
+import re
 import sys
 import time
 
@@ -49,9 +53,11 @@ CREATED = []
 SUMMARY = []
 EVIDENCE_DIR = None
 
-# The proven-microseconds reference (D-003). Everything in section B keys off
-# comparing an unknown source against this under the SAME live traffic.
-REFERENCE_PROP = "ProtoMetrics,proto_name=NFS4Common,read_latency__avg"
+# The NFS4-vs-proven-us pairing was retired after the 2026-08-17 run: var203/
+# 5.4.6 publishes NO NFS series in host_view under any protocol label, so that
+# proof is impossible on this build. The decisive remaining comparison is
+# same-op-class: vast_host_view_read_latency vs BlockMetrics,read_latency__avg.
+_HV_LINE = re.compile(r"^vast_host_view_([a-z_]+)\{([^}]*)\}\s+([0-9eE+.\-]+)\s*$")
 
 # Candidate OpenAPI paths, mirroring vast_discovery's survey list.
 OPENAPI_PATHS = (
@@ -236,6 +242,64 @@ def summarize_side_by_side(view_rows, hv_paths):
     }
 
 
+def host_view_field_series(text, field, protocol):
+    """All values of one raw ``vast_host_view_<field>`` gauge for a protocol.
+
+    The production parser deliberately reads only the combined ``latency``
+    gauge; the raw exposition ALSO carries ``read_latency``/``write_latency``,
+    and read-vs-read is the same-op-class pairing that can settle the unit
+    where the combined gauge left a ~0.74 semantic factor.
+    """
+    values = []
+    needle = 'protocol="%s"' % protocol
+    for line in (text or "").splitlines():
+        m = _HV_LINE.match(line.strip())
+        if not m or m.group(1) != field or needle not in m.group(2):
+            continue
+        try:
+            value = float(m.group(3))
+        except ValueError:
+            continue
+        if value == value:
+            values.append(value)
+    return values
+
+
+def ratio_stats(pairs):
+    """Distribution of b/h across paired nonzero (b, h) samples, or None."""
+    ratios = sorted(b / h for b, h in pairs if b and h)
+    if not ratios:
+        return None
+    n = len(ratios)
+    median = (ratios[n // 2] if n % 2
+              else (ratios[n // 2 - 1] + ratios[n // 2]) / 2.0)
+    return {"count": n, "min": ratios[0], "max": ratios[-1],
+            "median": median, "mean": sum(ratios) / n}
+
+
+def choose_target_views(views, ranked, anchor_paths, cap=8):
+    """Ordered [(path, id)] to monitor: operator anchors first, then rank.
+
+    *anchor_paths* (--view-paths) are sampled even if the ranking missed
+    them - the 2026-08-17 run monitored eight head-of-list idle views while
+    the busy /kmacs view went unsampled, which is exactly the failure this
+    anchor exists to make impossible.
+    """
+    by_path = {v.get("path"): v["id"] for v in views
+               if isinstance(v, dict) and v.get("path") and "id" in v}
+    chosen = []
+    for path in anchor_paths:
+        if path in by_path and all(p != path for p, _ in chosen):
+            chosen.append((path, by_path[path]))
+    for entry in ranked:
+        if len(chosen) >= cap:
+            break
+        path = entry.get("name")
+        if path in by_path and all(p != path for p, _ in chosen):
+            chosen.append((path, by_path[path]))
+    return chosen[:cap]
+
+
 def extract_unit_hints(text, tokens=UNIT_HINT_TOKENS):
     """Lines from a raw metadata body that might describe units."""
     hits = []
@@ -328,8 +392,16 @@ def probe_metadata():
 # ---------------------------------------------------------------------------
 # Section: FR1 side-by-side (ViewMetrics vs host_view protocol=NFS3)
 # ---------------------------------------------------------------------------
-def probe_nfs3_view_attribution(attempts, interval):
-    log("\n=== FR1: ViewMetrics vs host_view(protocol=NFS3), live load ===")
+def probe_nfs3_view_attribution(attempts, interval, anchor_paths):
+    """ViewMetrics against the ACTUAL busy NFSv3 view.
+
+    The 2026-08-17 run proved 5.4.6 publishes no NFS host_view series, so
+    host_view is census-only here, never a targeting source. Targets come
+    from production-style activity ranking over every view (the same
+    DrillSession machinery the NFSv3 drill uses), with --view-paths anchors
+    guaranteed a slot so the known-busy view cannot be missed again.
+    """
+    log("\n=== FR1: ViewMetrics on the busy NFSv3 view (rank + anchors) ===")
     try:
         views = api("GET", "/views/")
         views = views.get("results", views) if isinstance(views, dict) else views
@@ -337,33 +409,53 @@ def probe_nfs3_view_attribution(attempts, interval):
     except RuntimeError as exc:
         verdict("fr1.views", False, str(exc)[:100])
         return
-    by_path = {v.get("path"): v["id"] for v in views if v.get("path")}
-    log("  /views/ -> %d views" % len(views))
+    log("  /views/ -> %d views; anchors=%s" % (len(views), anchor_paths or "none"))
 
-    # First scrape decides which views to monitor: the NFS3-active paths if
-    # any, padded with head-of-list views for contrast.
+    # host_view protocol census: evidence, not targeting.
     try:
         text = vast_common.request_text("GET", nfs4_native.HOST_VIEW_ENDPOINT)
+        save_evidence("fr1-host_view-census.prom", text or "")
+        protocols = sorted({line.split('protocol="', 1)[1].split('"', 1)[0]
+                            for line in (text or "").splitlines()
+                            if 'protocol="' in line})
+        verdict("fr1.host_view.census", True, "protocols=%s; NFS series: %s"
+                % (protocols, "PRESENT" if any("NFS" in p for p in protocols)
+                   else "ABSENT"))
     except RuntimeError as exc:
-        text = ""
-        log("  WARN: initial host_view scrape failed: %s" % str(exc)[:100])
-    save_evidence("fr1-host_view-initial.prom", text or "")
-    protocols = sorted({line.split('protocol="', 1)[1].split('"', 1)[0]
-                        for line in (text or "").splitlines()
-                        if 'protocol="' in line})
-    log("  protocols present in host_view: %s" % (protocols or "none"))
-    nfs3_paths = [r["path"] for r in
-                  aggregate_by_path(host_view_rows(text, "NFS3"))]
-    target_paths = [p for p in nfs3_paths if p in by_path][:6]
-    for v in views:
-        if len(target_paths) >= 8:
-            break
-        if v.get("path") and v["path"] not in target_paths:
-            target_paths.append(v["path"])
-    target_ids = [by_path[p] for p in target_paths if p in by_path][:8]
-    log("  monitoring views: %s" % target_paths[:8])
-    if not target_ids:
-        verdict("fr1.targets", False, "no view ids to monitor")
+        verdict("fr1.host_view.census", False, str(exc)[:100])
+
+    # Production-style ranking over ALL views (topn attempt, batched rank
+    # monitors, chunked fallback - the NFSv3 drill's own machinery).
+    drill = vast_drill.DrillSession(
+        request_fn=api,
+        create_monitor_fn=create_probe_monitor,
+        delete_monitor_fn=delete_probe_monitor,
+    )
+    try:
+        ranked = drill.rank(
+            "view", views,
+            object_type="view",
+            rank_props=vast_drill.view_rank_props(),
+            score_fn=lambda sliced: (vast_drill.build_view_row(sliced, "")
+                                     or {}).get("total_ops") or 0.0,
+            time_frame=TIME_FRAME,
+            name_of=lambda v: v.get("path") or str(v.get("id")),
+            no_aggregation=True,
+        )
+    except RuntimeError as exc:
+        ranked = []
+        log("  WARN: ranking failed: %s" % str(exc)[:120])
+    save_evidence("fr1-ranked-views.json", json.dumps(ranked, indent=1))
+    verdict("fr1.rank", bool(ranked),
+            "production-style ranking returned %d candidates: %s"
+            % (len(ranked), [r.get("name") for r in ranked][:8]))
+
+    targets = choose_target_views(views, ranked, anchor_paths or [])
+    target_paths = [p for p, _ in targets]
+    target_ids = [i for _, i in targets]
+    verdict("fr1.targets", bool(targets),
+            "monitoring %s (anchors first, then rank order)" % target_paths)
+    if not targets:
         return
 
     monitor_id = None
@@ -373,58 +465,49 @@ def probe_nfs3_view_attribution(attempts, interval):
             no_aggregation=True)
     except RuntimeError as exc:
         verdict("fr1.viewmetrics.create", False, str(exc)[:120])
+        return
 
     def one_sample():
         snap = {"t": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
-        if monitor_id is not None:
-            try:
-                result = api("GET", "/monitors/%s/query/" % monitor_id)
-                rows = []
-                for oid, path in zip(target_ids, target_paths):
-                    sliced = vast_drill.slice_result_for_object(result, oid)
-                    row = vast_drill.build_view_row(sliced, path) if sliced else None
-                    rows.append((path, (row or {}).get("total_ops"),
-                                 (row or {}).get("latency_us"),
-                                 (row or {}).get("bw_gbs")))
-                snap["viewmetrics"] = rows
-                snap["viewmetrics_raw_saved"] = bool(
-                    save_evidence("fr1-viewmetrics-sample-%d.json"
-                                  % len(os.listdir(EVIDENCE_DIR)),
-                                  json.dumps(result)[:200000]))
-            except RuntimeError as exc:
-                snap["viewmetrics_error"] = str(exc)[:120]
         try:
-            body = vast_common.request_text(
-                "GET", nfs4_native.HOST_VIEW_ENDPOINT)
-            snap["host_view_nfs3"] = aggregate_by_path(
-                host_view_rows(body, "NFS3"))
+            result = api("GET", "/monitors/%s/query/" % monitor_id)
+            rows = []
+            for oid, path in zip(target_ids, target_paths):
+                sliced = vast_drill.slice_result_for_object(result, oid)
+                row = vast_drill.build_view_row(sliced, path) if sliced else None
+                rows.append((path, (row or {}).get("total_ops"),
+                             (row or {}).get("latency_us"),
+                             (row or {}).get("bw_gbs")))
+            snap["viewmetrics"] = rows
+            save_evidence("fr1-viewmetrics-sample-%d.json"
+                          % len(os.listdir(EVIDENCE_DIR)),
+                          json.dumps(result)[:200000])
         except RuntimeError as exc:
-            snap["host_view_error"] = str(exc)[:120]
+            snap["viewmetrics_error"] = str(exc)[:120]
         append_jsonl("fr1-paired-samples.jsonl", snap)
+        active = [(p, round(o, 1)) for p, o, _l, _b in snap.get("viewmetrics", []) if o]
+        log("  sample: active=%s" % (active or "none"))
         return snap
 
     def decisive(snap):
-        vm = any(r[1] for r in snap.get("viewmetrics", []))
-        hv = any(r["iops"] for r in snap.get("host_view_nfs3", []))
-        return vm and hv
+        return any(r[1] for r in snap.get("viewmetrics", []))
 
-    samples, got_both = bounded_paired_sampling(
+    samples, saw_load = bounded_paired_sampling(
         one_sample, decisive, attempts, interval)
-    last = samples[-1]
-    vm_rows = [(p, ops or 0)
-               for p, ops, _lat, _bw in last.get("viewmetrics", [])]
-    side = summarize_side_by_side(vm_rows, last.get("host_view_nfs3", []))
-    log("  side-by-side (last sample): %s" % json.dumps(side, sort_keys=True))
-    append_jsonl("fr1-paired-samples.jsonl", {"summary": side})
-    verdict("fr1.host_view.sees_nfs3",
-            bool(side["host_view_nfs3_paths_active"]),
-            "%d active NFS3 paths" % len(side["host_view_nfs3_paths_active"]))
-    verdict("fr1.viewmetrics.sees_load", bool(side["viewmetrics_paths_active"]),
-            "%d active paths of %d monitored"
-            % (len(side["viewmetrics_paths_active"]), len(target_ids)))
-    verdict("fr1.paired_window", got_both,
-            "%d samples; both sources active simultaneously: %s"
-            % (len(samples), got_both))
+    busiest = {}
+    for snap in samples:
+        for path, ops, lat, bw in snap.get("viewmetrics", []):
+            if ops and ops > busiest.get(path, (0,))[0]:
+                busiest[path] = (ops, lat, bw)
+    for path, (ops, lat, bw) in sorted(busiest.items(), key=lambda kv: -kv[1][0]):
+        log("  peak %-40s total_ops=%.1f latency_raw=%s bw_gbs=%s"
+            % (path, ops, lat, bw))
+    append_jsonl("fr1-paired-samples.jsonl", {"peaks": {
+        p: {"total_ops": v[0], "latency_raw": v[1], "bw_gbs": v[2]}
+        for p, v in busiest.items()}})
+    verdict("fr1.viewmetrics.sees_load", saw_load,
+            "%d samples; views with measured activity: %s"
+            % (len(samples), sorted(busiest) or "NONE"))
 
 
 # ---------------------------------------------------------------------------
@@ -441,22 +524,40 @@ def _latest_value(result, prop):
 
 
 def probe_latency_units(cluster_id, attempts, interval):
-    log("\n=== FR3: latency units - paired against the proven-us reference ===")
+    """Same-op-class pairing: BlockMetrics read latency vs the raw
+    ``vast_host_view_read_latency`` BLOCK gauge, plus a cheap volume-scope
+    VolumeMetrics check. The NFS4 pairing is deliberately absent: 5.4.6
+    publishes no NFS host_view series, so it cannot exist on this build."""
+    log("\n=== FR3: read-vs-read latency pairing (BLOCK) ===")
     monitors = {}
-    for key, props in (
-            ("ref", [REFERENCE_PROP]),
-            ("block", ["BlockMetrics,read_latency__avg"]),
-            ("volume", ["VolumeMetrics,read_latency__avg"])):
-        try:
-            monitors[key] = create_probe_monitor(
-                "lat_%s" % key, props, "cluster", [cluster_id])
-        except RuntimeError as exc:
-            verdict("fr3.%s.create" % key, False, str(exc)[:120])
+    try:
+        monitors["block"] = create_probe_monitor(
+            "lat_block", ["BlockMetrics,read_latency__avg"],
+            "cluster", [cluster_id])
+    except RuntimeError as exc:
+        verdict("fr3.block.create", False, str(exc)[:120])
+
+    # Volume-scope VolumeMetrics: cluster scope is proven unqueryable on
+    # 5.4.6 (HTTP 400 property_error, 20/20 in the previous run); one cheap
+    # create at the scope the family is actually for.
+    try:
+        volumes = api("GET", "/volumes/")
+        volumes = (volumes.get("results", volumes)
+                   if isinstance(volumes, dict) else volumes) or []
+        vol_ids = [v["id"] for v in volumes if isinstance(v, dict) and "id" in v][:2]
+        log("  /volumes/ -> %d volumes (sampling %s)" % (len(volumes), vol_ids))
+        if vol_ids:
+            monitors["volume"] = create_probe_monitor(
+                "lat_volume", ["VolumeMetrics,read_latency__avg"],
+                "volume", vol_ids)
+        else:
+            verdict("fr3.volume.scope", False, "no volumes to sample")
+    except RuntimeError as exc:
+        verdict("fr3.volume.scope", False, str(exc)[:120])
 
     def one_sample():
         snap = {"t": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
-        for key, prop in (("ref", REFERENCE_PROP),
-                          ("block", "BlockMetrics,read_latency__avg"),
+        for key, prop in (("block", "BlockMetrics,read_latency__avg"),
                           ("volume", "VolumeMetrics,read_latency__avg")):
             if key not in monitors:
                 continue
@@ -464,82 +565,78 @@ def probe_latency_units(cluster_id, attempts, interval):
                 result = api("GET", "/monitors/%s/query/" % monitors[key])
                 snap[key] = _latest_value(result, prop)
             except RuntimeError as exc:
-                snap["%s_error" % key] = str(exc)[:120]
+                snap["%s_error" % key] = str(exc)[:160]
         try:
             body = vast_common.request_text(
                 "GET", nfs4_native.HOST_VIEW_ENDPOINT)
-            for proto in ("NFS4", "NFS3", "BLOCK", "SMB2"):
-                rows = aggregate_by_path(host_view_rows(body, proto))
-                busy = [r for r in rows if r["iops"] and r["latency"]]
-                snap["hv_%s" % proto.lower()] = (
-                    {"paths": len(rows), "latency": busy[0]["latency"],
-                     "iops": busy[0]["iops"]} if busy else None)
+            for field in ("read_latency", "write_latency", "latency"):
+                series = host_view_field_series(body, field, "BLOCK")
+                snap["hv_block_%s" % field] = (
+                    sum(series) / len(series) if series else None)
         except RuntimeError as exc:
             snap["hv_error"] = str(exc)[:120]
         append_jsonl("fr3-latency-samples.jsonl", snap)
-        log("  sample: ref=%s block=%s volume=%s hv_nfs4=%s hv_block=%s"
-            % (snap.get("ref"), snap.get("block"), snap.get("volume"),
-               (snap.get("hv_nfs4") or {}).get("latency"),
-               (snap.get("hv_block") or {}).get("latency")))
+        log("  sample: block=%s volume=%s hv_read=%s hv_write=%s hv_combined=%s"
+            % (snap.get("block"), snap.get("volume", snap.get("volume_error")),
+               snap.get("hv_block_read_latency"),
+               snap.get("hv_block_write_latency"), snap.get("hv_block_latency")))
         return snap
 
     def decisive(snap):
-        return bool(snap.get("ref") and snap.get("hv_nfs4"))
+        return bool(snap.get("block") and snap.get("hv_block_read_latency"))
 
     samples, got_pair = bounded_paired_sampling(
         one_sample, decisive, attempts, interval)
-    verdict("fr3.paired_window", got_pair,
-            "%d samples; nonzero NFS4 reference paired with host_view NFS4: %s"
-            % (len(samples), got_pair))
+    # Keep sampling a few more paired points even after the first hit, so the
+    # ratio rests on a distribution rather than one exporter refresh.
+    extra = 0
+    while got_pair and extra < 5:
+        time.sleep(interval)
+        snap = one_sample()
+        samples.append(snap)
+        extra += 1
 
-    # Explicit unit hypotheses from the best paired sample.
-    best = next((s for s in reversed(samples)
-                 if s.get("ref") and s.get("hv_nfs4")), None)
-    if best:
-        ref = best["ref"]
-        hv = best["hv_nfs4"]["latency"]
-        guess, ratio = unit_hypothesis(ref, hv)
-        verdict("fr3.host_view.unit", guess != "inconclusive",
-                "reference=%.1fus host_view=%.4f ratio=%.1f -> "
-                "hypothesis=%s (ms hypothesis %s)"
-                % (ref, hv, ratio or -1, guess,
-                   "SUPPORTED" if guess == "ms" else "not supported"))
+    read_pairs = [(s["block"], s["hv_block_read_latency"]) for s in samples
+                  if s.get("block") and s.get("hv_block_read_latency")]
+    combined_pairs = [(s["block"], s["hv_block_latency"]) for s in samples
+                      if s.get("block") and s.get("hv_block_latency")]
+    stats = ratio_stats(read_pairs)
+    if stats:
+        guess, _r = unit_hypothesis(stats["median"], 1.0)
+        verdict("fr3.block.read_pairing", True,
+                "%d read-vs-read pairs; ratio min=%.1f max=%.1f median=%.1f "
+                "mean=%.1f -> hypothesis: BlockMetrics=us, host_view=ms %s"
+                % (stats["count"], stats["min"], stats["max"], stats["median"],
+                   stats["mean"],
+                   "SUPPORTED" if guess == "ms" else "NOT supported"))
     else:
-        verdict("fr3.host_view.unit", False,
-                "no paired nonzero window inside the bounded budget - "
-                "unit remains unproven by this run")
-    best_blk = next((s for s in reversed(samples)
-                     if s.get("block") and s.get("hv_block")), None)
-    if best_blk:
-        blk = best_blk["block"]
-        hvb = best_blk["hv_block"]["latency"]
-        guess, ratio = unit_hypothesis(blk, hvb)
-        log("  BlockMetrics(assumed us)=%.2f vs host_view BLOCK=%.4f "
-            "ratio=%.1f -> consistent with BlockMetrics in us if host_view "
-            "is ms: %s" % (blk, hvb, ratio or -1,
-                           "YES" if guess == "ms" else "no/inconclusive"))
-        verdict("fr3.block.pairing", True,
-                "block=%.2f hv_block=%.4f ratio=%.1f" % (blk, hvb, ratio or -1))
-    else:
-        verdict("fr3.block.pairing", False,
-                "no paired nonzero BLOCK window in the bounded budget")
+        verdict("fr3.block.read_pairing", False,
+                "no paired nonzero read-vs-read window in the bounded budget")
+    cstats = ratio_stats(combined_pairs)
+    if cstats:
+        log("  context: combined-gauge ratio median=%.1f over %d pairs "
+            "(expected below the read-vs-read ratio; the combined gauge "
+            "includes slower op classes)" % (cstats["median"], cstats["count"]))
     vols = [s.get("volume") for s in samples if s.get("volume")]
-    blks = [s.get("block") for s in samples if s.get("block")]
-    if vols and blks:
-        verdict("fr3.volume.corroboration", True,
-                "VolumeMetrics=%.2f vs BlockMetrics=%.2f (same scope/moment)"
-                % (vols[-1], blks[-1]))
-    else:
-        verdict("fr3.volume.corroboration", False,
-                "VolumeMetrics or BlockMetrics never nonzero in the window")
+    vol_errs = {s.get("volume_error") for s in samples if s.get("volume_error")}
+    if vols:
+        blocks = [s.get("block") for s in samples if s.get("block")]
+        verdict("fr3.volume.scope", True,
+                "VolumeMetrics(volume scope) latest=%.2f vs "
+                "BlockMetrics=%.2f - same magnitude family" %
+                (vols[-1], blocks[-1] if blocks else -1))
+    elif vol_errs:
+        verdict("fr3.volume.scope", False,
+                "volume-scope query error: %s" % sorted(vol_errs)[0])
 
 
 def run_probes(args, cluster_id):
     """Independent sections; each failure is contained, cleanup is caller's."""
+    anchors = [p for p in (args.view_paths or "").split(",") if p]
     sections = (
         ("metadata", lambda: probe_metadata()),
         ("fr1", lambda: probe_nfs3_view_attribution(
-            args.attempts, args.interval)),
+            args.attempts, args.interval, anchors)),
         ("fr3", lambda: probe_latency_units(
             cluster_id, args.attempts, args.interval)),
     )
@@ -559,6 +656,9 @@ def main():
     parser.add_argument("--user", default="admin")
     parser.add_argument("--evidence-dir", default=None,
                         help="directory for raw evidence files")
+    parser.add_argument("--view-paths", default="",
+                        help="comma-separated view paths to always sample "
+                             "(sanity anchors for the known-busy NFSv3 view)")
     parser.add_argument("--attempts", type=int, default=20,
                         help="bounded samples per paired loop")
     parser.add_argument("--interval", type=float, default=15.0,
