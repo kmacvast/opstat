@@ -12,7 +12,20 @@ before relying on it. Depth lives elsewhere — this file is the map:
 
 ---
 
-## Where things stand — MILESTONE CLOSED
+## Where things stand — TELEMETRY CORRECTNESS MILESTONE COMPLETE
+
+**Telemetry Correctness (2026-08-17): COMPLETE.** FR3 fixed and real-VMS
+validated the host_view millisecond latency defect (~1000x understatement;
+D-014, D-015); FR1 replaced the misleading NFSv3 VIEW drill with an honest
+zero-API-cost unavailable state on clusters exposing no valid per-view NFSv3
+source (D-016), Stage-B validated on var203 under proven live load (13/13
+production-path checks, run `fr1-20260817-224726`). No known
+telemetry-correctness defect from this milestone remains open; NFS3
+host_view support on newer builds is a capability-driven future opportunity
+behind `nfs_v3.view_attribution_source()`, not unfinished work. Lab
+workflows are committed `scripts/opstat-lab-*.sh` scripts (policy-tested).
+
+## Where things stand — TUI REFACTOR MILESTONE CLOSED
 
 **The TUI performance/refactor milestone is complete, merged to `main`, and
 closed by Round-5B real-VMS validation (var203, 2026-08-16, all checks PASS,
@@ -98,10 +111,11 @@ Implementation deliberately not attempted without live evidence:
 1. **NVMe headline consolidation** — var203 probe showed all-BlockMetrics-ops
    in one monitor is rejected at query time ("can't mix pr[operties]") and
    cross-family results are build-inconsistent. Split preserved.
-2. **Unproven latency source units** — `host_view` `latency` gauge; NVMe
-   BlockMetrics/VolumeMetrics µs assumption; SMB/S3 per-op corroboration.
-   Displays unchanged and marked UNVERIFIED until compared against a known-µs
-   metric under load.
+2. ~~Unproven latency source units~~ — **RESOLVED by FR3 (2026-08-17):**
+   host_view gauges proven milliseconds and converted at ingestion (D-014);
+   BlockMetrics microseconds at VERY STRONG EVIDENCE; the catalog `units`
+   field is a display convention (D-015); remaining SMB/S3 per-op sources
+   stay at their recorded confidence with no display change warranted.
 
 ## Settled by round 2 (Linux lab host, cluster-adjacent, 2026-08-14)
 
