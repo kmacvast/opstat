@@ -36,6 +36,49 @@ warn() { say "WARNING : $*"; }
 err()  { say "ERROR   : $*"; FAILURES=$((FAILURES + 1)); }
 section() { echo; echo "== $1 =================================================="; }
 
+# ------------------------------ shared: manifest, packaging, final verdict
+
+write_manifest() {
+  { git log --oneline -3; git status --short; } > "$RUN/git-final-state.txt"
+  {
+    echo "opstat FR2 delegation discovery - $DTS"
+    echo "HEAD $HEAD  target $VMS  probe rc ${PROBE_RC:-not-run}  script failures $FAILURES"
+    echo
+    echo "candidates.txt      : candidate discovery outcome"
+    echo "candidate-files.txt : raw candidate list (helper output)"
+    echo "probe-output.txt    : full PROBE: verdicts incl. observed record fields"
+    echo "raw/                : verbatim endpoint responses + GET-only API log"
+    echo "logs/               : mounts, mountstats, loadgen status, tmp diff"
+    echo
+    echo "file inventory:"
+    find "$RUN" -type f | sed "s#^$RUN/#  #" | sort
+  } > "$RUN/MANIFEST.txt"
+  cat "$RUN/MANIFEST.txt"
+}
+
+finish() {
+  section "final packaging and verdict"
+  write_manifest
+  ( cd "$(dirname "$RUN")" && zip -qr "$ZIP" "$(basename "$RUN")" )
+  if unzip -tq "$ZIP" >/dev/null 2>&1; then pass "ZIP integrity verified"
+  else err "ZIP failed integrity check"; fi
+  echo; unzip -l "$ZIP" | tail -8
+  echo; ls -lh "$ZIP"; sha256sum "$ZIP"
+  echo
+  echo "======================================================================"
+  if [ "$FAILURES" -eq 0 ]; then
+    echo "RESULT: RUN VALID - return this ONE file:"
+  else
+    echo "RESULT: RUN FAILED ($FAILURES failure(s) - see ERROR lines above)."
+    echo "The archive still contains the failure evidence; return it anyway:"
+  fi
+  echo
+  echo "    $ZIP"
+  echo "======================================================================"
+  [ "$FAILURES" -eq 0 ] && exit 0 || exit 1
+}
+
+
 mkdir -p "$RUN/raw" "$RUN/logs" "$RUN/tmp"
 export TMPDIR="$RUN/tmp" TMP="$RUN/tmp" TEMP="$RUN/tmp"
 export OPSTAT_API_LOG_DIR="$RUN/raw"
@@ -83,35 +126,19 @@ if [ -z "$EXPORT" ]; then
 else
   pass "mount: server export $EXPORT on $NFS41_MOUNT"
 fi
-# Prefer files the loadgen holds OPEN right now (best delegation odds):
-# wait bounded time for an fio phase, then read /proc/<pid>/fd symlinks.
-OPEN_FILES=""
-DEADLINE=$(( $(date +%s) + FIO_WAIT_S ))
-while [ "$(date +%s)" -lt "$DEADLINE" ]; do
-  for pid in $(pgrep -x fio 2>/dev/null); do
-    for fd in /proc/$pid/fd/*; do
-      tgt=$(readlink "$fd" 2>/dev/null) || continue
-      case "$tgt" in
-        "$NFS41_MOUNT"/*) OPEN_FILES="$OPEN_FILES$tgt"$'\n' ;;
-      esac
-    done
-  done
-  [ -n "$OPEN_FILES" ] && break
-  sleep 5
-done
-OPEN_FILES=$(printf '%s' "$OPEN_FILES" | sort -u | head -4)
-# Always also enumerate existing regular files (works between fio phases).
-FOUND_FILES=$(find "$NFS41_MOUNT" -maxdepth 4 -type f -size +0 2>/dev/null | head -6)
-CLIENT_FILES=$(printf '%s\n%s\n' "$OPEN_FILES" "$FOUND_FILES" | grep . | sort -u | head -6 | paste -sd, -)
+# Real existing files, via the tested helper: open fds of any process,
+# paths named on loadgen command lines, then a shallow walk (zero-byte
+# files included). Bounded sampling; refuses (rc 1) when nothing exists.
+python3 scripts/var203_validation/find_nfs41_candidates.py \
+  --mountpoint "$NFS41_MOUNT" --wait 120 2>&1 | tee "$RUN/candidate-files.txt"
+CAND_RC=${PIPESTATUS[0]}
+CLIENT_FILES=$(grep -v "^NO-CANDIDATES" "$RUN/candidate-files.txt" | paste -sd, -)
 {
   echo "export path     : $EXPORT"
-  echo "open-by-fio     : ${OPEN_FILES:-none}"
-  echo "found files     : ${FOUND_FILES:-none}"
+  echo "candidate rc    : $CAND_RC"
   echo "client files    : ${CLIENT_FILES:-none}"
 } | tee "$RUN/candidates.txt"
 ls -la "$NFS41_MOUNT" "$NFS41_MOUNT"/* > "$RUN/logs/mount-listing.txt" 2>&1
-if [ -n "$CLIENT_FILES" ]; then pass "real file candidates discovered"
-else err "no real files found beneath $NFS41_MOUNT - targeting cannot be proven"; fi
 cat /proc/self/mountstats > "$RUN/logs/mountstats-before.txt" 2>/dev/null
 ls -1 /tmp/opstat-* > "$RUN/logs/tmp-before.txt" 2>/dev/null || : > "$RUN/logs/tmp-before.txt"
 {
@@ -120,6 +147,15 @@ ls -1 /tmp/opstat-* > "$RUN/logs/tmp-before.txt" 2>/dev/null || : > "$RUN/logs/t
   echo "target   : $VMS"; echo "run dir  : $RUN"
 } | tee "$RUN/prereqs.txt"
 date '+PROBE-START %F %T' | tee "$RUN/timestamps.txt"
+
+# Refuse to query the cluster against nothing: a run with no real file
+# cannot settle FR2 targeting, and a normal-looking ZIP would mislead.
+if [ "$CAND_RC" -ne 0 ] || [ -z "$CLIENT_FILES" ]; then
+  err "prerequisite failure: no real existing file beneath $NFS41_MOUNT - refusing to run the probe"
+  PROBE_RC="not-run"
+  ls -1 /tmp/opstat-* > "$RUN/logs/tmp-after.txt" 2>/dev/null || : > "$RUN/logs/tmp-after.txt"
+  finish
+fi
 
 # --------------------------------- 5. read-only delegation discovery probe
 section "5. delegation endpoint discovery (GET-only)"
@@ -163,36 +199,12 @@ else
 fi
 { git log --oneline -3; git status --short; } > "$RUN/git-final-state.txt"
 
-# --------------------------------------------------------- 8. manifest
-section "8. manifest"
-{
-  echo "opstat FR2 delegation discovery - $DTS"
-  echo "HEAD $HEAD  target $VMS  probe rc $PROBE_RC  script failures $FAILURES"
-  echo
-  echo "candidates.txt      : server-side file/dir paths queried"
-  echo "probe-output.txt    : full PROBE: verdicts incl. observed record fields"
-  echo "raw/                : verbatim endpoint responses + GET-only API log"
-  echo "logs/               : mounts, mountstats (DELEGRETURN/OPEN context),"
-  echo "                      loadgen status, tmp before/after"
-  echo
-  echo "file inventory:"
-  find "$RUN" -type f | sed "s#^$RUN/#  #" | sort
-} > "$RUN/MANIFEST.txt"
-cat "$RUN/MANIFEST.txt"
-
-# --------------------------------------- 9. package, verify, hand back
-section "9. package"
-( cd "$(dirname "$RUN")" && zip -qr "$ZIP" "$(basename "$RUN")" )
-if unzip -tq "$ZIP" >/dev/null 2>&1; then pass "ZIP integrity verified"; else err "ZIP failed integrity check"; fi
-echo; unzip -l "$ZIP" | tail -8
-echo; ls -lh "$ZIP"; sha256sum "$ZIP"
-echo
-echo "======================================================================"
-if [ "$FAILURES" -eq 0 ]; then
-  echo "RESULT: PASS - return this ONE file:"
+# ------------------------------------- 8. minimum-success machine check
+section "8. minimum success check"
+if grep -q "PROBE:correlation.winner PASS" "$RUN/probe-output.txt"; then
+  pass "minimum success: a real existing file returned an HTTP-success nfs4_delegs response"
 else
-  echo "RESULT: $FAILURES failure(s) noted above - return the archive anyway:"
+  err "minimum success NOT met: no (tenant, syntax) pair produced an HTTP success for a real file"
 fi
-echo
-echo "    $ZIP"
-echo "======================================================================"
+
+finish
