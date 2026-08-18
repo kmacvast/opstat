@@ -2,7 +2,7 @@
   "schema_version": 1,
   "project": "opstat",
   "source_of_truth": true,
-  "updated": "2026-08-17",
+  "updated": "2026-08-18",
   "next_fr_number": 14,
   "status_values": [
     "backlog",
@@ -151,13 +151,14 @@
         "Delegation visibility needs a file/path-scoped interaction and must remain on-demand (D-008).",
         "The nfs4_delegs DELETE sibling must never be invoked; a test asserts it is not.",
         "2026-08-17 discovery pass 1 (var203/5.4.6, HEAD 5c7eb30): GET /tenants/{id}/nfs4_delegs/ EXISTS on 5.4.6 and still requires file_path (HTTP 400 'field required' without it, consistently). GET-only contract held; lab artifact policy clean (API log in-tree, /tmp unchanged).",
-        "Pass 1 was inconclusive on record shape: no real file candidate was discovered (loadgen in a sleep phase; *.bin glob empty), and guessed directory paths queried against the first three tenants in API order (37/25/51) all returned HTTP 400 get_handle_by_path GetHandleByPathCode.ILLEGAL_PATH - evidence of wrong-tenant/wrong-target queries, NOT an endpoint defect. Correct view->tenant correlation and a real existing file are prerequisites; record fields, empty-success shape and pagination semantics remain unproven."
+        "Pass 1 was inconclusive on record shape: no real file candidate was discovered (loadgen in a sleep phase; *.bin glob empty), and guessed directory paths queried against the first three tenants in API order (37/25/51) all returned HTTP 400 get_handle_by_path GetHandleByPathCode.ILLEGAL_PATH - evidence of wrong-tenant/wrong-target queries, NOT an endpoint defect. Correct view->tenant correlation and a real existing file are prerequisites; record fields, empty-success shape and pagination semantics remain unproven.",
+        "2026-08-18: second corrected lab attempt at 3f2627d was INVALID as FR2 evidence - the committed lab script passed --evidence-dir to a probe parser that no longer accepted it (a refactor dropped the argument; no gate test exercised the script-to-probe CLI contract), so the probe exited at argparse (rc 2) before any endpoint query. No FR2 endpoint conclusion was drawn from that run. Artifact routing itself remained compliant with the no-/tmp policy. Fixed: build_parser() contract factored and regression-tested against the committed script's actual argv; candidate discovery rebuilt (open-fd scan of any process, command-line-derived paths, walk keeping zero-byte files - the nfs41 loadgen uses no fio, and the size filter cost the trip its candidates); the script now refuses to run the probe without a proven real file and exits nonzero with a RUN FAILED banner while still packaging failure evidence."
       ],
       "notes": [
         "2026-08-17: Bundle 1 begins - Stage A repository/API analysis; design-first per owner instruction, D-008 governs."
       ],
       "created": "2026-08-16",
-      "updated": "2026-08-17",
+      "updated": "2026-08-18",
       "completed": null
     },
     {
