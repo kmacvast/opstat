@@ -118,6 +118,12 @@ grep -q "$NFS41_MOUNT" "$RUN/logs/mounts.txt" \
   && pass "NFSv4.1 mount present: $NFS41_MOUNT" \
   || warn "$NFS41_MOUNT not mounted; file candidates may be empty"
 
+# Locate the loadgen check in Section 3 and replace the warning block with:
+if ! pgrep -f "nfs41-loadgen" >/dev/null 2>&1; then
+    echo "[!] ERROR: nfs41-loadgen is not running. Active NFSv4.1 state is required."
+    echo "[!] Run 'sudo systemctl start nfs41-loadgen' before running this probe."
+    exit 1
+fi
 # --------------------------------- 4. mount facts + real file candidates
 section "4. mount derivation and real file candidates (client-side truth)"
 EXPORT=$(mount | awk -v mp="$NFS41_MOUNT" '$3 == mp {split($1, a, ":"); print a[2]}' | head -1)
