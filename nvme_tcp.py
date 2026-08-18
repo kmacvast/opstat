@@ -1555,6 +1555,9 @@ def _dispatch_key(key):
     Exactly one action per key, so keys queued during a long blocking poll
     are all honored in arrival order instead of all-but-one being dropped.
     """
+    # Keys arrive case-preserved from dispatch_queued_keys (text prompts
+    # need raw characters); commands are case-insensitive, so fold here.
+    key = key.lower()
     if key == " ":
         # Forced (un-throttled) refresh, standardized across engines.
         vast_common.guarded_poll(manual_refresh, render_screen)

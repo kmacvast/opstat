@@ -103,7 +103,7 @@ def test_navigation_footer_present_in_every_mode(v41, mode):
 @pytest.mark.parametrize("key,label", [
     ("q", "Quit"), ("o", "Ops"), ("l", "Lat"), ("n", "Name"),
     ("c", "cNode"), ("v", "View"), ("t", "Tenant"),
-    ("4", "Native v4"), ("h", "v4 hosts"),
+    ("4", "Native v4"), ("h", "v4 hosts"), ("d", "Delegation"),
     ("x", "Exit drill"), ("space", "Refresh"),
 ])
 def test_every_control_is_listed_in_every_mode(v41, mode, key, label):

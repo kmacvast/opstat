@@ -2111,6 +2111,9 @@ def _dispatch_key(key):
     Returns "rendered" when the action painted already, "refresh" when a
     repaint is owed after the queued batch drains, None for an unbound key.
     """
+    # Keys arrive case-preserved from dispatch_queued_keys (text prompts
+    # need raw characters); commands are case-insensitive, so fold here.
+    key = key.lower()
     global SORT_MODE
     if key == " ":
         vast_common.guarded_poll(manual_refresh, render_screen)

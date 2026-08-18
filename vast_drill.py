@@ -768,10 +768,16 @@ def dispatch_queued_keys(chars, dispatch, render):
     Returns True when any action already rendered, so the caller re-arms its
     refresh timer. Quit handling stays in the caller: scanning for ``q``
     before dispatch preserves quit-from-anywhere-in-the-buffer semantics.
+
+    Keys are delivered CASE-PRESERVED: engines lowercase in their command
+    branches. Lowercasing here corrupted text input - the NFSv4.1 delegation
+    path prompt consumes raw characters, and VAST namespace paths are
+    case-sensitive, so a buffer-wide ``.lower()`` silently rewrote the path
+    the user typed.
     """
     rendered = False
     refresh_needed = False
-    for key in chars.lower():
+    for key in chars:
         outcome = dispatch(key)
         if outcome == "rendered":
             rendered = True
@@ -800,6 +806,7 @@ LOADING_MESSAGES = {
     "host": "Loading the HOST drill-down, please stand by...",
     "native": "Loading the NFSv4 telemetry view, please stand by...",
     "hosts": "Loading the NFSv4 hosts view, please stand by...",
+    "delegation": "Looking up NFSv4.1 delegations, please stand by...",
 }
 
 
@@ -847,3 +854,49 @@ def with_startup_status(show_status, render, steps):
             work()
     finally:
         show_status(None)
+
+
+# ---------------------------------------------------------------------------
+# Namespace ownership resolution (shared by the NFSv4.1 delegation
+# diagnostic and the FR2 lab tooling). Proven on var204/5.5.0.1: the view
+# owning the namespace supplies the tenant for /tenants/{id}/nfs4_delegs/,
+# and querying the wrong tenant returns get_handle_by_path ILLEGAL_PATH -
+# an entire lab run once collected cross-tenant noise this way.
+# ---------------------------------------------------------------------------
+def namespace_candidate_views(views, server_path):
+    """Views that could own *server_path*: exact match first, then prefix
+    matches, longest first (the root view "/" matches everything - NFS
+    mounts traverse the root view when no exact view exists). Only
+    NFS-capable views count. Returns [(view_dict, "exact"|"prefix")]."""
+    out = []
+    for v in views or []:
+        if not isinstance(v, dict) or "id" not in v:
+            continue
+        path = (v.get("path") or "").rstrip("/") or "/"
+        protos = v.get("protocols") or []
+        if protos and not any(str(p).upper().startswith("NFS") for p in protos):
+            continue
+        if server_path == path:
+            out.append((0, -len(path), v, "exact"))
+        elif path == "/" or server_path.startswith(path + "/"):
+            out.append((1, -len(path), v, "prefix"))
+    out.sort(key=lambda t: (t[0], t[1]))
+    return [(v, kind) for _a, _b, v, kind in out]
+
+
+def namespace_candidate_tenants(cands, cap=3):
+    """Ordered distinct (tenant_id, tenant_name, via) from candidate views.
+
+    Returns (tenants, ambiguous): ambiguous means MORE than *cap* distinct
+    tenants could own the namespace - callers stop honestly rather than
+    spraying queries at tenants."""
+    seen, tenants = set(), []
+    for v, kind in cands:
+        tid = v.get("tenant_id")
+        if tid is None or tid in seen:
+            continue
+        seen.add(tid)
+        tenants.append((tid, v.get("tenant_name", tid),
+                        "%s view id %s path %s"
+                        % (kind, v.get("id"), v.get("path"))))
+    return tenants[:cap], len(tenants) > cap

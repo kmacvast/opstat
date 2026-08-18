@@ -234,6 +234,17 @@ DRILL = None
 # dashboard refresh path.
 EXPORTER_MODE = None        # None | "native" | "hosts" | "view"
 EXPORTER_STATUS = None      # transient "Scraping..." message
+
+# --- NFSv4.1 delegation diagnostic (FR2, D-008) -----------------------------
+# One-shot and on demand ONLY: the normal refresh path performs zero
+# delegation API calls, ever. The endpoint's DELETE sibling revokes live
+# delegations; the only operation this feature can perform is the GET lookup
+# (_deleg_lookup_get has no method parameter to misuse).
+DELEG_PROMPT = None         # None = prompt closed | str = current input buffer
+DELEG_RESULT = None         # dict built by _deleg_query, or None
+DELEG_STATUS = None         # transient "Looking up..." message
+_DELEG_VIEWS = None         # /views/ list, fetched once per session on demand
+_DELEG_MAX_ROWS = 8         # bounded display; count_total still reported
 NFS4 = None                 # nfs4_native.Nfs4Collector
 HOSTVIEW = None             # nfs4_native.HostViewCollector
 
@@ -284,6 +295,7 @@ def init_config(args):
     global DRILL_MODE, DRILL_ERROR, DRILL_STATUS, DRILL_OBJECTS
     global DRILL_MONITORS, LAST_DRILL_ROWS
     global EXPORTER_MODE, EXPORTER_STATUS, NFS4, HOSTVIEW
+    global DELEG_PROMPT, DELEG_RESULT, DELEG_STATUS, _DELEG_VIEWS
 
     ARGS = args
     VMS = args.vms
@@ -327,11 +339,15 @@ def init_config(args):
     LAST_DRILL_ROWS = []
     DRILL_STATUS = None
     EXPORTER_MODE = EXPORTER_STATUS = None
+    DELEG_PROMPT = DELEG_RESULT = DELEG_STATUS = _DELEG_VIEWS = None
     NFS4 = nfs4_native.Nfs4Collector(vast_common.request_text)
     HOSTVIEW = nfs4_native.HostViewCollector(vast_common.request_text)
 
 
 def box_top(title, width):
+    # A title longer than the frame would overflow the terminal and corrupt
+    # every row below it (box_row truncates content; the title never was).
+    title = truncate_display(title, max(1, width - 6))
     raw_pre = f"{_TL}{_H} {title} "
     fill = max(0, width - display_width(raw_pre) - 1)
     if _COLOR:
@@ -1809,6 +1825,305 @@ def manual_refresh():
         refresh_exporter(force=True)
 
 
+# ---------------------------------------------------------------------------
+# NFSv4.1 delegation diagnostic (FR2, D-008): one-shot, GET-only
+# ---------------------------------------------------------------------------
+def _deleg_lookup_get(tenant_id, file_path):
+    """The ONLY operation the delegation diagnostic can perform.
+
+    Builds GET /tenants/{id}/nfs4_delegs/?file_path=<encoded full namespace
+    path> - proven on var204/5.5.0.1 (view 755, tenant default, five live
+    WRITE records). There is deliberately no method parameter: the endpoint's
+    DELETE sibling revokes live delegations and must remain unreachable from
+    this code (D-008).
+    """
+    return api_request(
+        "GET", f"/tenants/{tenant_id}/nfs4_delegs/?file_path="
+        + urllib.parse.quote(file_path, safe=""))
+
+
+def _deleg_views():
+    """The view inventory, fetched once per session on first diagnostic use."""
+    global _DELEG_VIEWS
+    if _DELEG_VIEWS is None:
+        data = api_request("GET", "/views/")
+        _DELEG_VIEWS = normalize_list_response(data) or []
+    return _DELEG_VIEWS
+
+
+def _deleg_resolve_tenants(file_path):
+    """Owner-approved tenant resolution (FR2 decision 3).
+
+    A: a specific (non-root) NFS view owning the path -> that view's tenant,
+       NO fallback on ILLEGAL_PATH.
+    B: only root views match -> longest-prefix candidate first, at most ONE
+       bounded fallback tenant.
+    C/D: never spray tenants; >cap distinct candidates is honest ambiguity.
+
+    Returns (tenants, allow_fallback, note): tenants = [(id, name, via)].
+    """
+    cands = vast_drill.namespace_candidate_views(_deleg_views(), file_path)
+    if not cands:
+        return [], False, "no NFS-capable view owns this path"
+    tenants, ambiguous = vast_drill.namespace_candidate_tenants(cands)
+    if ambiguous:
+        return [], False, "namespace ownership is ambiguous across tenants"
+    deepest_path = (cands[0][0].get("path") or "").rstrip("/") or "/"
+    if deepest_path != "/":
+        return tenants[:1], False, None      # rule A: authoritative view
+    return tenants[:2], len(tenants) > 1, None   # rule B: bounded fallback
+
+
+def _deleg_normalize_record(rec):
+    """One proven-shape record (var204 evidence), '-' for anything missing.
+
+    Fields are the six the real cluster sends; nothing is invented and
+    delegation_type is an arbitrary string (WRITE observed, not assumed)."""
+    if not isinstance(rec, dict):
+        return None
+    def _get(key):
+        value = rec.get(key)
+        return value if value is not None else "-"
+    return {
+        "delegation_type": _get("delegation_type"),
+        "delegation_client_ip": _get("delegation_client_ip"),
+        "vip_addr": _get("vip_addr"),
+        "revoke_in_progress": rec.get("revoke_in_progress"),
+        "client_id": _get("client_id"),
+        "delegation_stateid": _get("delegation_stateid"),
+    }
+
+
+def _deleg_query(file_path):
+    """One bounded lookup; builds DELEG_RESULT. Never more than two GETs."""
+    global DELEG_RESULT
+    queried_at = time.strftime("%H:%M:%S")
+    base = {"path": file_path, "queried_at": queried_at, "records": [],
+            "count": 0, "truncated": False, "tenant": None}
+    try:
+        tenants, allow_fallback, note = _deleg_resolve_tenants(file_path)
+    except RuntimeError as exc:
+        DELEG_RESULT = dict(base, state="error", message=_short_error(str(exc)))
+        return
+    if not tenants:
+        DELEG_RESULT = dict(base, state="ambiguous",
+                            message=note or "cannot resolve a tenant")
+        return
+    last_error = None
+    tried = []
+    for attempt, (tid, name, _via) in enumerate(tenants):
+        tried.append(str(name))
+        try:
+            payload = _deleg_lookup_get(tid, file_path)
+        except RuntimeError as exc:
+            detail = str(exc)
+            if "ILLEGAL_PATH" in detail:
+                last_error = "illegal_path"
+                if allow_fallback and attempt == 0:
+                    continue                  # rule B: one bounded fallback
+                break
+            if "HTTP 404" in detail:
+                # Never observed on a real build (the endpoint existed on
+                # 5.4.6 and 5.5.0.1) - name the provenance rather than
+                # asserting a cluster-wide capability from one status code.
+                DELEG_RESULT = dict(base, state="unavailable",
+                                    message="Delegation lookup is not "
+                                            "available (HTTP 404 from "
+                                            "tenant %s)." % name)
+                return
+            DELEG_RESULT = dict(base, state="error",
+                                message=_short_error(detail))
+            return
+        records = payload.get("delegate_info") if isinstance(payload, dict) else None
+        if records is None:
+            DELEG_RESULT = dict(base, state="malformed", tenant=str(name),
+                                message="Unrecognized response; raw details "
+                                        "are in the API log.")
+            return
+        normalized = [r for r in
+                      (_deleg_normalize_record(rec) for rec in records)
+                      if r is not None]
+        count = payload.get("delegate_info_count_total")
+        # bool is an int subclass; a True count would be an invention.
+        count_native = isinstance(count, int) and not isinstance(count, bool)
+        count = count if count_native else len(normalized)
+        shown = normalized[:_DELEG_MAX_ROWS]
+        DELEG_RESULT = dict(
+            base, state="live" if normalized else "empty",
+            records=shown, count=count, count_native=count_native,
+            fetched=len(normalized),
+            pagination=bool(payload.get("xeystore_pagination")),
+            truncated=bool(normalized) and (
+                count > len(shown)
+                or bool(payload.get("xeystore_pagination"))),
+            tenant=str(name))
+        return
+    if last_error == "illegal_path":
+        DELEG_RESULT = dict(base, state="invalid",
+                            message="Path was not found in the queried "
+                                    "tenant namespace (tried: %s)."
+                                    % ", ".join(tried))
+    else:
+        DELEG_RESULT = dict(base, state="error", message="lookup failed")
+
+
+def _set_deleg_status(text):
+    global DELEG_STATUS
+    DELEG_STATUS = text
+
+
+def _deleg_submit():
+    """Enter pressed in the prompt: validate locally, then one-shot lookup."""
+    global DELEG_PROMPT, DELEG_RESULT
+    path = (DELEG_PROMPT or "").strip()
+    DELEG_PROMPT = None
+    if not path:
+        return                                # empty submit = cancel
+    if not path.startswith("/"):
+        DELEG_RESULT = {"path": path, "state": "invalid_input", "records": [],
+                        "count": 0, "truncated": False, "tenant": None,
+                        "queried_at": time.strftime("%H:%M:%S"),
+                        "message": "The path must be the full path as the "
+                                   "cluster exports it and start with /."}
+        return
+    vast_drill.with_loading_status(
+        _set_deleg_status, render_screen, "delegation",
+        lambda: _deleg_query(path))
+
+
+def _deleg_prompt_key(key):
+    """Line editor for the path prompt. While the prompt is open, printable
+    characters are path text - q does not quit, d/x/v/h do not navigate.
+    (Bare Esc never reaches dispatch: the terminal layer strips escape
+    sequences for arrow-key safety, so cancel = Enter on an empty line or
+    Backspace on an empty line.)"""
+    global DELEG_PROMPT
+    if key in ("\r", "\n"):
+        _deleg_submit()
+        return "refresh"
+    if key in ("\x7f", "\x08"):
+        if DELEG_PROMPT:
+            DELEG_PROMPT = DELEG_PROMPT[:-1]
+        else:
+            DELEG_PROMPT = None               # backspace on empty = cancel
+        return "refresh"
+    if key == "\x15":                         # Ctrl-U clears the line
+        DELEG_PROMPT = ""
+        return "refresh"
+    if key.isprintable():
+        DELEG_PROMPT = (DELEG_PROMPT or "") + key
+        return "refresh"
+    return "refresh"                          # swallow other controls
+
+
+def _tail_display(text, budget):
+    """Fit *text* into *budget* columns keeping the TAIL visible.
+
+    Paths distinguish themselves at the end, and the prompt's insertion
+    point is the end; right-truncation hid both."""
+    if display_width(text) <= budget:
+        return text
+    while text and display_width("…" + text) > budget:
+        text = text[1:]
+    return "…" + text
+
+
+def _render_delegation_panel(width):
+    result = DELEG_RESULT
+    print(box_top("NFSv4.1 DELEGATION LOOKUP", width))
+    if DELEG_STATUS:
+        print(box_row(c(DELEG_STATUS, _YELLOW), width))
+        print(box_bottom(width))
+        return
+    if DELEG_PROMPT is not None:
+        print(box_row(c("File path as the cluster exports it "
+                        "(full path, starts with /):", _DIM), width))
+        # Keep the TAIL of a long path visible: the insertion point is where
+        # the user is typing, and right-truncation would leave them blind.
+        print(box_row("> " + _tail_display(DELEG_PROMPT, width - 7)
+                      + c("_", _BYELLOW), width))
+        print(box_row(c("[Enter] Look up   [Enter on empty line] Cancel   "
+                        "[Ctrl-U] Clear", _DIM), width))
+        print(box_bottom(width))
+        return
+    if not result:
+        # Defensive only: _render_frame enters this panel solely when a
+        # prompt, status or result exists, so this branch is unreachable
+        # from the production render path.
+        print(box_row(c("No lookup yet. Press d to enter a path.", _DIM), width))
+        print(box_bottom(width))
+        return
+    # Tail-preserving: sibling paths differ at the end, and losing the tail
+    # made otherwise-different rows render identically once before.
+    print(box_row(_tail_display(result["path"], width - 4), width))
+    state = result["state"]
+    if state == "live":
+        for rec in result["records"]:
+            revoke = ("Yes" if rec["revoke_in_progress"] is True
+                      else "No" if rec["revoke_in_progress"] is False else "-")
+            print(box_row("Delegation         "
+                          + c(str(rec["delegation_type"]), _BGREEN), width))
+            print(box_row(f"Client             {rec['delegation_client_ip']}",
+                          width))
+            print(box_row(f"Serving VIP        {rec['vip_addr']}", width))
+            print(box_row("Revoke in progress "
+                          + (c(revoke, _BRED) if revoke == "Yes" else revoke),
+                          width))
+            print(box_row(c(f"client_id {rec['client_id']}   "
+                            f"stateid {rec['delegation_stateid']}", _DIM),
+                          width))
+        # The count line states only what the response proves: a display
+        # bound is not a cluster fact, a derived count is not a reported
+        # one, and the pagination flag's meaning is unproven (only false
+        # was ever observed) so it is named, not interpreted.
+        shown_n, count = len(result["records"]), result["count"]
+        if count > shown_n:
+            note = f"{shown_n} of {count} delegations shown"
+            if result.get("fetched", shown_n) < count:
+                note += ("; the cluster reports more than this response "
+                         "carried")
+        elif result.get("count_native", True):
+            note = f"{count} delegation(s) reported"
+        else:
+            note = f"{count} delegation record(s) returned"
+        if result.get("pagination"):
+            note += ("; response marked xeystore_pagination - additional "
+                     "records may exist")
+        print(box_row(c(f"{note}  ·  queried {result['queried_at']}  ·  "
+                        "[space] Re-query", _DIM), width))
+    elif state == "empty":
+        print(box_row("No active NFSv4.1 delegation exists for this path.",
+                      width))
+        print(box_row(c("The path is valid; no client currently holds a "
+                        "delegation on it.", _DIM), width))
+        # Always shown: the var204 capture proved a directory queries as
+        # empty while files INSIDE it held live delegations, and path syntax
+        # alone cannot tell a file from a directory.
+        print(box_row(c("If this path is a directory, delegations held on "
+                        "files inside it are not reported; query the file "
+                        "itself.", _DIM), width))
+        print(box_row(c(f"queried {result['queried_at']}  ·  [space] Re-query"
+                        "   [d] New path   [x] Back", _DIM), width))
+    elif state in ("invalid", "invalid_input"):
+        print(box_row(result["message"], width))
+        print(box_row(c("Check the full path as the cluster exports it "
+                        "(starts with /).", _DIM), width))
+        print(box_row(c("[d] Try another path   [x] Back", _DIM), width))
+    elif state == "unavailable":
+        print(box_row(result["message"], width))
+        print(box_row(c("[x] Back", _DIM), width))
+    elif state == "ambiguous":
+        print(box_row("Cannot determine which tenant owns this path: "
+                      + result["message"] + ".", width))
+        print(box_row(c("[d] Try another path   [x] Back", _DIM), width))
+    else:   # error / malformed
+        print(box_row(c(f"Error: {result.get('message', 'lookup failed')}",
+                        _BRED), width))
+        print(box_row(c("[space] Retry   [d] New path   [x] Back", _DIM),
+                      width))
+    print(box_bottom(width))
+
+
 def render_screen():
     """Compose the whole frame into a buffer, then flush it in one write."""
     buf = io.StringIO()
@@ -1825,7 +2140,7 @@ def render_screen():
 # NFSv4.1-specific exporter drills.
 _NAV_CONTROLS = vast_drill.nav_controls(
     ("q", "o", "l", "n", "c", "v", "t", "x", "space"),
-    extra=(("4", "Native v4"), ("h", "v4 hosts")),
+    extra=(("4", "Native v4"), ("h", "v4 hosts"), ("d", "Delegation")),
 )
 
 # Never let a narrow terminal collapse the frame to the point where the
@@ -1837,7 +2152,11 @@ _MIN_FRAME_WIDTH = 24
 # cap must still leave room for the navigation footer, which grew when the
 # native-NFSv4 and client-attribution drills added their keys - a narrower
 # cap silently truncated "[x] Exit drill".
-_MAX_FRAME_WIDTH = 140
+# Raised 140 -> 152 deliberately when [d] Delegation joined the footer: the
+# full legend measures 147 (+4 frame furniture). On a narrower terminal the
+# legend wraps via nav_legend_lines rather than dropping a control - the
+# same precedent as the deliberate 120 -> 140 raise for the drill keys.
+_MAX_FRAME_WIDTH = 152
 
 
 def _frame_width():
@@ -1863,7 +2182,9 @@ def _render_frame():
         + f"   VMS {c(f'{VMS}:{PORT}', _BWHITE)}   cluster {c(CLUSTER_NAME or '?', _BWHITE)}"
         + c(f"   refresh {REFRESH_SECONDS}s", _DIM)
     )
-    if EXPORTER_MODE:
+    if DELEG_PROMPT is not None or DELEG_STATUS or DELEG_RESULT:
+        title += c("   | DELEGATION", _BYELLOW)
+    elif EXPORTER_MODE:
         tag = {"hosts": "NFSv4 HOSTS", "view": "NFSv4 VIEWS"}.get(
             EXPORTER_MODE, "NATIVE NFSv4")
         title += c(f"   | {tag}", _BYELLOW)
@@ -1889,6 +2210,10 @@ def _render_frame():
         print(box_top("STARTING", width))
         print(box_row(c(STARTUP_STATUS, _YELLOW), width))
         print(box_bottom(width))
+    elif DELEG_PROMPT is not None or DELEG_STATUS or DELEG_RESULT:
+        # Delegation prompt/result renders through this common path so the
+        # navigation footer below survives it (the early-return defect).
+        _render_delegation_panel(width)
     elif EXPORTER_MODE or EXPORTER_STATUS:
         _render_exporter_panels(width)
     elif DRILL_MODE or DRILL_STATUS:
@@ -2799,24 +3124,76 @@ def _dispatch_key(key):
     Returns "rendered" when the action painted already, "refresh" when a
     repaint is owed after the queued batch drains, None for an unbound key.
     """
-    global SORT_MODE
+    global SORT_MODE, DELEG_PROMPT, DELEG_RESULT
+    # The path prompt owns EVERY key while it is open: typing q, d, x, v or h
+    # inside a path must be text, never quit or navigation. This branch is
+    # deliberately first.
+    if DELEG_PROMPT is not None:
+        return _deleg_prompt_key(key)
+    # Keys arrive case-preserved (the prompt above needs raw characters -
+    # VAST namespace paths are case-sensitive); commands are not.
+    key = key.lower()
+    if key == "d":
+        DELEG_PROMPT = ""
+        return "refresh"
     if key == " ":
+        if DELEG_RESULT is not None:
+            # Delegation result on screen: space is a manual re-query of the
+            # same path (owner decision - no timed refresh, no polling).
+            path = DELEG_RESULT.get("path", "")
+            if path.startswith("/"):
+                vast_drill.with_loading_status(
+                    _set_deleg_status, render_screen, "delegation",
+                    lambda: _deleg_query(path))
+            render_screen()
+            return "rendered"
         vast_common.guarded_poll(manual_refresh, render_screen)
         return "rendered"
     if key in ("o", "l", "n"):
         SORT_MODE = {"o": "ops", "l": "latency", "n": "default"}[key]
         return "refresh"
     if key in ("c", "t"):
+        DELEG_RESULT = None      # navigating away dismisses the lookup result
         switch_drill_mode({"c": "cnode", "t": "tenant"}[key])
         return "refresh"
     if key in ("v", "4", "h"):
+        DELEG_RESULT = None
         enter_exporter_mode({"v": "view", "4": "native", "h": "hosts"}[key])
         return "refresh"
     if key == "x":
+        DELEG_RESULT = None
         exit_drill_mode()
         exit_exporter_mode()
         return "refresh"
     return None
+
+
+def _should_quit(chars):
+    """Ctrl-C always quits. "q" quits only while the delegation path prompt
+    is closed - inside the prompt it is path text and must reach
+    _dispatch_key rather than terminate the program.
+
+    On a slow cluster several keystrokes arrive in ONE buffered read (the
+    reason dispatch_queued_keys exists), so prompt state is simulated across
+    the buffer: a "q" typed after the "d" that opens the prompt is path
+    text even though the prompt was closed when the read returned. The
+    simulation mirrors _deleg_prompt_key's cancel/submit semantics exactly:
+    Enter closes the prompt, backspace on an empty line cancels it."""
+    if "\x03" in chars:
+        return True
+    prompt = DELEG_PROMPT
+    for ch in chars:
+        if prompt is not None:
+            if ch in ("\r", "\n"):
+                prompt = None
+            elif ch in ("\x7f", "\x08"):
+                prompt = prompt[:-1] if prompt else None
+        else:
+            if ch.lower() == "q":
+                return True
+            if ch.lower() == "d":
+                prompt = ""
+    return False
 
 
 def main():
@@ -2838,7 +3215,7 @@ def main():
     while True:
         chars = check_keypress()
         if chars:
-            if "\x03" in chars or "q" in chars.lower():
+            if _should_quit(chars):
                 break
             # Every queued key, in arrival order - see vast_drill.
             if vast_drill.dispatch_queued_keys(chars, _dispatch_key, render_screen):
