@@ -1,509 +1,161 @@
-Yes. I’d make the lab script fully self-contained and establish one hard rule:
+If you want to make scripts/opstat-lab-fr2-delegation-discovery.sh fail immediately with a useful message, open the script and update Section 3 where it checks for nfs41-loadgen:
 
-Every transient artifact, API log, raw capture, journal, status file, and scratch file lives under one DTS-named directory beneath ~/kjmtmp/opstat/. The only thing written outside that tree is the final ZIP in $HOME.
-
-I’d also explicitly redirect the process temp environment into that evidence directory via TMPDIR, TMP, and TEMP. That should catch anything using the normal Python/system temporary-directory mechanism. If opstat itself has a literal /tmp/... path hard-coded somewhere, the script will detect that condition rather than silently accepting it.
-
-Here’s the complete one-shot script in the format you want:
-
-#!/usr/bin/env bash
-# ==============================================================================
-# Script Name : opstat-telemetry-targeted-lab.sh
-# Description : Executes the targeted FR1/FR3 telemetry-correctness evidence
-#               pass against the VAST lab cluster.
-#
-#               The script:
-#                 - updates and verifies the opstat repository
-#                 - verifies the exact expected Git SHA
-#                 - verifies credentials and load generators
-#                 - captures client-side NFS and block evidence
-#                 - redirects temporary files into the evidence directory
-#                 - runs the telemetry correctness probe
-#                 - captures API logs and service evidence
-#                 - captures final repository state
-#                 - packages everything into one ZIP file
-#
-# Artifact Rule:
-#               ALL working artifacts are written below:
-#
-#                 $HOME/kjmtmp/opstat/<DTS>/
-#
-#               Nothing from this run should be written to /tmp.
-#
-# Final Output:
-#
-#                 $HOME/opstat-telemetry2-<DTS>.zip
-#
-# Dependencies: git, python3, systemctl, journalctl, zip, unzip, sha256sum
-#
-# Target:
-#               var203.selab.vastdata.com
-#
-# Expected Git:
-#               main @ 17b22240643a7433e43c30241bb6640eae324ca4
-# ==============================================================================
-set -uo pipefail
-EXPECTED_SHA="17b22240643a7433e43c30241bb6640eae324ca4"
-VMS="var203.selab.vastdata.com"
-VMS_USER="admin"
-VIEW_ANCHORS="/kmacs"
-REPO="$HOME/git/opstat"
-BASE="$HOME/kjmtmp/opstat"
-DTS=$(date +%Y%m%d-%H%M%S)
-EV="$BASE/$DTS"
-RAW="$EV/raw"
-RUNTMP="$EV/tmp"
-ARCHIVE="$HOME/opstat-telemetry2-$DTS.zip"
-export VAST_PASSWORD="${VAST_PASSWORD:-123456}"
-mkdir -p "$RAW"
-mkdir -p "$RUNTMP"
-export TMPDIR="$RUNTMP"
-export TMP="$RUNTMP"
-export TEMP="$RUNTMP"
-cd "$REPO" || exit 1
-echo
-echo "======================================================================"
-echo "  OPSTAT TARGETED TELEMETRY CORRECTNESS LAB RUN"
-echo "======================================================================"
-echo
-echo "Run ID       : $DTS"
-echo "Evidence Dir : $EV"
-echo "Final ZIP    : $ARCHIVE"
-echo "Target VMS   : $VMS"
-echo
-echo
-echo "======================================================================"
-echo "  1. UPDATE AND VERIFY REPOSITORY"
-echo "======================================================================"
-git status --short
-git fetch origin
-git checkout main
-git merge --ff-only origin/main
-ACTUAL_SHA=$(git rev-parse HEAD)
-BRANCH=$(git rev-parse --abbrev-ref HEAD)
-echo
-echo "Branch : $BRANCH"
-echo "HEAD   : $ACTUAL_SHA"
-echo "Expect : $EXPECTED_SHA"
-if [ "$BRANCH" != "main" ]; then
-    echo
-    echo "ERROR: Repository is not on main."
+# Locate the loadgen check in Section 3 and replace the warning block with:
+if ! pgrep -f "nfs41-loadgen" >/dev/null 2>&1; then
+    echo "[!] ERROR: nfs41-loadgen is not running. Active NFSv4.1 state is required."
+    echo "[!] Run 'sudo systemctl start nfs41-loadgen' before running this probe."
     exit 1
 fi
-if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
-    echo
-    echo "ERROR: HEAD DOES NOT MATCH EXPECTED PROBE SHA."
-    echo "Evidence collection will not run against an unexpected revision."
-    exit 1
-fi
-if [ -n "$(git status --short)" ]; then
-    echo
-    echo "ERROR: WORKING TREE IS NOT CLEAN."
-    git status --short
-    exit 1
-fi
-echo
-echo "Repository checkpoint verified."
-echo
-echo "======================================================================"
-echo "  2. VERIFY CREDENTIALS"
-echo "======================================================================"
-if [ -n "${VAST_TOKEN:-}" ]; then
-    echo "Credential : VAST_TOKEN present"
-elif [ -n "${VAST_PASSWORD:-}" ]; then
-    echo "Credential : VAST_PASSWORD present"
-else
-    echo
-    echo "ERROR: No VAST credential available."
-    exit 1
-fi
-echo
-echo "======================================================================"
-echo "  3. VERIFY LOAD GENERATORS"
-echo "======================================================================"
-LOADGEN_OK=1
-for u in nfs3-loadgen nfs41-loadgen block-loadgen smb-loadgen; do
-    STATE=$(systemctl is-active "$u.service" 2>&1 || true)
-    printf "%-18s : %s\n" "$u" "$STATE"
-    case "$u" in
-        nfs3-loadgen|block-loadgen)
-            if [ "$STATE" != "active" ]; then
-                LOADGEN_OK=0
-            fi
-            ;;
-    esac
-done
-echo
-if [ "$LOADGEN_OK" -ne 1 ]; then
-    echo "ERROR: A required load generator is not active."
-    echo
-    echo "Required for this pass:"
-    echo "  nfs3-loadgen.service"
-    echo "  block-loadgen.service"
-    echo
-    echo "Fix the workload before collecting evidence."
-    exit 1
-fi
-echo "Required load generators are active."
-echo
-echo "======================================================================"
-echo "  4. CAPTURE PRE-RUN STATE"
-echo "======================================================================"
-{
-    echo "run id        : $DTS"
-    echo "hostname      : $(hostname)"
-    echo "collected     : $(date '+%F %T %Z')"
-    echo "branch        : $(git rev-parse --abbrev-ref HEAD)"
-    echo "HEAD          : $(git rev-parse HEAD)"
-    echo "expected HEAD : $EXPECTED_SHA"
-    echo "python        : $(python3 -V 2>&1)"
-    echo "target        : $VMS"
-    echo "view anchors  : $VIEW_ANCHORS"
-    echo "TMPDIR        : $TMPDIR"
-    if [ -n "${VAST_TOKEN:-}" ]; then
-        echo "credential    : VAST_TOKEN present"
-    else
-        echo "credential    : VAST_PASSWORD present"
-    fi
-    echo
-    echo "working tree:"
-    git status --short
-    echo
-    echo "load generators:"
-    for u in nfs3-loadgen nfs41-loadgen block-loadgen smb-loadgen; do
-        echo "$u : $(systemctl is-active "$u.service" 2>&1 || true)"
-    done
-    echo
-    echo "recent commits:"
-    git log -10 --oneline --decorate
-    echo
-    echo "tags at HEAD:"
-    git tag --points-at HEAD
-} | tee "$EV/prereqs.txt"
-echo
-echo "======================================================================"
-echo "  5. CAPTURE LOAD GENERATOR STATE"
-echo "======================================================================"
-for u in nfs3-loadgen nfs41-loadgen block-loadgen smb-loadgen; do
-    systemctl status "$u.service" --no-pager -l \
-        > "$EV/${u}-status-before.txt" 2>&1 || true
-    journalctl -u "$u.service" -n 200 --no-pager \
-        > "$EV/${u}-journal-before.txt" 2>&1 || true
-done
-echo
-echo "======================================================================"
-echo "  6. CAPTURE NFS CLIENT STATE BEFORE PROBE"
-echo "======================================================================"
-mount > "$EV/mounts-all.txt" 2>&1
-mount | grep -iE 'type nfs|nfs3|nfs4|vast' \
-    > "$EV/mounts-nfs.txt" 2>&1 || true
-cat /proc/self/mountstats \
-    > "$EV/mountstats-before.txt" 2>&1 || true
-if command -v nfsiostat >/dev/null 2>&1; then
-    nfsiostat 1 3 \
-        > "$EV/nfsiostat-before.txt" 2>&1 || true
-else
-    echo "nfsiostat not installed" \
-        > "$EV/nfsiostat-before.txt"
-fi
-ps -ef \
-    > "$EV/processes-before.txt"
-ps -ef | grep -E '[f]io|[n]fs3|[n]fs41|[b]lock-loadgen' \
-    > "$EV/loadgen-processes-before.txt" 2>&1 || true
-echo
-echo "======================================================================"
-echo "  7. CAPTURE TEMPORARY-FILE BASELINE"
-echo "======================================================================"
-find "$RUNTMP" -maxdepth 2 -type f -print \
-    > "$EV/runtime-files-before.txt"
-find /tmp -maxdepth 1 \
-    -name 'opstat-api-telemetry-probe-*' \
-    -printf '%T@ %p\n' 2>/dev/null \
-    > "$EV/preexisting-tmp-opstat-files.txt" || true
-echo
-echo "======================================================================"
-echo "  8. RUN TARGETED TELEMETRY PROBE"
-echo "======================================================================"
-date '+PROBE-START %F %T %Z' \
-    | tee "$EV/timestamps.txt"
-python3 scripts/var203_validation/probe_telemetry_correctness.py \
-    --vms "$VMS" \
-    --user "$VMS_USER" \
-    --view-paths "$VIEW_ANCHORS" \
-    --evidence-dir "$RAW" \
-    2>&1 | tee "$EV/probe-output.txt"
-PROBE_RC=${PIPESTATUS[0]}
-echo "PROBE-RC $PROBE_RC" \
-    | tee -a "$EV/timestamps.txt"
-date '+PROBE-END %F %T %Z' \
-    | tee -a "$EV/timestamps.txt"
-echo
-echo "Probe return code: $PROBE_RC"
-echo
-echo "======================================================================"
-echo "  9. CAPTURE NFS CLIENT STATE AFTER PROBE"
-echo "======================================================================"
-cat /proc/self/mountstats \
-    > "$EV/mountstats-after.txt" 2>&1 || true
-if command -v nfsiostat >/dev/null 2>&1; then
-    nfsiostat 1 3 \
-        > "$EV/nfsiostat-after.txt" 2>&1 || true
-else
-    echo "nfsiostat not installed" \
-        > "$EV/nfsiostat-after.txt"
-fi
-ps -ef | grep -E '[f]io|[n]fs3|[n]fs41|[b]lock-loadgen' \
-    > "$EV/loadgen-processes-after.txt" 2>&1 || true
-echo
-echo "======================================================================"
-echo "  10. CAPTURE BLOCK CLIENT LATENCY EVIDENCE"
-echo "======================================================================"
-if sudo -n true >/dev/null 2>&1; then
-    sudo -n journalctl \
-        -u block-loadgen.service \
-        -n 400 \
-        --no-pager \
-        > "$EV/block-loadgen-journal-after.txt" 2>&1 || true
-else
-    journalctl \
-        -u block-loadgen.service \
-        -n 400 \
-        --no-pager \
-        > "$EV/block-loadgen-journal-after.txt" 2>&1 || true
-fi
-echo
-echo "======================================================================"
-echo "  11. CAPTURE POST-RUN LOAD GENERATOR STATE"
-echo "======================================================================"
-for u in nfs3-loadgen nfs41-loadgen block-loadgen smb-loadgen; do
-    systemctl status "$u.service" --no-pager -l \
-        > "$EV/${u}-status-after.txt" 2>&1 || true
-    journalctl -u "$u.service" -n 200 --no-pager \
-        > "$EV/${u}-journal-after.txt" 2>&1 || true
-done
-echo
-echo "======================================================================"
-echo "  12. LOCATE THIS RUN'S API LOG"
-echo "======================================================================"
-find "$RUNTMP" -type f -print \
-    > "$EV/runtime-files-after.txt" 2>&1 || true
-APILOG=$(find "$EV" \
-    -type f \
-    -name 'opstat-api-telemetry-probe-*' \
-    -printf '%T@ %p\n' 2>/dev/null \
-    | sort -nr \
-    | head -1 \
-    | cut -d' ' -f2-)
-if [ -n "${APILOG:-}" ] && [ -f "$APILOG" ]; then
-    echo "API log: $APILOG" \
-        | tee "$EV/api-log-location.txt"
-else
-    echo "API log not found beneath evidence directory." \
-        | tee "$EV/api-log-location.txt"
-fi
-echo
-echo "======================================================================"
-echo "  13. VERIFY NOTHING NEW WAS WRITTEN TO /tmp"
-echo "======================================================================"
-find /tmp -maxdepth 1 \
-    -name 'opstat-api-telemetry-probe-*' \
-    -printf '%T@ %p\n' 2>/dev/null \
-    > "$EV/postrun-tmp-opstat-files.txt" || true
-python3 - "$EV/preexisting-tmp-opstat-files.txt" \
-          "$EV/postrun-tmp-opstat-files.txt" \
-          "$EV/tmp-artifact-check.txt" <<'PY'
-import sys
-before_path, after_path, out_path = sys.argv[1:4]
-def read(path):
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            return set(line.rstrip("\n") for line in fh if line.strip())
-    except OSError:
-        return set()
-before = read(before_path)
-after = read(after_path)
-new = sorted(after - before)
-with open(out_path, "w", encoding="utf-8") as fh:
-    if new:
-        fh.write("FAIL: new opstat telemetry artifacts appeared in /tmp\n")
-        for line in new:
-            fh.write(line + "\n")
-    else:
-        fh.write("PASS: no new opstat telemetry artifacts appeared in /tmp\n")
-if new:
-    print("WARNING: probe created new opstat telemetry artifacts in /tmp")
-else:
-    print("PASS: no new opstat telemetry artifacts created in /tmp")
-PY
-TMP_CHECK_RC=$?
-echo
-echo "======================================================================"
-echo "  14. CAPTURE FINAL REPOSITORY STATE"
-echo "======================================================================"
-git fetch origin
-{
-    echo "branch        : $(git rev-parse --abbrev-ref HEAD)"
-    echo "HEAD          : $(git rev-parse HEAD)"
-    echo "origin/main   : $(git rev-parse origin/main)"
-    echo "expected HEAD : $EXPECTED_SHA"
-    echo
-    echo "working tree:"
-    git status --short
-    echo
-    echo "recent history:"
-    git log -10 --oneline --decorate
-    echo
-    echo "tags at HEAD:"
-    git tag --points-at HEAD
-} > "$EV/git-final-state.txt"
-echo
-echo "======================================================================"
-echo "  15. BUILD MANIFEST"
-echo "======================================================================"
-{
-    echo "OPSTAT TARGETED TELEMETRY EVIDENCE MANIFEST"
-    echo
-    echo "Run ID          : $DTS"
-    echo "Host            : $(hostname)"
-    echo "Start/End:"
-    cat "$EV/timestamps.txt"
-    echo
-    echo "Repository:"
-    echo "  Branch        : $(git rev-parse --abbrev-ref HEAD)"
-    echo "  HEAD          : $(git rev-parse HEAD)"
-    echo "  Expected HEAD : $EXPECTED_SHA"
-    echo
-    echo "Probe:"
-    echo "  Return code   : $PROBE_RC"
-    echo
-    echo "Target:"
-    echo "  VMS           : $VMS"
-    echo "  View anchors  : $VIEW_ANCHORS"
-    echo
-    echo "Artifact root:"
-    echo "  $EV"
-    echo
-    echo "/tmp policy:"
-    cat "$EV/tmp-artifact-check.txt"
-    echo
-    echo "API log:"
-    cat "$EV/api-log-location.txt"
-} > "$EV/MANIFEST.txt"
-echo
-echo "======================================================================"
-echo "  16. INVENTORY EVIDENCE DIRECTORY"
-echo "======================================================================"
-find "$EV" \
-    -type f \
-    -printf '%P\t%k KB\n' \
-    | sort \
-    > "$EV/file-inventory.txt"
-cat "$EV/file-inventory.txt"
-echo
-echo "======================================================================"
-echo "  17. BUILD FINAL ZIP"
-echo "======================================================================"
-rm -f "$ARCHIVE"
-(
-    cd "$BASE" || exit 1
-    zip -qr "$ARCHIVE" "$DTS"
-)
-if [ ! -f "$ARCHIVE" ]; then
-    echo
-    echo "ERROR: ZIP archive was not created."
-    exit 1
-fi
-echo
-echo "======================================================================"
-echo "  18. VERIFY FINAL ZIP"
-echo "======================================================================"
-unzip -t "$ARCHIVE"
-echo
-echo "Archive inventory:"
-unzip -l "$ARCHIVE"
-echo
-echo "======================================================================"
-echo "  19. FINAL RESULT"
-echo "======================================================================"
-echo
-echo "Probe return code : $PROBE_RC"
-echo "Repository HEAD   : $(git rev-parse HEAD)"
-echo "Evidence directory:"
-echo
-echo "  $EV"
-echo
-echo "Final deliverable:"
-echo
-echo "  $ARCHIVE"
-echo
-echo "Archive size:"
-ls -lh "$ARCHIVE"
-echo
-echo "SHA256:"
-sha256sum "$ARCHIVE"
-echo
-echo "Evidence files in /tmp:"
-cat "$EV/tmp-artifact-check.txt"
-echo
-echo "======================================================================"
-if [ "$PROBE_RC" -ne 0 ]; then
-    echo
-    echo "WARNING: Probe returned non-zero."
-    echo "The evidence archive was still preserved for analysis."
-fi
-if [ "$TMP_CHECK_RC" -ne 0 ]; then
-    echo
-    echo "WARNING: Unexpected /tmp artifact check condition."
-fi
-echo
-echo "RETURN THIS ONE FILE:"
-echo
-echo "  $ARCHIVE"
-echo
-echo "======================================================================"
 
-One thing I want Claude to change permanently
+This stops the probe on line one instead of making you guess why the VAST API rejected the zero-state queries.
 
-The shell script sets:
+vastdata@kevin-mcdonald-ubu-01:~/git/opstat$ bash scripts/opstat-lab-fr2-delegation-discovery.sh
 
-TMPDIR="$EV/tmp"
-TMP="$EV/tmp"
-TEMP="$EV/tmp"
+== 1. repository state ==================================================
+Already on 'main'
+Your branch is up to date with 'origin/main'.
+Already up to date.
+[19:27:50] PASS    : main @ 4463499a90e15a799961cbeb1ff17d49a289a7c7 (matches origin/main)
 
-so any sane temp-file implementation will stay under your run directory. But because we’ve historically seen:
+== 2. working tree ==================================================
+[19:27:50] PASS    : working tree clean
 
-/tmp/opstat-api-telemetry-probe-...
+== 3. credentials and NFSv4.1 environment ==================================================
+[19:27:50] PASS    : credential: VAST_PASSWORD present
+[19:27:50] PASS    : nfs41-loadgen active (open files give the best delegation odds)
+[19:27:50] PASS    : NFSv4.1 mount present: /mnt/nfs41test
 
-I don’t want to merely hope the logging code respects TMPDIR.
+== 4. mount derivation and real file candidates (client-side truth) ==================================================
+[19:27:50] PASS    : mount: server export /kmacs/nfstest on /mnt/nfs41test
+/mnt/nfs41test/nfs41_loadgen/attr_stress.txt
+/mnt/nfs41test/delegation_test_file.txt
+/mnt/nfs41test/nfs41_loadgen/fio_bw.bin
+/mnt/nfs41test/nfs41_loadgen/fio_iops.bin
+/mnt/nfs41test/nfs41_loadgen/fio_locks.bin
+/mnt/nfs41test/nfs41_loadgen/lock_stress.dat
+/mnt/nfs41test/nfs41_loadgen/meta_stress/dir_1/file_11
+/mnt/nfs41test/nfs41_loadgen/meta_stress/dir_1/file_14
+export path     : /kmacs/nfstest
+candidate rc    : 0
+client files    : /mnt/nfs41test/nfs41_loadgen/attr_stress.txt,/mnt/nfs41test/delegation_test_file.txt,/mnt/nfs41test/nfs41_loadgen/fio_bw.bin,/mnt/nfs41test/nfs41_loadgen/fio_iops.bin,/mnt/nfs41test/nfs41_loadgen/fio_locks.bin,/mnt/nfs41test/nfs41_loadgen/lock_stress.dat,/mnt/nfs41test/nfs41_loadgen/meta_stress/dir_1/file_11,/mnt/nfs41test/nfs41_loadgen/meta_stress/dir_1/file_14
+hostname : kevin-mcdonald-ubu-01
+collected: 2026-08-18 19:28:32 UTC
+HEAD     : 4463499a90e15a799961cbeb1ff17d49a289a7c7
+python   : Python 3.12.3
+target   : var203.selab.vastdata.com
+run dir  : /home/vastdata/kjmtmp/opstat/fr2-20260818-192749
+PROBE-START 2026-08-18 19:28:32
 
-The script therefore compares /tmp before and after and explicitly tells us whether the probe cheated.
+== 5. delegation endpoint discovery (GET-only) ==================================================
+api log: /home/vastdata/kjmtmp/opstat/fr2-20260818-192749/raw/opstat-api-fr2-delegations-var203.selab.vastdata.com-443-710499.log
+fr2 delegation discovery - 2026-08-18T19:28:32Z
+cluster: selab-var-203 (5.4.6.0.17320657730101426841)
+  evidence: view-candidates.json (430 bytes)
+PROBE:correlation.views PASS 3 candidate view(s) for /kmacs/nfstest/nfs41_loadgen/attr_stress.txt; top: [(320, '/kmacs/nfstest', 'prefix'), (1, '/', 'prefix'), (217, '/', 'prefix')]
+PROBE:correlation.tenant PASS namespace tenant candidates (derived, ordered): [(1, 'default', 'prefix view id 320 path /kmacs/nfstest'), (7, 'nireny', 'prefix view id 217 path /')]
+  evidence: file-mapping.txt (865 bytes)
+  file mapping:
+    client /mnt/nfs41test/nfs41_loadgen/attr_stress.txt -> server /kmacs/nfstest/nfs41_loadgen/attr_stress.txt
+    client /mnt/nfs41test/delegation_test_file.txt -> server /kmacs/nfstest/delegation_test_file.txt
+    client /mnt/nfs41test/nfs41_loadgen/fio_bw.bin -> server /kmacs/nfstest/nfs41_loadgen/fio_bw.bin
+    client /mnt/nfs41test/nfs41_loadgen/fio_iops.bin -> server /kmacs/nfstest/nfs41_loadgen/fio_iops.bin
+    client /mnt/nfs41test/nfs41_loadgen/fio_locks.bin -> server /kmacs/nfstest/nfs41_loadgen/fio_locks.bin
+    client /mnt/nfs41test/nfs41_loadgen/lock_stress.dat -> server /kmacs/nfstest/nfs41_loadgen/lock_stress.dat
+    client /mnt/nfs41test/nfs41_loadgen/meta_stress/dir_1/file_11 -> server /kmacs/nfstest/nfs41_loadgen/meta_stress/dir_1/file_11
+    client /mnt/nfs41test/nfs41_loadgen/meta_stress/dir_1/file_14 -> server /kmacs/nfstest/nfs41_loadgen/meta_stress/dir_1/file_14
+  evidence: deleg-availability-t1.txt (139 bytes)
+PROBE:deleg.availability PASS tenant default (no file_path) [111ms] -> GET https://var203.selab.vastdata.com:443/api/tenants/1/nfs4_delegs/ failed: HTTP 400: {"detail":"['__root__->file_path: field required']"}
+  path representations to try (derived, bounded): ['/kmacs/nfstest/nfs41_loadgen/attr_stress.txt', '/nfs41_loadgen/attr_stress.txt']
+  evidence: deleg-try0-t1.txt (234 bytes)
+PROBE:deleg.try0 FAIL tenant default /kmacs/nfstest/nfs41_loadgen/attr_stress.txt [215ms] -> GET https://var203.selab.vastdata.com:443/api/tenants/1/nfs4_delegs/?file_path=%2Fkmacs%2Fnfstest%2Fnfs41_loadgen%2Fattr_stress.txt failed:
+  evidence: deleg-try1-t1.txt (216 bytes)
+PROBE:deleg.try1 FAIL tenant default /nfs41_loadgen/attr_stress.txt [209ms] -> GET https://var203.selab.vastdata.com:443/api/tenants/1/nfs4_delegs/?file_path=%2Fnfs41_loadgen%2Fattr_stress.txt failed: HTTP 400: {"detail
+  evidence: deleg-try2-t7.txt (234 bytes)
+PROBE:deleg.try2 FAIL tenant nireny /kmacs/nfstest/nfs41_loadgen/attr_stress.txt [214ms] -> GET https://var203.selab.vastdata.com:443/api/tenants/7/nfs4_delegs/?file_path=%2Fkmacs%2Fnfstest%2Fnfs41_loadgen%2Fattr_stress.txt failed:
+  evidence: deleg-try3-t7.txt (216 bytes)
+PROBE:deleg.try3 FAIL tenant nireny /nfs41_loadgen/attr_stress.txt [434ms] -> GET https://var203.selab.vastdata.com:443/api/tenants/7/nfs4_delegs/?file_path=%2Fnfs41_loadgen%2Fattr_stress.txt failed: HTTP 400: {"detail
+PROBE:correlation.winner FAIL no (tenant, syntax) pair produced an HTTP success for a real existing file - every attempt recorded verbatim
 
-If it reports:
+No delegation records observed; field names remain unproven by this run (shape/empty evidence still captured).
 
-PASS: no new opstat telemetry artifacts appeared in /tmp
+=== RESULT SUMMARY ===
+PROBE:correlation.views PASS 3 candidate view(s) for /kmacs/nfstest/nfs41_loadgen/attr_stress.txt; top: [(320, '/kmacs/nfstest', 'prefix'), (1, '/', 'prefix'), (217, '/', 'prefix')]
+PROBE:correlation.tenant PASS namespace tenant candidates (derived, ordered): [(1, 'default', 'prefix view id 320 path /kmacs/nfstest'), (7, 'nireny', 'prefix view id 217 path /')]
+PROBE:deleg.availability PASS tenant default (no file_path) [111ms] -> GET https://var203.selab.vastdata.com:443/api/tenants/1/nfs4_delegs/ failed: HTTP 400: {"detail":"['__root__->file_path: field required']"}
+PROBE:deleg.try0 FAIL tenant default /kmacs/nfstest/nfs41_loadgen/attr_stress.txt [215ms] -> GET https://var203.selab.vastdata.com:443/api/tenants/1/nfs4_delegs/?file_path=%2Fkmacs%2Fnfstest%2Fnfs41_loadgen%2Fattr_stress.txt failed:
+PROBE:deleg.try1 FAIL tenant default /nfs41_loadgen/attr_stress.txt [209ms] -> GET https://var203.selab.vastdata.com:443/api/tenants/1/nfs4_delegs/?file_path=%2Fnfs41_loadgen%2Fattr_stress.txt failed: HTTP 400: {"detail
+PROBE:deleg.try2 FAIL tenant nireny /kmacs/nfstest/nfs41_loadgen/attr_stress.txt [214ms] -> GET https://var203.selab.vastdata.com:443/api/tenants/7/nfs4_delegs/?file_path=%2Fkmacs%2Fnfstest%2Fnfs41_loadgen%2Fattr_stress.txt failed:
+PROBE:deleg.try3 FAIL tenant nireny /nfs41_loadgen/attr_stress.txt [434ms] -> GET https://var203.selab.vastdata.com:443/api/tenants/7/nfs4_delegs/?file_path=%2Fnfs41_loadgen%2Fattr_stress.txt failed: HTTP 400: {"detail
+PROBE:correlation.winner FAIL no (tenant, syntax) pair produced an HTTP success for a real existing file - every attempt recorded verbatim
+evidence directory: /home/vastdata/kjmtmp/opstat/fr2-20260818-192749/raw
+SAFETY: this probe issues GET requests only; the API log must contain zero non-GET lines.
+PROBE-RC 0
+PROBE-END 2026-08-18 19:28:34
+[19:28:34] PASS    : probe rc=0
 
-we’re done.
+== 6. read-only verification (API log) ==================================================
+[19:28:34] PASS    : API log inside the run tree: /home/vastdata/kjmtmp/opstat/fr2-20260818-192749/raw/opstat-api-fr2-delegations-var203.selab.vastdata.com-443-710499.log
+[19:28:34] PASS    : API log contains ZERO non-GET requests (D-008 honored)
 
-If it reports a new /tmp/opstat-api-... file, then the next Claude instruction should be to make the API-log destination honor TMPDIR or an explicit log-directory option. That’s a tooling hygiene change, not production telemetry behavior.
+== 7. post-run state and /tmp policy ==================================================
+[19:28:34] PASS    : no new opstat artifacts in /tmp
 
-From here forward, I’d use this filesystem convention for every lab run:
+== 8. minimum success check ==================================================
+[19:28:35] ERROR   : minimum success NOT met: no (tenant, syntax) pair produced an HTTP success for a real file
 
-$HOME/
-├── git/
-│   └── opstat/
-│
-├── kjmtmp/
-│   └── opstat/
-│       ├── 20260817-153512/
-│       │   ├── MANIFEST.txt
-│       │   ├── prereqs.txt
-│       │   ├── raw/
-│       │   ├── tmp/
-│       │   └── ...
-│       │
-│       └── 20260817-181304/
-│           └── ...
-│
-└── opstat-telemetry2-20260817-153512.zip
+== final packaging and verdict ==================================================
+opstat FR2 delegation discovery - 20260818-192749
+HEAD 4463499a90e15a799961cbeb1ff17d49a289a7c7  target var203.selab.vastdata.com  probe rc 0  script failures 1
 
-Nice clean crime-scene bags: every run isolated, timestamped, self-describing, and one ZIP sitting in $HOME waiting to be hauled back.
+candidates.txt      : candidate discovery outcome
+candidate-files.txt : raw candidate list (helper output)
+probe-output.txt    : full PROBE: verdicts incl. observed record fields
+raw/                : verbatim endpoint responses + GET-only API log
+logs/               : mounts, mountstats, loadgen status, tmp diff
+
+file inventory:
+  MANIFEST.txt
+  candidate-files.txt
+  candidates.txt
+  git-final-state.txt
+  logs/mount-listing.txt
+  logs/mounts.txt
+  logs/mountstats-after.txt
+  logs/mountstats-before.txt
+  logs/nfs41-loadgen-status.txt
+  logs/tmp-after.txt
+  logs/tmp-before.txt
+  prereqs.txt
+  probe-output.txt
+  raw/deleg-availability-t1.txt
+  raw/deleg-try0-t1.txt
+  raw/deleg-try1-t1.txt
+  raw/deleg-try2-t7.txt
+  raw/deleg-try3-t7.txt
+  raw/file-mapping.txt
+  raw/opstat-api-fr2-delegations-var203.selab.vastdata.com-443-710499.log
+  raw/view-candidates.json
+  timestamps.txt
+[19:28:35] PASS    : ZIP integrity verified
+
+      906  2026-08-18 19:28   fr2-20260818-192749/logs/mount-listing.txt
+      862  2026-08-18 19:27   fr2-20260818-192749/logs/mounts.txt
+        0  2026-08-18 19:28   fr2-20260818-192749/logs/tmp-before.txt
+        0  2026-08-18 19:28   fr2-20260818-192749/logs/tmp-after.txt
+      436  2026-08-18 19:28   fr2-20260818-192749/candidates.txt
+      242  2026-08-18 19:28   fr2-20260818-192749/prereqs.txt
+---------                     -------
+    91967                     26 files
+
+-rw-rw-r-- 1 vastdata vastdata 27K Aug 18 19:28 /home/vastdata/opstat-fr2-delegation-discovery-20260818-192749.zip
+47505d0acfb2e66df2fa81446bdc53b55d0c6a761881674be431fe30952ecb47  /home/vastdata/opstat-fr2-delegation-discovery-20260818-192749.zip
+
+======================================================================
+RESULT: RUN FAILED (1 failure(s) - see ERROR lines above).
+The archive still contains the failure evidence; return it anyway:
+
+    /home/vastdata/opstat-fr2-delegation-discovery-20260818-192749.zip
+======================================================================
+vastdata@kevin-mcdonald-ubu-01:~/git/opstat$
+
+
