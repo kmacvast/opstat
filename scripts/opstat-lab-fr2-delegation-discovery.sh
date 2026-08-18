@@ -22,12 +22,14 @@ set -u
 
 # ------------------------------------------------------------------ variables
 REPO="${OPSTAT_REPO:-$HOME/git/opstat}"
-VMS="${OPSTAT_VMS:-var203.selab.vastdata.com}"
+VMS="${OPSTAT_VMS:-var204.selab.vastdata.com}"   # NFSv4.1 target: the VMS owning the mount
+VMSTAG=${VMS%%.*}
+REQUIRED_LOADGEN="nfs41-loadgen"       # active NFSv4.1 state is required
 NFS41_MOUNT="${OPSTAT_NFS41_MOUNT:-/mnt/nfs41test}"   # client mount of the NFSv4.1 view
 FIO_WAIT_S=90                          # bounded wait for a loadgen fio phase
 DTS=$(date +%Y%m%d-%H%M%S)
-RUN="$HOME/kjmtmp/opstat/fr2-$DTS"
-ZIP="$HOME/opstat-fr2-delegation-discovery-$DTS.zip"
+RUN="$HOME/kjmtmp/opstat/fr2-$VMSTAG-$DTS"
+ZIP="$HOME/opstat-fr2-delegation-discovery-$VMSTAG-$DTS.zip"
 FAILURES=0
 
 say()  { echo "[$(date +%T)] $*"; }
@@ -109,28 +111,36 @@ section "3. credentials and NFSv4.1 environment"
 if [ -n "${VAST_TOKEN:-}" ]; then pass "credential: VAST_TOKEN present"
 elif [ -n "${VAST_PASSWORD:-}" ]; then pass "credential: VAST_PASSWORD present"
 else err "no VAST_TOKEN/VAST_PASSWORD in environment - aborting before any cluster contact"; exit 1; fi
-state=$(systemctl is-active nfs41-loadgen.service 2>&1)
-if [ "$state" = "active" ]; then pass "nfs41-loadgen active (open files give the best delegation odds)"
-else warn "nfs41-loadgen is $state - shape/empty evidence still lands"; fi
-systemctl status nfs41-loadgen.service --no-pager -l > "$RUN/logs/nfs41-loadgen-status.txt" 2>&1
-mount | grep -iE "nfs|vast" > "$RUN/logs/mounts.txt" 2>&1
-grep -q "$NFS41_MOUNT" "$RUN/logs/mounts.txt" \
-  && pass "NFSv4.1 mount present: $NFS41_MOUNT" \
-  || warn "$NFS41_MOUNT not mounted; file candidates may be empty"
-
-# Locate the loadgen check in Section 3 and replace the warning block with:
-if ! pgrep -f "nfs41-loadgen" >/dev/null 2>&1; then
-    echo "[!] ERROR: nfs41-loadgen is not running. Active NFSv4.1 state is required."
-    echo "[!] Run 'sudo systemctl start nfs41-loadgen' before running this probe."
-    exit 1
+# Layered prerequisites (durable policy): required service -> mount health
+# -> mount-to-VMS consistency (verified in the probe against the target
+# cluster's own VIPs) -> real files -> probe. Never auto-start anything.
+if ! systemctl is-active --quiet "$REQUIRED_LOADGEN.service"; then
+  err "prerequisite: $REQUIRED_LOADGEN is not running - active NFSv4.1 state is required for delegation evidence"
+  say "start it with: sudo systemctl start $REQUIRED_LOADGEN"
+  exit 1
 fi
+pass "$REQUIRED_LOADGEN active"
+systemctl status "$REQUIRED_LOADGEN.service" --no-pager -l > "$RUN/logs/nfs41-loadgen-status.txt" 2>&1
+mount | grep -iE "nfs|vast" > "$RUN/logs/mounts.txt" 2>&1
+if ! grep -q " $NFS41_MOUNT " "$RUN/logs/mounts.txt"; then
+  err "prerequisite: no NFSv4.1 mount at $NFS41_MOUNT - mount the target cluster's export first"
+  exit 1
+fi
+grep " $NFS41_MOUNT " "$RUN/logs/mounts.txt" | grep -q "vers=4.1" \
+  && pass "mount at $NFS41_MOUNT is NFS vers=4.1" \
+  || { err "prerequisite: $NFS41_MOUNT is not an NFS v4.1 mount"; exit 1; }
+ls "$NFS41_MOUNT" >/dev/null 2>&1 \
+  && pass "mount is readable" \
+  || { err "prerequisite: cannot read $NFS41_MOUNT"; exit 1; }
+
 # --------------------------------- 4. mount facts + real file candidates
 section "4. mount derivation and real file candidates (client-side truth)"
 EXPORT=$(mount | awk -v mp="$NFS41_MOUNT" '$3 == mp {split($1, a, ":"); print a[2]}' | head -1)
+SERVER_IP=$(mount | awk -v mp="$NFS41_MOUNT" '$3 == mp {split($1, a, ":"); print a[1]}' | head -1)
 if [ -z "$EXPORT" ]; then
   err "no mount found at $NFS41_MOUNT; cannot derive the export path"; EXPORT="unknown"
 else
-  pass "mount: server export $EXPORT on $NFS41_MOUNT"
+  pass "mount: server $SERVER_IP export $EXPORT on $NFS41_MOUNT (API target $VMS)"
 fi
 # Real existing files, via the tested helper: open fds of any process,
 # paths named on loadgen command lines, then a shallow walk (zero-byte
@@ -168,6 +178,7 @@ section "5. delegation endpoint discovery (GET-only)"
 python3 scripts/var203_validation/probe_fr2_delegations.py \
   --vms "$VMS" --user admin \
   --mountpoint "$NFS41_MOUNT" --export-path "$EXPORT" \
+  --mount-server "$SERVER_IP" \
   --client-files "$CLIENT_FILES" \
   --dir-paths "$EXPORT/nfs41_loadgen" \
   --evidence-dir "$RUN/raw" 2>&1 | tee "$RUN/probe-output.txt"

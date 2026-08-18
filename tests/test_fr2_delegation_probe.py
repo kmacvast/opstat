@@ -285,3 +285,60 @@ def test_lab_script_candidate_helper_invocation_parses():
     argv = _extract_argv(_LAB_SCRIPT,
                          "scripts/var203_validation/find_nfs41_candidates.py")
     helper.build_parser().parse_args(argv)   # SystemExit(2) = contract break
+
+
+# ---------------------------------------------------------------------------
+# Mount-to-VMS consistency (2026-08-18 owner correction): the lab server's
+# NFSv4.1 mount belongs to var204, and the earlier runs queried var203 about
+# files living there - every ILLEGAL_PATH was cross-cluster noise. The probe
+# now refuses to collect evidence unless the mounted server address is a VIP
+# of the cluster being queried.
+# ---------------------------------------------------------------------------
+def test_vips_contain_ip_matches_across_payload_shapes():
+    probe = _load_probe()
+    assert probe.vips_contain_ip(
+        [{"id": 1, "ip": "172.200.204.6"}], "172.200.204.6")
+    assert probe.vips_contain_ip(
+        {"results": [{"vips": [{"addr": "172.200.204.6"}]}]}, "172.200.204.6")
+    assert not probe.vips_contain_ip(
+        [{"id": 1, "ip": "172.200.202.6"}], "172.200.204.6"), (
+        "a var204 mount server must not match var203's VIP inventory")
+    assert not probe.vips_contain_ip([], "172.200.204.6")
+    assert not probe.vips_contain_ip([{"ip": "172.200.204.6"}], "")
+
+
+def test_mismatch_guard_precedes_all_delegation_queries():
+    """Structural ordering: the consistency verdict and its refusal must sit
+    before the correlation flow and every nfs4_delegs call in main()."""
+    body = open("scripts/var203_validation/probe_fr2_delegations.py").read()
+    guard = body.index("preflight.mount_matches_vms")
+    assert body.index("Refusing to", guard) < body.index(
+        "mount -> view -> tenant correlation"), (
+        "the refusal must come before correlation")
+    assert guard < body.index('probe_one("availability"')
+
+
+def test_required_objective_decides_exit_status():
+    probe = _load_probe()
+    probe.SUMMARY.append("PROBE:deleg.try0 FAIL something")
+    assert probe.required_objective_met() is False
+    probe.SUMMARY.append("PROBE:correlation.winner PASS tenant 1 accepts ...")
+    assert probe.required_objective_met() is True
+
+
+def test_lab_script_nfs41_defaults_and_prerequisites():
+    """NFSv4.1 discovery defaults to var204 (the cluster owning the mount);
+    the loadgen prerequisite fails fast with operator guidance and never
+    auto-starts anything; the mount must exist, be readable and be v4.1."""
+    body = open(_LAB_SCRIPT).read()
+    assert "OPSTAT_VMS:-var204.selab.vastdata.com" in body, (
+        "var203 must no longer be the NFSv4.1 default target")
+    assert 'REQUIRED_LOADGEN="nfs41-loadgen"' in body
+    check = body.index('systemctl is-active --quiet "$REQUIRED_LOADGEN')
+    probe_call = body.index("probe_fr2_delegations.py \\")
+    assert check < probe_call, "the prerequisite must precede the probe"
+    for line in body.splitlines():
+        if "systemctl start" in line:
+            assert "say " in line or "echo" in line, (
+                "the start command is operator guidance, never executed: %r" % line)
+    assert "vers=4.1" in body and '--mount-server "$SERVER_IP"' in body

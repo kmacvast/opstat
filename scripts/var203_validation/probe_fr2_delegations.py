@@ -175,6 +175,37 @@ def path_representations(server_path, view_path, export_path):
     return out[:3]
 
 
+def vips_contain_ip(vips_payload, ip):
+    """Does the target cluster's own VIP inventory contain *ip*?
+
+    Authoritative mount-to-VMS consistency: the mounted NFS server address
+    must be one of the VIPs of the cluster being queried. The 2026-08-18 run
+    queried var203's nfs4_delegs about files mounted from a var204 VIP, and
+    every ILLEGAL_PATH it collected was cross-cluster noise. Walks the whole
+    payload so VMS shape differences cannot hide a match.
+    """
+    if not ip:
+        return False
+    stack = [vips_payload]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, str) and node.strip() == ip:
+            return True
+        if isinstance(node, dict):
+            stack.extend(node.values())
+        elif isinstance(node, (list, tuple)):
+            stack.extend(node)
+    return False
+
+
+def required_objective_met():
+    """The probe's REQUIRED discovery objective: one (tenant, syntax) pair
+    returned an HTTP success for a real existing file. Optional observations
+    may FAIL as evidence without failing the process; this one decides the
+    exit status, and the outer lab script independently enforces it too."""
+    return any("correlation.winner PASS" in line for line in SUMMARY)
+
+
 def probe_one(tag, tenant_id, tenant_name, file_path):
     label = file_path if file_path is not None else "(no file_path)"
     started = time.monotonic()
@@ -217,6 +248,10 @@ def build_parser():
     parser.add_argument("--user", default="admin")
     parser.add_argument("--mountpoint", required=True,
                         help="client mountpoint of the NFSv4.1 filesystem")
+    parser.add_argument("--mount-server", required=True,
+                        help="NFS server address from the mount table; must "
+                             "be a VIP of the --vms cluster or the probe "
+                             "refuses to collect cross-cluster evidence")
     parser.add_argument("--export-path", required=True,
                         help="server-side export path of that mount "
                              "(from the mount table, e.g. /kmacs/nfstest)")
@@ -264,6 +299,21 @@ def main():
         log("cluster: %s (%s)" % (
             first.get("name", "?"),
             vast_common.os_release_from_cluster(first) or "os unknown"))
+
+        # ---- mount-to-VMS consistency: the mounted server address must be
+        # a VIP of the cluster we are about to query ----
+        vips = get_only("GET", "/vips/")
+        if vips_contain_ip(vips, args.mount_server):
+            verdict("preflight.mount_matches_vms", True,
+                    "mount server %s is a VIP of %s"
+                    % (args.mount_server, args.vms))
+        else:
+            verdict("preflight.mount_matches_vms", False,
+                    "NFSv4.1 mount belongs to a different cluster than %s "
+                    "(mount server %s is not among its VIPs). Refusing to "
+                    "collect invalid cross-cluster evidence."
+                    % (args.vms, args.mount_server))
+            return 1
 
         # ---- mount -> view -> tenant correlation (never tenant-list order:
         # pass 1 queried tenants 37/25/51 by API order and every path came
@@ -316,6 +366,13 @@ def main():
         # Availability contract on the DERIVED tenant only.
         tid0, name0, _via = tenants[0]
         probe_one("availability", tid0, name0, None)
+
+        # The literal D-008 semantic, reconstructed: on the 5.5.0.1 cluster
+        # the successful file_path values were namespace-absolute VIEW paths
+        # (host_view path labels, leading slash, quote(safe="")). Reproduce
+        # that exact form once against the matched view.
+        if cands:
+            probe_one("d008_viewpath", tid0, name0, cands[0][0].get("path"))
 
         # ---- find the accepted (tenant, path-syntax) pair with the FIRST
         # real file; bounded: <=3 tenants x <=3 derived representations ----
@@ -380,6 +437,10 @@ def main():
     log("evidence directory: %s" % EVIDENCE_DIR)
     log("SAFETY: this probe issues GET requests only; the API log must "
         "contain zero non-GET lines.")
+    if not required_objective_met():
+        log("EXIT: required discovery objective not met "
+            "(no HTTP-success nfs4_delegs response for a real file)")
+        return 1
     return 0
 
 
