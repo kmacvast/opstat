@@ -1,143 +1,82 @@
-vastdata@kevin-mcdonald-ubu-01:~/git/opstat$ git fetch origin
-vastdata@kevin-mcdonald-ubu-01:~/git/opstat$ bash scripts/opstat-lab-fr2-delegation-discovery.sh
+  VAST NFSv41 opstat v0.1.2   VMS var204.selab.vastdata.com:443   cluster selab-var-204   refresh 5s   | DELEGATION
+  sample 2026-08-18T20:51:51Z   frame 10m   source NFS4Common + NfsMetrics   sort default
 
-== 1. repository state ==================================================
-Already on 'main'
-Your branch is up to date with 'origin/main'.
-Already up to date.
-[19:45:12] PASS    : main @ fbcc5839dd8c4acac9502f3e5e8008f116d8dd12 (matches origin/main)
+┌─ NFSv4.1 DELEGATION LOOKUP ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ /kmacs/nfstest                                                                                                                                       │
+│ No active NFSv4.1 delegation exists for this path.                                                                                                   │
+│ The path is valid; no client currently holds a delegation on it.                                                                                     │
+│ If this path is a directory, delegations held on files inside it are not reported; query the file itself.                                            │
+│ queried 20:52:01  ·  [space] Re-query   [d] New path   [x] Back                                                                                      │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 
-== 2. working tree ==================================================
-[19:45:12] PASS    : working tree clean
-
-== 3. credentials and NFSv4.1 environment ==================================================
-[19:45:12] PASS    : credential: VAST_PASSWORD present
-[19:45:12] PASS    : nfs41-loadgen active
-[19:45:12] PASS    : mount at /mnt/nfs41test is NFS vers=4.1
-[19:45:13] PASS    : mount is readable
-
-== 4. mount derivation and real file candidates (client-side truth) ==================================================
-[19:45:13] PASS    : mount: server 172.200.204.6 export /kmacs/nfstest on /mnt/nfs41test (API target var204.selab.vastdata.com)
-/mnt/nfs41test/delegation_test_file.txt
-/mnt/nfs41test/nfs41_loadgen/attr_stress.txt
-/mnt/nfs41test/nfs41_loadgen/fio_bw.bin
-/mnt/nfs41test/nfs41_loadgen/fio_iops.bin
-/mnt/nfs41test/nfs41_loadgen/fio_locks.bin
-/mnt/nfs41test/nfs41_loadgen/lock_stress.dat
-/mnt/nfs41test/nfs41_loadgen/meta_stress/dir_3/file_19
-/mnt/nfs41test/nfs41_loadgen/meta_stress/dir_3/file_2
-export path     : /kmacs/nfstest
-candidate rc    : 0
-client files    : /mnt/nfs41test/delegation_test_file.txt,/mnt/nfs41test/nfs41_loadgen/attr_stress.txt,/mnt/nfs41test/nfs41_loadgen/fio_bw.bin,/mnt/nfs41test/nfs41_loadgen/fio_iops.bin,/mnt/nfs41test/nfs41_loadgen/fio_locks.bin,/mnt/nfs41test/nfs41_loadgen/lock_stress.dat,/mnt/nfs41test/nfs41_loadgen/meta_stress/dir_3/file_19,/mnt/nfs41test/nfs41_loadgen/meta_stress/dir_3/file_2
-hostname : kevin-mcdonald-ubu-01
-collected: 2026-08-18 19:45:49 UTC
-HEAD     : fbcc5839dd8c4acac9502f3e5e8008f116d8dd12
-python   : Python 3.12.3
-target   : var204.selab.vastdata.com
-run dir  : /home/vastdata/kjmtmp/opstat/fr2-var204-20260818-194511
-PROBE-START 2026-08-18 19:45:49
-
-== 5. delegation endpoint discovery (GET-only) ==================================================
-api log: /home/vastdata/kjmtmp/opstat/fr2-var204-20260818-194511/raw/opstat-api-fr2-delegations-var204.selab.vastdata.com-443-962435.log
-fr2 delegation discovery - 2026-08-18T19:45:49Z
-cluster: selab-var-204 (5.5.0.1.12648440953753313426)
-PROBE:preflight.mount_matches_vms PASS mount server 172.200.204.6 is a VIP of var204.selab.vastdata.com
-  evidence: view-candidates.json (289 bytes)
-PROBE:correlation.views PASS 2 candidate view(s) for /kmacs/nfstest/delegation_test_file.txt; top: [(755, '/kmacs/nfstest', 'prefix'), (1, '/', 'prefix')]
-PROBE:correlation.tenant PASS namespace tenant candidates (derived, ordered): [(1, 'default', 'prefix view id 755 path /kmacs/nfstest')]
-  evidence: file-mapping.txt (863 bytes)
-  file mapping:
-    client /mnt/nfs41test/delegation_test_file.txt -> server /kmacs/nfstest/delegation_test_file.txt
-    client /mnt/nfs41test/nfs41_loadgen/attr_stress.txt -> server /kmacs/nfstest/nfs41_loadgen/attr_stress.txt
-    client /mnt/nfs41test/nfs41_loadgen/fio_bw.bin -> server /kmacs/nfstest/nfs41_loadgen/fio_bw.bin
-    client /mnt/nfs41test/nfs41_loadgen/fio_iops.bin -> server /kmacs/nfstest/nfs41_loadgen/fio_iops.bin
-    client /mnt/nfs41test/nfs41_loadgen/fio_locks.bin -> server /kmacs/nfstest/nfs41_loadgen/fio_locks.bin
-    client /mnt/nfs41test/nfs41_loadgen/lock_stress.dat -> server /kmacs/nfstest/nfs41_loadgen/lock_stress.dat
-    client /mnt/nfs41test/nfs41_loadgen/meta_stress/dir_3/file_19 -> server /kmacs/nfstest/nfs41_loadgen/meta_stress/dir_3/file_19
-    client /mnt/nfs41test/nfs41_loadgen/meta_stress/dir_3/file_2 -> server /kmacs/nfstest/nfs41_loadgen/meta_stress/dir_3/file_2
-  evidence: deleg-availability-t1.txt (139 bytes)
-PROBE:deleg.availability PASS tenant default (no file_path) [1788ms] -> GET https://var204.selab.vastdata.com:443/api/tenants/1/nfs4_delegs/ failed: HTTP 400: {"detail":"['__root__->file_path: field required']"}
-  evidence: deleg-d008_viewpath-t1.json (143 bytes)
-PROBE:deleg.d008_viewpath PASS tenant default /kmacs/nfstest [257ms] -> 0 record(s), count_total=0, record fields=none, wrapper extras=['xeystore_pagination', 'xeystore_pagination_next_client_id']
-  path representations to try (derived, bounded): ['/kmacs/nfstest/delegation_test_file.txt', '/delegation_test_file.txt']
-  evidence: deleg-try0-t1.json (143 bytes)
-PROBE:deleg.try0 PASS tenant default /kmacs/nfstest/delegation_test_file.txt [261ms] -> 0 record(s), count_total=0, record fields=none, wrapper extras=['xeystore_pagination', 'xeystore_pagination_next_client_id']
-PROBE:correlation.winner PASS tenant 1 (default) accepts full-namespace syntax: /kmacs/nfstest/delegation_test_file.txt
-  evidence: deleg-file1-t1.json (367 bytes)
-PROBE:deleg.file1 PASS tenant default /kmacs/nfstest/nfs41_loadgen/attr_stress.txt [223ms] -> 1 record(s), count_total=1, record fields=['client_id', 'delegation_client_ip', 'delegation_stateid', 'delegation_type', 'revoke_in_progress', 'vip_addr'], wrapper extras=['xeystore_pagination', 'xeystore_pagination_next_client_id']
-    RECORD: {"client_id": 107889578475529, "delegation_client_ip": "172.200.14.198", "delegation_stateid": 107923938216949, "delegation_type": "WRITE", "revoke_in_progress": false, "vip_addr": "172.200.204.6"}
-  evidence: deleg-file2-t1.json (367 bytes)
-PROBE:deleg.file2 PASS tenant default /kmacs/nfstest/nfs41_loadgen/fio_bw.bin [709ms] -> 1 record(s), count_total=1, record fields=['client_id', 'delegation_client_ip', 'delegation_stateid', 'delegation_type', 'revoke_in_progress', 'vip_addr'], wrapper extras=['xeystore_pagination', 'xeystore_pagination_next_client_id']
-    RECORD: {"client_id": 107889578475529, "delegation_client_ip": "172.200.14.198", "delegation_stateid": 107923938217152, "delegation_type": "WRITE", "revoke_in_progress": false, "vip_addr": "172.200.204.6"}
-  evidence: deleg-file3-t1.json (367 bytes)
-PROBE:deleg.file3 PASS tenant default /kmacs/nfstest/nfs41_loadgen/fio_iops.bin [220ms] -> 1 record(s), count_total=1, record fields=['client_id', 'delegation_client_ip', 'delegation_stateid', 'delegation_type', 'revoke_in_progress', 'vip_addr'], wrapper extras=['xeystore_pagination', 'xeystore_pagination_next_client_id']
-    RECORD: {"client_id": 107889578475529, "delegation_client_ip": "172.200.14.198", "delegation_stateid": 107923938217032, "delegation_type": "WRITE", "revoke_in_progress": false, "vip_addr": "172.200.204.6"}
-  evidence: deleg-file4-t1.json (367 bytes)
-PROBE:deleg.file4 PASS tenant default /kmacs/nfstest/nfs41_loadgen/fio_locks.bin [220ms] -> 1 record(s), count_total=1, record fields=['client_id', 'delegation_client_ip', 'delegation_stateid', 'delegation_type', 'revoke_in_progress', 'vip_addr'], wrapper extras=['xeystore_pagination', 'xeystore_pagination_next_client_id']
-    RECORD: {"client_id": 107889578475529, "delegation_client_ip": "172.200.14.198", "delegation_stateid": 107923938216963, "delegation_type": "WRITE", "revoke_in_progress": false, "vip_addr": "172.200.204.6"}
-  evidence: deleg-file5-t1.json (367 bytes)
-PROBE:deleg.file5 PASS tenant default /kmacs/nfstest/nfs41_loadgen/lock_stress.dat [217ms] -> 1 record(s), count_total=1, record fields=['client_id', 'delegation_client_ip', 'delegation_stateid', 'delegation_type', 'revoke_in_progress', 'vip_addr'], wrapper extras=['xeystore_pagination', 'xeystore_pagination_next_client_id']
-    RECORD: {"client_id": 107889578475529, "delegation_client_ip": "172.200.14.198", "delegation_stateid": 107923938216948, "delegation_type": "WRITE", "revoke_in_progress": false, "vip_addr": "172.200.204.6"}
-  evidence: deleg-dir-t1.json (143 bytes)
-PROBE:deleg.dir PASS tenant default /kmacs/nfstest/nfs41_loadgen [224ms] -> 0 record(s), count_total=0, record fields=none, wrapper extras=['xeystore_pagination', 'xeystore_pagination_next_client_id']
-  evidence: deleg-missing-t1.txt (228 bytes)
-PROBE:deleg.missing FAIL tenant default /kmacs/nfstest/does-not-exist-opstat-fr2 [221ms] -> GET https://var204.selab.vastdata.com:443/api/tenants/1/nfs4_delegs/?file_path=%2Fkmacs%2Fnfstest%2Fdoes-not-exist-opstat-fr2 failed: HTTP 4
-
-OBSERVED RECORD FIELDS (union): {
- "client_id": "int",
- "delegation_client_ip": "str",
- "delegation_stateid": "int",
- "delegation_type": "str",
- "revoke_in_progress": "bool",
- "vip_addr": "str"
-}
-  evidence: record-fields.json (163 bytes)
+│ [q] Quit |[o] Ops |[l] Lat |[n] Name |[c] cNode |[v] View |[t] Tenant |[x] Exit drill |[space] Refresh |[4] Native v4 |[h] v4 hosts |[d] Delegation  │
+CHECK:cost.space_requeries_once PASS space issued 1 delegation GET(s), 0 other call(s)
+CHECK:deleg.x_exits PASS x dismissed the result
+CHECK:cost.refresh_zero_deleg PASS 0 delegation call(s) across 3 poll ticks (expected 0)
+CHECK:deleg.exit.returns PASS dashboard restored after exit
+CHECK:safety.get_only PASS every nfs4_delegs call in the API log is a GET (5 total)
+Cleaning up 1 temporary monitor, please stand by...
+CHECK:cleanup.exact_ids PASS all 1 session monitors confirmed gone by per-id GET
+frames saved: /home/vastdata/kjmtmp/opstat/fr2val-var204-20260818-205116/frames.txt
 
 === RESULT SUMMARY ===
-PROBE:preflight.mount_matches_vms PASS mount server 172.200.204.6 is a VIP of var204.selab.vastdata.com
-PROBE:correlation.views PASS 2 candidate view(s) for /kmacs/nfstest/delegation_test_file.txt; top: [(755, '/kmacs/nfstest', 'prefix'), (1, '/', 'prefix')]
-PROBE:correlation.tenant PASS namespace tenant candidates (derived, ordered): [(1, 'default', 'prefix view id 755 path /kmacs/nfstest')]
-PROBE:deleg.availability PASS tenant default (no file_path) [1788ms] -> GET https://var204.selab.vastdata.com:443/api/tenants/1/nfs4_delegs/ failed: HTTP 400: {"detail":"['__root__->file_path: field required']"}
-PROBE:deleg.d008_viewpath PASS tenant default /kmacs/nfstest [257ms] -> 0 record(s), count_total=0, record fields=none, wrapper extras=['xeystore_pagination', 'xeystore_pagination_next_client_id']
-PROBE:deleg.try0 PASS tenant default /kmacs/nfstest/delegation_test_file.txt [261ms] -> 0 record(s), count_total=0, record fields=none, wrapper extras=['xeystore_pagination', 'xeystore_pagination_next_client_id']
-PROBE:correlation.winner PASS tenant 1 (default) accepts full-namespace syntax: /kmacs/nfstest/delegation_test_file.txt
-PROBE:deleg.file1 PASS tenant default /kmacs/nfstest/nfs41_loadgen/attr_stress.txt [223ms] -> 1 record(s), count_total=1, record fields=['client_id', 'delegation_client_ip', 'delegation_stateid', 'delegation_type', 'revoke_in_progress', 'vip_addr'], wrapper extras=['xeystore_pagination', 'xeystore_pagination_next_client_id']
-PROBE:deleg.file2 PASS tenant default /kmacs/nfstest/nfs41_loadgen/fio_bw.bin [709ms] -> 1 record(s), count_total=1, record fields=['client_id', 'delegation_client_ip', 'delegation_stateid', 'delegation_type', 'revoke_in_progress', 'vip_addr'], wrapper extras=['xeystore_pagination', 'xeystore_pagination_next_client_id']
-PROBE:deleg.file3 PASS tenant default /kmacs/nfstest/nfs41_loadgen/fio_iops.bin [220ms] -> 1 record(s), count_total=1, record fields=['client_id', 'delegation_client_ip', 'delegation_stateid', 'delegation_type', 'revoke_in_progress', 'vip_addr'], wrapper extras=['xeystore_pagination', 'xeystore_pagination_next_client_id']
-PROBE:deleg.file4 PASS tenant default /kmacs/nfstest/nfs41_loadgen/fio_locks.bin [220ms] -> 1 record(s), count_total=1, record fields=['client_id', 'delegation_client_ip', 'delegation_stateid', 'delegation_type', 'revoke_in_progress', 'vip_addr'], wrapper extras=['xeystore_pagination', 'xeystore_pagination_next_client_id']
-PROBE:deleg.file5 PASS tenant default /kmacs/nfstest/nfs41_loadgen/lock_stress.dat [217ms] -> 1 record(s), count_total=1, record fields=['client_id', 'delegation_client_ip', 'delegation_stateid', 'delegation_type', 'revoke_in_progress', 'vip_addr'], wrapper extras=['xeystore_pagination', 'xeystore_pagination_next_client_id']
-PROBE:deleg.dir PASS tenant default /kmacs/nfstest/nfs41_loadgen [224ms] -> 0 record(s), count_total=0, record fields=none, wrapper extras=['xeystore_pagination', 'xeystore_pagination_next_client_id']
-PROBE:deleg.missing FAIL tenant default /kmacs/nfstest/does-not-exist-opstat-fr2 [221ms] -> GET https://var204.selab.vastdata.com:443/api/tenants/1/nfs4_delegs/?file_path=%2Fkmacs%2Fnfstest%2Fdoes-not-exist-opstat-fr2 failed: HTTP 4
-evidence directory: /home/vastdata/kjmtmp/opstat/fr2-var204-20260818-194511/raw
-SAFETY: this probe issues GET requests only; the API log must contain zero non-GET lines.
-PROBE-RC 0
-PROBE-END 2026-08-18 19:45:55
-[19:45:55] PASS    : probe rc=0
+CHECK:preflight.mount_vms_consistent   PASS  mount server 172.200.204.6 found in var204.selab.vastdata.com VIP inventory
+CHECK:nfs41.dashboard.footer           PASS  footer present on the dashboard
+CHECK:nfs41.footer.advertises_d        PASS  the [d] Delegation control is discoverable
+CHECK:prompt.opens                     PASS  [d] opened the path prompt
+CHECK:prompt.frame.footer              PASS  footer survives the prompt
+CHECK:prompt.q_is_text                 PASS  typing q inside the prompt neither quits nor navigates
+CHECK:prompt.cancel                    PASS  backspace-on-empty cancelled the prompt
+CHECK:deleg.live.records               PASS  live delegation records for /kmacs/nfstest/nfs41_loadgen/attr_stress.txt
+CHECK:deleg.live.six_fields            PASS  all proven fields populated
+CHECK:deleg.live.tenant_recorded       PASS  answered by tenant 'default'
+CHECK:deleg.live.frame                 PASS  primary fields plus the dim id line rendered
+CHECK:deleg.live.frame.footer          PASS  footer survives the live result
+CHECK:cost.lookup_bounded              PASS  1 /views/ fetch(es), 1 delegation GET(s) across 1 lookup(s) (budget: 1 views + 2 GETs per lookup)
+CHECK:deleg.valid_root.answers         PASS  state='empty' for the export root (valid path)
+CHECK:deleg.empty.honest               PASS  empty is information, not an error
+CHECK:deleg.invalid.state              PASS  state='invalid' for a nonexistent path
+CHECK:deleg.invalid.frame.footer       PASS  footer survives the invalid state
+CHECK:cost.views_cached                PASS  repeat lookup fetched /views/ 0 time(s) (expected 0)
+CHECK:cost.space_requeries_once        PASS  space issued 1 delegation GET(s), 0 other call(s)
+CHECK:deleg.x_exits                    PASS  x dismissed the result
+CHECK:cost.refresh_zero_deleg          PASS  0 delegation call(s) across 3 poll ticks (expected 0)
+CHECK:deleg.exit.returns               PASS  dashboard restored after exit
+CHECK:safety.get_only                  PASS  every nfs4_delegs call in the API log is a GET (5 total)
+CHECK:cleanup.exact_ids                PASS  all 1 session monitors confirmed gone by per-id GET
+RESULT: PASS
+NOTE: keystroke capture is unit-test covered; every key above flowed through the production _dispatch_key path in-process.
+VALIDATOR-RC 0
+VALIDATION-END 2026-08-18 20:52:03
+[20:52:03] PASS    : validator rc=0
 
 == 6. read-only verification (API log) ==================================================
-[19:45:55] PASS    : API log inside the run tree: /home/vastdata/kjmtmp/opstat/fr2-var204-20260818-194511/raw/opstat-api-fr2-delegations-var204.selab.vastdata.com-443-962435.log
-[19:45:55] PASS    : API log contains ZERO non-GET requests (D-008 honored)
+[20:52:03] PASS    : API log inside the run tree: /home/vastdata/kjmtmp/opstat/fr2val-var204-20260818-205116/raw/opstat-api-nfs-v41-var204.selab.vastdata.com-443-1896935.log
+[20:52:03] PASS    : API log contains ZERO non-GET delegation requests (D-008 honored)
 
 == 7. post-run state and /tmp policy ==================================================
-[19:45:55] PASS    : no new opstat artifacts in /tmp
+[20:52:03] PASS    : no new opstat artifacts in /tmp
 
 == 8. minimum success check ==================================================
-[19:45:55] PASS    : minimum success: a real existing file returned an HTTP-success nfs4_delegs response
+[20:52:03] PASS    : minimum success: a REAL workload file returned live delegation records and every production check passed
 
 == final packaging and verdict ==================================================
-opstat FR2 delegation discovery - 20260818-194511
-HEAD fbcc5839dd8c4acac9502f3e5e8008f116d8dd12  target var204.selab.vastdata.com  probe rc 0  script failures 0
+opstat FR2 delegation-diagnostic validation - 20260818-205116
+HEAD 5fd69092ff0e91883f37e54f8a27b59d5d972333  target var204.selab.vastdata.com  validator rc 0  script failures 0
 
 candidates.txt      : candidate discovery outcome
 candidate-files.txt : raw candidate list (helper output)
-probe-output.txt    : full PROBE: verdicts incl. observed record fields
-raw/                : verbatim endpoint responses + GET-only API log
+validator-output.txt: full CHECK: verdicts from the production run
+frames.txt          : captured production frames (dashboard, prompt,
+                      live, empty, invalid, after-exit)
+raw/                : GET-only API log (verbatim requests/responses)
 logs/               : mounts, mountstats, loadgen status, tmp diff
 
 file inventory:
   MANIFEST.txt
   candidate-files.txt
   candidates.txt
+  frames.txt
   git-final-state.txt
   logs/mount-listing.txt
   logs/mounts.txt
@@ -147,39 +86,26 @@ file inventory:
   logs/tmp-after.txt
   logs/tmp-before.txt
   prereqs.txt
-  probe-output.txt
-  raw/deleg-availability-t1.txt
-  raw/deleg-d008_viewpath-t1.json
-  raw/deleg-dir-t1.json
-  raw/deleg-file1-t1.json
-  raw/deleg-file2-t1.json
-  raw/deleg-file3-t1.json
-  raw/deleg-file4-t1.json
-  raw/deleg-file5-t1.json
-  raw/deleg-missing-t1.txt
-  raw/deleg-try0-t1.json
-  raw/file-mapping.txt
-  raw/opstat-api-fr2-delegations-var204.selab.vastdata.com-443-962435.log
-  raw/record-fields.json
-  raw/view-candidates.json
+  raw/opstat-api-nfs-v41-var204.selab.vastdata.com-443-1896935.log
   timestamps.txt
-[19:45:55] PASS    : ZIP integrity verified
+  validator-output.txt
+[20:52:03] PASS    : ZIP integrity verified
 
-      906  2026-08-18 19:45   fr2-var204-20260818-194511/logs/mount-listing.txt
-      862  2026-08-18 19:45   fr2-var204-20260818-194511/logs/mounts.txt
-        0  2026-08-18 19:45   fr2-var204-20260818-194511/logs/tmp-before.txt
-        0  2026-08-18 19:45   fr2-var204-20260818-194511/logs/tmp-after.txt
-      435  2026-08-18 19:45   fr2-var204-20260818-194511/candidates.txt
-      249  2026-08-18 19:45   fr2-var204-20260818-194511/prereqs.txt
+      906  2026-08-18 20:51   fr2val-var204-20260818-205116/logs/mount-listing.txt
+      862  2026-08-18 20:51   fr2val-var204-20260818-205116/logs/mounts.txt
+        0  2026-08-18 20:51   fr2val-var204-20260818-205116/logs/tmp-before.txt
+        0  2026-08-18 20:52   fr2val-var204-20260818-205116/logs/tmp-after.txt
+      436  2026-08-18 20:51   fr2val-var204-20260818-205116/candidates.txt
+      252  2026-08-18 20:51   fr2val-var204-20260818-205116/prereqs.txt
 ---------                     -------
-   115578                     32 files
+   348407                     20 files
 
--rw-rw-r-- 1 vastdata vastdata 32K Aug 18 19:45 /home/vastdata/opstat-fr2-delegation-discovery-var204-20260818-194511.zip
-3d8e2288261a32c6138b95ec4fb97c9c954ce0c2170527b786499e841cb01335  /home/vastdata/opstat-fr2-delegation-discovery-var204-20260818-194511.zip
+-rw-rw-r-- 1 vastdata vastdata 56K Aug 18 20:52 /home/vastdata/opstat-fr2-delegation-validation-var204-20260818-205116.zip
+8b8aa1ec9fc25e518ff97ce2197e47c9fc89614d879d6e970dc7918dd45737db  /home/vastdata/opstat-fr2-delegation-validation-var204-20260818-205116.zip
 
 ======================================================================
 RESULT: RUN VALID - return this ONE file:
 
-    /home/vastdata/opstat-fr2-delegation-discovery-var204-20260818-194511.zip
+    /home/vastdata/opstat-fr2-delegation-validation-var204-20260818-205116.zip
 ======================================================================
 vastdata@kevin-mcdonald-ubu-01:~/git/opstat$
