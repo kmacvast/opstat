@@ -342,3 +342,84 @@ def test_lab_script_nfs41_defaults_and_prerequisites():
             assert "say " in line or "echo" in line, (
                 "the start command is operator guidance, never executed: %r" % line)
     assert "vers=4.1" in body and '--mount-server "$SERVER_IP"' in body
+
+# ---------------------------------------------------------------------------
+# FR2 production validation pair: scripts/opstat-lab-fr2-delegation-
+# validation.sh must start the committed validator (CLI contract), carry the
+# same targeting/prerequisite discipline as the discovery script, and gate
+# its verdict on the live-delegation objective. The --evidence-dir incident
+# proved an untested argv drifts; every committed script/tool pair is parsed
+# for real in the gate.
+# ---------------------------------------------------------------------------
+_VAL_LAB_SCRIPT = "scripts/opstat-lab-fr2-delegation-validation.sh"
+_VALIDATOR = "scripts/var203_validation/validate_fr2_delegation.py"
+
+
+def _load_validator():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "validate_fr2_delegation", _VALIDATOR)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_validation_lab_script_validator_invocation_parses():
+    validator = _load_validator()
+    argv = _extract_argv(_VAL_LAB_SCRIPT, _VALIDATOR)
+    args = validator.build_parser().parse_args(argv)  # SystemExit(2) = break
+    assert args.mountpoint and args.export_path and args.client_files
+    assert args.mount_server, (
+        "mount-to-VMS consistency needs the mount server address")
+    assert args.frame_out is not None, (
+        "captured production frames must land in the run tree")
+
+
+def test_validation_lab_script_candidate_helper_invocation_parses():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "find_nfs41_candidates",
+        "scripts/var203_validation/find_nfs41_candidates.py")
+    helper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helper)
+    argv = _extract_argv(_VAL_LAB_SCRIPT,
+                         "scripts/var203_validation/find_nfs41_candidates.py")
+    helper.build_parser().parse_args(argv)
+
+
+def test_validation_lab_script_defaults_prerequisites_and_verdict():
+    """var204 default; nfs41-loadgen fail-fast with guidance, never
+    auto-started; refusal precedes the validator when no real file exists;
+    the minimum-success check requires the live-delegation objective AND an
+    all-PASS production run; failures map to RUN FAILED + nonzero exit."""
+    body = open(_VAL_LAB_SCRIPT).read()
+    assert "OPSTAT_VMS:-var204.selab.vastdata.com" in body
+    assert 'REQUIRED_LOADGEN="nfs41-loadgen"' in body
+    check = body.index('systemctl is-active --quiet "$REQUIRED_LOADGEN')
+    run_call = body.index("validate_fr2_delegation.py \\")
+    assert check < run_call, "the prerequisite must precede the validator"
+    for line in body.splitlines():
+        if "systemctl start" in line:
+            assert "say " in line or "echo" in line, (
+                "the start command is operator guidance, never executed: %r"
+                % line)
+    assert body.index("refusing to run the validator") < run_call
+    assert "vers=4.1" in body and '--mount-server "$SERVER_IP"' in body
+    assert "CHECK:deleg.live.records *PASS" in body, (
+        "minimum success must be machine-checked on the live objective")
+    assert "^RESULT: PASS" in body, (
+        "minimum success must also require an all-PASS validator run")
+    assert "RUN FAILED" in body and "RUN VALID" in body
+    assert "|| true" not in body
+
+
+def test_validator_is_get_only_by_construction():
+    """The in-process validator drives the production engine; its only
+    direct requests are GETs (/vips/ preflight, per-id monitor checks) and
+    it greps the API log for non-GET delegation calls as a hard gate."""
+    body = open(_VALIDATOR).read()
+    assert 'request("GET"' in body
+    for verb in ('"POST"', '"DELETE"', '"PUT"', '"PATCH"'):
+        assert verb not in body, (
+            "the validator must never issue %s itself" % verb)
+    assert "non_get_deleg_calls" in body and "safety.get_only" in body
