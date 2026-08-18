@@ -20,10 +20,12 @@ front of anyone working here as a discovered capability.
 2. **Not implemented in the TUI.** A per-file lookup needs a path-entry
    interaction that would have complicated the telemetry drill. Deferred, not
    rejected. *(2026-08-18: the owner exercised this reopening clause —
-   FR2 implements the path-entry lookup in the NFSv4.1 engine. The wire
-   contract and its limits are recorded in
+   FR2 implements the path-entry lookup in the NFSv4.1 engine, and Stage-B
+   validation ran it end to end against var204/VAST 5.5.0.1 the same day.
+   The wire contract, its limits, and the validated scope are recorded in
    [D-017](D-017-nfs41-delegation-lookup-wire-contract.md). Points 1 and 3
-   are unchanged: no panel exists, and the DELETE prohibition is permanent.)*
+   are unchanged: no panel exists, and the DELETE prohibition is permanent —
+   `nfs4_delegs` DELETE must never be exposed by opstat.)*
 3. **The `DELETE` sibling must never be invoked.** There is a test asserting it
    is not. This holds regardless of any future decision about the `GET`.
 

@@ -1,7 +1,14 @@
 # D-017 — The NFSv4.1 delegation lookup wire contract (var204/5.5.0.1)
 
-**Status:** Accepted · **Recorded:** 2026-08-18 · **Cluster:** var204,
-VAST OS 5.5.0.1 (decisive discovery run `fr2-var204-20260818-194511`)
+**Status:** Accepted, real-VMS validated · **Recorded:** 2026-08-18 ·
+**Cluster:** var204, VAST OS 5.5.0.1 (decisive discovery run
+`fr2-var204-20260818-194511`; Stage-B production validation run
+`fr2val-var204-20260818-205116`)
+
+This record distinguishes three levels of certainty: the **proven API
+contract** (captured wire behavior), the **implemented behavior** (what the
+diagnostic does with it), and the **real-VMS validated behavior** (what was
+exercised end to end in production code against a live cluster).
 
 ## Context
 
@@ -15,7 +22,7 @@ unchanged and permanent.
 This record captures the wire semantics the implementation relies on, and —
 just as importantly — which parts of the payload remain **unproven**.
 
-## Proven (captured verbatim on var204)
+## Proven API contract (captured verbatim on var204)
 
 - `GET /api/tenants/{tenant_id}/nfs4_delegs/?file_path=<path>` is the whole
   contract. `file_path` is the **full VAST namespace path** with a leading
@@ -66,6 +73,28 @@ just as importantly — which parts of the payload remain **unproven**.
   capability fact.
 - Trailing-slash path resolution, `delegation_type` values other than WRITE,
   and `revoke_in_progress = true` in the wild.
+
+## Real-VMS validated (Stage B, 2026-08-18)
+
+Run `fr2val-var204-20260818-205116` (validated SHA `5fd6909`, selab-var-204,
+VAST 5.5.0.1) drove the production `nfs_v41` engine in-process against the
+live cluster: all 24 checks PASS, validator rc 0, raw-first review of the
+archive confirmed agreement. Validated end to end: `[d]` entry and prompt
+(q-as-path-text included), a live WRITE delegation on a real workload file
+with all six fields populated (`delegation_client_ip` equalled the mount's
+own `clientaddr`; `vip_addr` equalled the mount VIP), the answering tenant
+recorded, the valid-empty vs invalid (ILLEGAL_PATH) distinction, the
+directory caveat, `[space]` re-querying exactly once, zero delegation calls
+across poll ticks, the session `/views/` cache, GET-only safety (5
+delegation calls in the log, all GET), and per-id monitor cleanup.
+
+**Validated release scope is VAST 5.5.0.1 on var204 only.** VAST 5.4.6 has
+never had the production diagnostic run against it; the endpoint exists
+there (Stage-A discovery), but the record shape and semantics on 5.4.6 are
+unvalidated. The "Unproven" payload aspects above remain unproven — the
+validation run also observed only `xeystore_pagination: false`,
+`count_total == len(delegate_info)`, WRITE delegations, and
+`revoke_in_progress: false`.
 
 ## Consequences
 

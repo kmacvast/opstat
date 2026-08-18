@@ -12,6 +12,25 @@ before relying on it. Depth lives elsewhere — this file is the map:
 
 ---
 
+## Where things stand — BUNDLE 1 (FR2) COMPLETE
+
+**FR2, the NFSv4.1 delegation diagnostic (2026-08-18): DONE, real-VMS
+validated.** `[d]` in the NFSv4.1 engine opens a full-namespace-path prompt;
+tenant resolution comes from the view owning the namespace (exact view
+authoritative, one bounded root-prefix fallback, honest ambiguity, never a
+spray); results render the six proven record fields with valid-empty,
+invalid-path, unavailable and error states kept distinct; `[space]` is a
+manual re-query; the normal refresh path makes zero delegation API calls;
+the lookup is GET-only by construction (D-008's DELETE prohibition is
+permanent). Wire contract and validated scope: [decisions/D-017](decisions/D-017-nfs41-delegation-lookup-wire-contract.md).
+Stage-B validation ran the production engine in-process on var204 (VAST
+5.5.0.1, run `fr2val-var204-20260818-205116`, 24/24 PASS at SHA `5fd6909`).
+**VAST 5.4.6 is outside the validated scope.** The Stage-B run also proved
+the layered lab-script prerequisite model in practice (required service →
+mount health → mount-to-VMS consistency → workload evidence → validator);
+the FR2 discovery/validation scripts are retained as durable revalidation
+tooling.
+
 ## Where things stand — TELEMETRY CORRECTNESS MILESTONE COMPLETE
 
 **Telemetry Correctness (2026-08-17): COMPLETE.** FR3 fixed and real-VMS
@@ -184,7 +203,7 @@ The authoritative backlog — items, priorities, statuses — lives in
 **[FR_BACKLOG.json](FR_BACKLOG.json)** and only there
 (rule: [../.claude/rules/backlog.md](../.claude/rules/backlog.md)). This
 document summarizes state; it is not a backlog. Priority 1 at the time of
-writing: FR1, the NFSv3 VIEW attribution / `host_view` rebuild decision.
+writing: FR4, exporter scrape responsiveness (measurement-first).
 
 ## Recommended next step
 
