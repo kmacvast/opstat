@@ -205,8 +205,12 @@ def probe_one(tag, tenant_id, tenant_name, file_path):
     return payload
 
 
-def main():
-    global EVIDENCE_DIR
+def build_parser():
+    """The probe's CLI contract, factored so tests can hold the committed
+    lab script to it. The second lab trip failed at argparse: a refactor
+    dropped --evidence-dir from the parser while the committed script (and
+    main() itself) still used it, and nothing in the gate ran the two
+    against each other."""
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--vms", required=True)
     parser.add_argument("--port", type=int, default=443)
@@ -222,7 +226,16 @@ def main():
     parser.add_argument("--dir-paths", default="",
                         help="comma-separated server-side directory paths "
                              "for the directory-semantics check")
-    args = parser.parse_args()
+    parser.add_argument("--evidence-dir", default=None,
+                        help="directory for raw evidence files and the API "
+                             "log; the lab workflow routes this beneath the "
+                             "run's DTS tree so nothing lands in /tmp")
+    return parser
+
+
+def main():
+    global EVIDENCE_DIR
+    args = build_parser().parse_args()
 
     if not (os.environ.get("VAST_TOKEN") or os.environ.get("VAST_PASSWORD")):
         print("ERROR: set VAST_TOKEN or VAST_PASSWORD in the environment.",

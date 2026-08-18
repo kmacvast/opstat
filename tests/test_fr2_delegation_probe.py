@@ -230,3 +230,58 @@ def test_probe_one_records_illegal_path_verbatim(tmp_path, monkeypatch):
     line = [l for l in probe.SUMMARY if "deleg.try0" in l][0]
     assert "FAIL" in line and "ILLEGAL_PATH" in line
     assert "ILLEGAL_PATH" in (tmp_path / "deleg-try0-t1.txt").read_text()
+
+
+# ---------------------------------------------------------------------------
+# Script-to-probe CLI contract. The second lab trip died at argparse: the
+# committed script passed --evidence-dir to a probe parser that no longer
+# accepted it, and nothing in the gate ran the two against each other. This
+# test parses the ACTUAL invocation out of the committed shell script and
+# feeds it to the probe's real parser.
+# ---------------------------------------------------------------------------
+_LAB_SCRIPT = "scripts/opstat-lab-fr2-delegation-discovery.sh"
+
+
+def _extract_argv(script_path, program):
+    """The flag sequence a shell script passes to *program*, with every
+    shell-substituted value replaced by "1" (parseable by str/int/float
+    options alike). All options in these tools take exactly one value."""
+    lines = open(script_path).read().splitlines()
+    invocation, grabbing = [], False
+    for line in lines:
+        if program in line:
+            grabbing = True
+        if grabbing:
+            invocation.append(line.rstrip("\\").strip())
+            if not line.rstrip().endswith("\\"):
+                break
+    assert invocation, "no invocation of %s found in %s" % (program, script_path)
+    argv = []
+    for tok in " ".join(invocation).split():
+        if tok.startswith("--"):
+            argv.extend([tok, "1"])
+    return argv
+
+
+def test_lab_script_probe_invocation_parses():
+    """If the committed shell script and committed probe cannot start
+    together, the gate must fail before publication."""
+    probe = _load_probe()
+    argv = _extract_argv(_LAB_SCRIPT,
+                         "scripts/var203_validation/probe_fr2_delegations.py")
+    args = probe.build_parser().parse_args(argv)   # SystemExit(2) = contract break
+    assert args.evidence_dir is not None, (
+        "the lab script must route probe evidence beneath its DTS tree")
+    assert args.mountpoint and args.export_path is not None
+
+
+def test_lab_script_candidate_helper_invocation_parses():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "find_nfs41_candidates",
+        "scripts/var203_validation/find_nfs41_candidates.py")
+    helper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helper)
+    argv = _extract_argv(_LAB_SCRIPT,
+                         "scripts/var203_validation/find_nfs41_candidates.py")
+    helper.build_parser().parse_args(argv)   # SystemExit(2) = contract break
