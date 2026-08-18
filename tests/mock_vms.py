@@ -58,7 +58,12 @@ CNODES = [
 # so the drill ranking path cannot rely on scanning everything cheaply.
 VIEWS = [
     {"id": 1000 + i, "path": f"/view/{i:03d}", "name": f"view-{i:03d}",
-     "title": f"view-{i:03d}"}
+     "title": f"view-{i:03d}",
+     # Real /views/ records carry tenant ownership and a protocols list
+     # (FR1/FR2 evidence, var203+var204); the delegation diagnostic resolves
+     # its tenant from exactly these fields.
+     "tenant_id": 1, "tenant_name": "default",
+     "protocols": ["NFS", "NFS4", "SMB"]}
     for i in range(429)
 ]
 
@@ -420,6 +425,18 @@ class _State:
                                     "/api/prometheusmetrics/basic",
                                     "/api/prometheusmetrics/all"}
         self.delegations_enabled = True
+        # FR2 wire contract (var204 / VAST 5.5.0.1, decisive run): a valid
+        # path returns the delegate_info wrapper (empty list included); a
+        # nonexistent path returns HTTP 400 with a get_handle_by_path
+        # ILLEGAL_PATH detail. Tests plant records/valid paths per scenario;
+        # the tenant that answers is the one owning the namespace.
+        self.deleg_records = {}      # file_path -> [record, ...]
+        self.deleg_valid_paths = set()   # extra valid-but-empty paths
+        # HYPOTHESIZED shape, not captured contract: only false was ever
+        # observed on a real cluster. Tests that flip this exercise the
+        # client's defensive handling of a constructed payload.
+        self.deleg_pagination = False
+        self.extra_views = []        # per-test additions to /views/
         self.latency_s = 0.0
         self.t0 = time.time()
 
@@ -481,7 +498,7 @@ class _Handler(BaseHTTPRequestHandler):
         simple = {
             "/api/clusters/": CLUSTERS,
             "/api/cnodes/": self.state.cnodes if self.state.cnodes is not None else CNODES,
-            "/api/views/": VIEWS,
+            "/api/views/": VIEWS + self.state.extra_views,
             "/api/tenants/": TENANTS,
             "/api/volumes/": VOLUMES,
             "/api/vips/": self.state.vips if self.state.vips is not None else VIPS,
@@ -558,18 +575,25 @@ class _Handler(BaseHTTPRequestHandler):
             if "file_path" not in query:
                 return self._error(
                     400, "['__root__->file_path: field required']")
-            records = [
-                {"client_ip": f"10.9.0.{i}", "path": f"/view/{300 + i}",
-                 "stateid": f"0x{tid:04x}{i:04x}", "deleg_type": "READ",
-                 "tenant_id": tid, "created_at": "2026-08-13T14:00:00Z"}
-                for i in range(2 if tid % 2 == 0 else 0)
-            ]
-            # Real VMS wraps records in delegate_info beside pagination keys.
+            file_path = query["file_path"][0]
+            # Validity mirrors the real cluster: an existing file/dir under
+            # the namespace answers (empty wrapper included); anything else
+            # is the literal ILLEGAL_PATH 400 captured on var204.
+            valid = (file_path in self.state.deleg_records
+                     or file_path in self.state.deleg_valid_paths
+                     or any(file_path == v["path"] for v in VIEWS))
+            if not valid:
+                return self._error(
+                    400, "get_handle_by_path returned an error : "
+                         "GetHandleByPathCode.ILLEGAL_PATH")
+            records = self.state.deleg_records.get(file_path, [])
+            # Real VMS wraps records in delegate_info beside pagination keys;
+            # next_client_id is populated even when pagination is false.
             return self._send({
                 "delegate_info": records,
                 "delegate_info_count_total": len(records),
-                "xeystore_pagination": None,
-                "xeystore_pagination_next_client_id": None,
+                "xeystore_pagination": self.state.deleg_pagination,
+                "xeystore_pagination_next_client_id": 1,
             })
 
         if path.startswith("/api/prometheusmetrics"):
