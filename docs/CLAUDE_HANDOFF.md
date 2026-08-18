@@ -38,7 +38,7 @@ work.** Full record: REFACTOR_HANDOFF's Round-5B closeout.
 | Working tree | Clean |
 | Gate | `./scripts/validate.sh` → PASS: 603 passed / 0 skipped on current Python **and** 3.8; doc links valid |
 | Final validation | Round 5B on `main` @ `1aaa359`: monitor creates 206 → 20, cleanup 20/20, remaining NONE; cNode drill + API-evidence-verified manual refresh green; VIP/HOST dead scopes bounded with honest notices; navigation and clean shutdown green |
-| Real clusters | `var203.selab.vastdata.com` only, from the owner's **work laptop** only. `var204` unavailable until the owner says otherwise. No cluster is reachable from the personal laptop |
+| Real clusters | From the owner's **work laptop/lab host** only: `var203.selab.vastdata.com` (VAST 5.4.6) for most protocols; `var204.selab.vastdata.com` (VAST 5.5.0, available since 2026-08-18) owns the lab's NFSv4.1 mount and is the NFSv4.1 lab target. Lab workflows verify mount-to-VMS consistency before collecting evidence. No cluster is reachable from the personal laptop |
 
 ## Objective
 
