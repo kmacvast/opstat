@@ -95,17 +95,41 @@ def build(name: str, clean: bool) -> Path:
         cmd.extend(["--hidden-import", mod])
     cmd.append(str(ENTRY))
 
+    # dist/ is NOT cleaned by --clean (that clears PyInstaller's cache and
+    # work directory only), so a previous build's binary can sit there and be
+    # packaged as if it were new. Observed before this guard: with PyInstaller
+    # exiting 0 but writing nothing, the PREVIOUS dist/opstat was copied to
+    # releases/ and reported as "Created" - a stale artifact presented as a
+    # successful build, which a release would then publish.
+    #
+    # Removing the expected output first makes its existence afterwards the
+    # proof of freshness. That is deterministic, unlike comparing mtimes
+    # against the wall clock: filesystem timestamp granularity, clock skew on
+    # a network mount, and PyInstaller reusing an unchanged EXE under
+    # --no-clean can all make a perfectly good binary look stale.
+    expected = DIST / ("opstat.exe" if sys.platform.startswith("win") else "opstat")
+    for leftover in list(DIST.glob("opstat*")) if DIST.exists() else []:
+        if leftover.is_file():
+            leftover.unlink()
+
     print("Running:", " ".join(cmd))
     subprocess.check_call(cmd, cwd=str(ROOT))
 
-    built = DIST / ("opstat.exe" if sys.platform.startswith("win") else "opstat")
+    built = expected
     if not built.exists():
-        # Fallback: whatever PyInstaller wrote
-        candidates = list(DIST.glob("opstat*"))
+        # Fallback: whatever PyInstaller actually wrote this run. Files only -
+        # a leftover directory (e.g. from a --onedir spec) would otherwise be
+        # selected and fail later with IsADirectoryError.
+        candidates = [p for p in DIST.glob("opstat*") if p.is_file()]
         if not candidates:
-            print("ERROR: PyInstaller did not produce dist/opstat", file=sys.stderr)
+            print("ERROR: PyInstaller did not produce dist/opstat "
+                  "(nothing new in dist/ after the build)", file=sys.stderr)
             sys.exit(1)
-        built = candidates[0]
+        built = max(candidates, key=lambda p: p.stat().st_mtime)
+
+    if built.stat().st_size == 0:
+        print(f"ERROR: {built} is empty", file=sys.stderr)
+        sys.exit(1)
 
     dest = RELEASES / name
     shutil.copy2(built, dest)
