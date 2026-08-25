@@ -51,7 +51,7 @@ EPILOG = textwrap.dedent(
 
     protocols:
       --nfs --version={3.0|4.1}     NFS v3 or NFS v4.1
-      --block --nvme-over-tcp       NVMe over TCP block storage
+      --block --nvme-over-tcp       NVMe-oTCP block storage
       --smb                         SMB / SMB2
       --s3                          S3 object storage
 
@@ -121,7 +121,13 @@ def validate_protocol_args(args):
         return
 
 
-def parse_args(argv=None):
+def build_parser():
+    """The CLI contract, factored so tests can hold help and README to it.
+
+    Same idiom as the committed lab probes: a parser that can only be
+    reached by parsing argv cannot be audited, and the documentation drift
+    this factoring exists to catch is invisible to a runtime test.
+    """
     parser = new_argument_parser(
         "Live multi-protocol performance statistics for VAST Data clusters."
     )
@@ -178,6 +184,15 @@ def parse_args(argv=None):
         help=f"VMS HTTPS port (default: {DEFAULT_PORT})",
     )
     conn.add_argument(
+        # Compatibility alias for --vms-port, accepted since the repository
+        # migration. Deliberately hidden rather than removed: it still works
+        # for anyone scripting against the older spelling, but documenting a
+        # second name for one option would be the drift this pass removes.
+        # tests/test_cli_contract.py allowlists it with this rationale and
+        # exercises it. DECLARATION ORDER IS LOAD-BEARING: --vms-port above
+        # carries default=DEFAULT_PORT and must stay first, because argparse
+        # seeds a shared dest from the first action that defines it - moving
+        # this alias above it would silently default the port to None.
         "--port",
         dest="port",
         type=int,
@@ -312,9 +327,13 @@ def parse_args(argv=None):
         help="Launch the interactive setup wizard",
     )
     ui.add_argument(
+        # args.no_menu is never read: the wizard decision happens in main()
+        # on the raw argv before parsing (wizard.should_launch). The option
+        # exists so argparse accepts the token instead of rejecting it, so
+        # do not remove it as an unused destination.
         "--no-menu",
         action="store_true",
-        help=argparse.SUPPRESS,
+        help="Never launch the wizard (overrides --menu)",
     )
     ui.add_argument(
         "-V",
@@ -324,7 +343,11 @@ def parse_args(argv=None):
         help="Print opstat version and exit",
     )
 
-    args = parser.parse_args(argv)
+    return parser
+
+
+def parse_args(argv=None):
+    args = build_parser().parse_args(argv)
     validate_protocol_args(args)
     return args
 
