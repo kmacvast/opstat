@@ -25,7 +25,6 @@ import io
 import os
 import re
 import urllib.parse
-import shutil
 import ssl
 import sys
 import time
@@ -2163,8 +2162,7 @@ _MAX_FRAME_WIDTH = 152
 
 def _frame_width():
     return max(_MIN_FRAME_WIDTH,
-               min(shutil.get_terminal_size((_MAX_FRAME_WIDTH, 40)).columns,
-                   _MAX_FRAME_WIDTH))
+               vast_common.terminal_width(_MAX_FRAME_WIDTH, _MAX_FRAME_WIDTH))
 
 
 def _render_nav_footer(width):

@@ -43,7 +43,6 @@ import csv
 import io
 import os
 import re
-import shutil
 import ssl
 import sys
 import time
@@ -1917,7 +1916,7 @@ def _footer_keys(width=None):
 def _render_frame():
     rows            = LAST_ROWS
     selected_sample = LAST_SAMPLE
-    width            = min(shutil.get_terminal_size((184, 40)).columns, 184)
+    width            = vast_common.terminal_width(184, 184)
     mode_tag         = "avg " + API_TIME_FRAME if SAMPLE_AVERAGE_MODE else "latest"
 
     # ── Title bar (plain - intentionally outside any box, htop style) ────────

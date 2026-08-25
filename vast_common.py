@@ -14,6 +14,7 @@ import json
 import os
 import re
 import select
+import shutil
 import signal
 import sys
 import threading
@@ -836,6 +837,48 @@ def wait_for_input(timeout):
     except Exception:
         time.sleep(min(timeout, 0.05))
         return False
+
+
+def terminal_width(fallback, cap):
+    """Visible columns for a rendered frame, capped at *cap*.
+
+    Asks the terminal itself, NOT the environment. ``shutil.get_terminal_size``
+    honours ``COLUMNS`` before the ioctl, and an exported stale COLUMNS then
+    pins the width permanently: measured in a real pty, with COLUMNS=200 and
+    the terminal resized 120 -> 80 -> 40, opstat kept emitting 120-column
+    frames indefinitely, wrapping and corrupting the display. With COLUMNS
+    unset the same sequence converged within one refresh tick.
+
+    Only stdout is consulted, and ``sys.__stdout__`` first: ``render_screen``
+    swaps ``sys.stdout`` for a StringIO while composing, so the real stream
+    has to be reachable. stderr is deliberately NOT consulted - with the
+    frame piped to a file and stderr still on a terminal, the terminal's
+    width is not the output's width.
+
+    Falls back to ``shutil`` when stdout is not a terminal: piped output and
+    the render tests land there, and honouring COLUMNS is correct for a pipe.
+    """
+    for stream in (sys.__stdout__, sys.stdout):
+        try:
+            descriptor = stream.fileno()
+        # AttributeError: sys.__stdout__ can be None (pythonw, frozen apps).
+        # ValueError / io.UnsupportedOperation: StringIO or a closed file -
+        # taken on EVERY frame, because render_screen swaps sys.stdout.
+        except (AttributeError, ValueError, OSError):
+            continue
+        try:
+            if not os.isatty(descriptor):
+                continue
+            columns = os.get_terminal_size(descriptor).columns
+        except OSError:
+            continue
+        if columns > 0:
+            return min(columns, cap)
+    # A 0x0 winsize (script(1), some CI pty wrappers) reports 0 columns.
+    # Python >= 3.11 coalesces that to the fallback; 3.8 - this project's
+    # floor - does NOT, and returned a frame width of 0.
+    columns = shutil.get_terminal_size((fallback, 40)).columns or fallback
+    return min(columns, cap)
 
 
 def clear_screen():

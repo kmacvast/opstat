@@ -25,7 +25,6 @@ import io
 import json
 import os
 import re
-import shutil
 import ssl
 import sys
 import time
@@ -2231,7 +2230,7 @@ def _nav_legend_lines(width):
 
 
 def _render_frame():
-    width = min(shutil.get_terminal_size((120, 40)).columns, 120)
+    width = vast_common.terminal_width(120, 120)
     title = (
         c("  VAST SMB", _BCYAN) + c(" opstat", _BWHITE) + c(f" v{VERSION}", _DIM)
         + f"   VMS {c(f'{VMS}:{PORT}', _BWHITE)}   cluster {c(CLUSTER_NAME or '?', _BWHITE)}"

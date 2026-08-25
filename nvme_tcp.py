@@ -13,7 +13,6 @@ import csv
 import io
 import os
 import re
-import shutil
 import ssl
 import sys
 import time
@@ -2116,7 +2115,7 @@ def render_screen():
 
 def _render_frame():
     rows = LAST_ROWS
-    width = min(shutil.get_terminal_size((120, 40)).columns, 120)
+    width = vast_common.terminal_width(120, 120)
 
     title = (
         c("  VAST NVMe-oTCP", _BCYAN) + c(" opstat", _BWHITE) + c(f" v{VERSION}", _DIM)
