@@ -106,7 +106,9 @@ Build your own locally: see [Building stand-alone binaries](#building-stand-alon
 ```
 
 The wizard never prints secrets. It exports `VAST_PASSWORD` / `VAST_TOKEN` into the
-process environment and can seed host/user from `~/.vastconf`.
+process environment. (It has a seam for reading connection details from a
+`~/.vastconf`, but no production loader is wired up, so nothing is read from
+disk today — see [D-018](docs/decisions/D-018-compatibility-policy.md).)
 
 ### Protocol selection (exactly one)
 
@@ -146,7 +148,7 @@ Run `./opstat --help` for the authoritative list. Summary:
 |--------|---------|-------------|
 | `--refresh SEC` | `5` | Dashboard redraw interval |
 | `--sample-average WIN` | off | Rolling window (`10m`, `1h`, `4h`, ...) |
-| `--csv FILE` | off | Append samples to CSV |
+| `--csv FILE` | off | Append samples to CSV. Supported by NFSv3, SMB, S3 and NVMe-oTCP; **NFSv4.1 accepts the flag but writes nothing** |
 | `--no-color` | off | Plain terminal output |
 | `--discover-metrics` | off | List metrics/objects, exit |
 | `-V` / `--tool-version` | | Print `opstat <version>` |
@@ -275,14 +277,15 @@ Expected: wizard prompts for protocol, VMS host, credentials, options; then the 
 
 Expected: four-panel NFS v3 dashboard; password prompt if neither `VAST_TOKEN` nor `VAST_PASSWORD` is set; Ctrl-C cleans up monitors.
 
-### NFS v4.1 with rolling average and CSV
+### NFS v4.1 with rolling average
 
 ```bash
 ./opstat --nfs --version=4.1 --vms vms.example.com \
-  --sample-average 10m --csv /tmp/nfs41.csv --user admin
+  --sample-average 10m --user admin
 ```
 
-Expected: NFS v4.1 TUI; samples appended to `/tmp/nfs41.csv` each refresh.
+Expected: NFS v4.1 TUI averaged over a 10-minute window. NFSv4.1 is the one
+engine with no CSV writer — it accepts `--csv` and writes nothing.
 
 ### NVMe-oTCP scoped to volumes
 
@@ -423,6 +426,78 @@ macOS arm64 with Python 3.12 and PyInstaller 6.22.2, producing a ~9.2 MB
 Linux and Windows binaries are produced by the same script through the release
 workflow but have **not** been executed as part of this validation; Windows
 execution coverage is tracked separately (FR5).
+
+### Upgrading
+
+opstat **persists no state** — no config file, no cache, no dotfile. Every
+file it writes, it writes because you asked for it on the command line
+(`--csv`, `--export-openmetrics`, `--log-api-calls`, `--discover-metrics`), and
+it never reads any of them back. Upgrading is therefore: replace the
+executable. There is nothing to migrate.
+
+One caveat, because `--csv` **appends**: the header row is written only when
+the file is empty, so a CSV file reused across an upgrade keeps release N's
+header while release N+1 appends its rows. That is safe while the schema is
+unchanged, and silently widens the rows if N+1 adds a column. Rotate the file
+on upgrade, or start a new one.
+
+What stays stable across compatible releases, and what may change, is recorded
+in [D-018](docs/decisions/D-018-compatibility-policy.md) and enforced by
+`tests/test_compatibility_contract.py`. In short: documented CLI flags and
+defaults, exit codes, CSV column identity and order, the JSON Lines record
+shape and metric naming, credential precedence and artifact naming are stable;
+the TUI, diagnostic wording and the API log are not.
+
+Comparing `main` against the published `v0.1.2` tag at source level, **no
+breaking change has occurred**: no CLI flag was removed, the NFSv3, SMB and
+NVMe-oTCP CSV headers are byte-identical, and the JSON Lines record keys and
+artifact naming are unchanged. S3 and its scoping flags were added.
+
+**Not yet validated end to end.** Only one release exists, so a real
+version-to-version upgrade has never been run. Once a second release is
+published, the check is:
+
+```bash
+# 1. run release N against a cluster, capture machine output, quit with Ctrl-C
+#    after a few refreshes
+./opstat-N --smb --vms <HOST> --csv n.csv --export-openmetrics --openmetrics-file n.jsonl
+
+# 2. replace the executable with release N+1. Change NOTHING else: same shell,
+#    same environment variables, same working directory.
+
+# 3. run the identical command line against the same cluster
+./opstat-N1 --smb --vms <HOST> --csv n1.csv --export-openmetrics --openmetrics-file n1.jsonl
+
+# 4. compare the contracts, not the values. Values differ - the cluster moved.
+head -1 n.csv; head -1 n1.csv     # N+1 header starts with N's, columns appended only
+./opstat-N1 -V                    # prints "opstat <new version>"
+
+python3 - n.jsonl n1.jsonl <<'EOF'
+import json, sys
+def shape(path):
+    keys, names, types = set(), set(), {}
+    for line in open(path):
+        r = json.loads(line)
+        keys |= set(r)
+        names.add(r["metric_name"])
+        types[r["metric_name"]] = type(r["value"]).__name__
+    return keys, names, types
+ok, on, ot = shape(sys.argv[1])
+nk, nn, nt = shape(sys.argv[2])
+assert not ok - nk, "record keys removed: %s" % (ok - nk)
+assert not on - nn, "metric names removed: %s" % (on - nn)
+for m in on & nn:
+    assert ot[m] == nt[m], "%s retyped %s -> %s" % (m, ot[m], nt[m])
+print("JSON Lines contract intact; added: %s" % (nn - on or "nothing"))
+EOF
+```
+
+Repeat for each protocol that has a CSV writer (`--nfs --version=3.0`, `--smb`,
+`--s3`, `--block --nvme-over-tcp`), since the CSV schema is per-protocol.
+
+Pass criteria: the same command line still parses, exit codes are unchanged, no
+CSV column was renamed/reordered/removed, no JSON Lines key was removed or
+retyped, and no manual migration or cleanup was needed.
 
 ### Versioning and releases
 

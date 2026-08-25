@@ -23,8 +23,9 @@ cd opstat
 ./opstat --nfs --version=4.1 --vms <VMS_HOST> --discover-metrics
 ```
 
-Shared CLI flags (`--vms-port`, `--refresh`, `--sample-average`, `--csv`, `--no-color`,
-`--log-api-calls`, `-V`) are documented in [README.md](README.md).
+Shared CLI flags (`--vms-port`, `--refresh`, `--sample-average`, `--no-color`,
+`--log-api-calls`, `-V`) are documented in [README.md](README.md). `--csv` is
+accepted but does nothing on this engine (see below).
 
 ---
 
@@ -214,7 +215,7 @@ Press `c`, `v`, or `t` to enter the corresponding scope. Press `x` to exit.
 | `--refresh N` | Poll interval (default 5s) |
 | `--sample-average WIN` | Rolling monitor window (`10m`, `1h`, …) |
 | `--no-color` | Plain ASCII output |
-| `--csv FILE` | CSV capture |
+| `--csv FILE` | Accepted and **ignored** — NFSv4.1 has no CSV writer, so no file is created and nothing is printed. The other four engines honour it |
 | `--log-api-calls` | REST debug log under `/tmp` |
 
 ---
@@ -225,9 +226,9 @@ Press `c`, `v`, or `t` to enter the corresponding scope. Press `x` to exit.
 # Live monitor
 ./opstat --nfs --version=4.1 --vms var203.selab.vastdata.com --user admin
 
-# Rolling average + CSV
+# Rolling average (no --csv: this engine has no CSV writer)
 ./opstat --nfs --version=4.1 --vms var203.selab.vastdata.com \
-  --sample-average 1h --csv nfs41_stats.csv
+  --sample-average 1h
 
 # SSH tunnel
 ssh -L 8443:var203.selab.vastdata.com:443 user@jump-host
