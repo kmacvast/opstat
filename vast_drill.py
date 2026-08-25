@@ -322,6 +322,9 @@ class DrillSession:
     def reset(self):
         """Clear learned capabilities and cached rankings (new run, or tests)."""
         self._rank_cache = {}
+        # Drill modes already loaded once in this run - the cold/warm signal
+        # for the drill-entry loading wording (see begin_load).
+        self._loaded_modes = set()
         # Discovered rank chunk capability, PER object_type. A single shared
         # value was objectively wrong: a scan over a 2-object scope (cNode)
         # "discovered" that chunks of 2 work and that size was then reused
@@ -509,6 +512,23 @@ class DrillSession:
 
     def _signature(self, objects):
         return len(objects), tuple(sorted(str(obj["id"]) for obj in objects))[:64]
+
+    def begin_load(self, mode):
+        """Record that *mode* is being loaded; True only the first time.
+
+        Drives the cold-entry loading wording. A dedicated record rather
+        than the rank cache: not every drill ranks - SMB's cNode drill
+        head-slices a tiny population and never stores a ranking - yet its
+        first entry still pays monitor creation and the first query, which
+        is what makes cold entry slow.
+
+        Marking on entry rather than on success means a retry after a failed
+        entry shows the plain wording; that under-promises the wait rather
+        than over-promising it, which is the safe direction.
+        """
+        first = mode not in self._loaded_modes
+        self._loaded_modes.add(mode)
+        return first
 
     def _cached(self, mode, objects):
         entry = self._rank_cache.get(mode)
@@ -810,21 +830,42 @@ LOADING_MESSAGES = {
 }
 
 
-def loading_message(mode):
-    """The stand-by message for a drill mode."""
-    return LOADING_MESSAGES.get(
-        mode, f"Loading the {str(mode).upper()} drill-down, please stand by...")
+# The stand-by tail, and its first-cold-entry replacement. A first monitor-
+# backed entry ranks the whole object population and creates monitors: SMB
+# view ranking measured 104 s before batching and 9 s after, and NVMe entry
+# ran ~2 min on var203 at 2.5-38 s per call. Saying so up front turns a wait
+# that reads as a hang into an expected one. Re-entry reuses what the first
+# entry learned, so it keeps the plain wording.
+_STAND_BY_TAIL = "please stand by..."
+_FIRST_TIME_TAIL = "this can take 30+ seconds the first time..."
 
 
-def with_loading_status(show_status, render, mode, work):
+def loading_message(mode, first_time=False):
+    """The stand-by message for a drill mode.
+
+    ``first_time=True`` is for a **cold monitor-backed drill entry** only -
+    callers that scrape the exporter or run a file-scoped lookup must leave
+    it False, because those cost seconds or milliseconds and the warning
+    would be false.
+    """
+    message = LOADING_MESSAGES.get(
+        mode, f"Loading the {str(mode).upper()} drill-down, {_STAND_BY_TAIL}")
+    if first_time and message.endswith(_STAND_BY_TAIL):
+        return message[:-len(_STAND_BY_TAIL)] + _FIRST_TIME_TAIL
+    return message
+
+
+def with_loading_status(show_status, render, mode, work, first_time=False):
     """Paint a loading frame, then run blocking drill initialisation.
 
     ``show_status(text_or_None)`` sets the engine's status global and
     ``render()`` flushes one frame. Both run before *work* so the user sees
     progress rather than a frozen screen; the status is always cleared, even
     if the work raises.
+
+    ``first_time`` selects the cold-entry wording (see :func:`loading_message`).
     """
-    show_status(loading_message(mode))
+    show_status(loading_message(mode, first_time))
     try:
         render()
         return work()

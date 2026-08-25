@@ -2015,7 +2015,9 @@ def switch_drill_mode(mode):
         if DRILL_MODE:
             fetch_drill_query(force=True)
 
-    vast_drill.with_loading_status(_set_drill_status, render_screen, mode, _work)
+    vast_drill.with_loading_status(
+        _set_drill_status, render_screen, mode, _work,
+        first_time=DRILL.begin_load(mode) if DRILL else False)
 
 
 def _render_drill_panel(width):

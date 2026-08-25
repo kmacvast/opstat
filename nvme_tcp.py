@@ -1593,7 +1593,9 @@ def _enter_drill_with_status(mode):
         if DRILL_MODE:
             fetch_drill_query(force=True)
 
-    vast_drill.with_loading_status(_set_drill_status, render_screen, mode, work)
+    vast_drill.with_loading_status(
+        _set_drill_status, render_screen, mode, work,
+        first_time=DRILL.begin_load(mode) if DRILL else False)
 
 
 def exit_drill_mode():

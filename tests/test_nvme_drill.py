@@ -396,7 +396,12 @@ def test_drill_entry_paints_loading_frame_before_work(nvme, monkeypatch):
     assert events.index(first_render) < work_idx, (
         "no frame rendered before the blocking drill entry")
     assert first_render[1], "loading status was empty in the pre-work frame"
-    assert "stand by" in first_render[1]
+    # This is the FIRST cNode entry of the run, so the cold-entry wording
+    # applies (NVMe entry ran ~2 min on var203). Asserting it exactly is
+    # stricter than the previous "stand by" substring check.
+    assert first_render[1] == (
+        "Loading the cNODE drill-down, this can take 30+ seconds the first "
+        "time..."), first_render[1]
     assert engine.DRILL_STATUS is None, "loading status not cleared"
 
 

@@ -1404,8 +1404,12 @@ def switch_drill_mode(mode):
         if DRILL_MODE:
             fetch_drill_query(force=True)
 
+    # The VIEW capability notice (D-016) returns instantly at zero API cost,
+    # so that entry must never claim a 30-second wait even on its first use.
+    instant = mode == "view" and view_attribution_source() is None
     vast_drill.with_loading_status(
-        _set_drill_status, render_screen, mode, _work)
+        _set_drill_status, render_screen, mode, _work,
+        first_time=bool(DRILL) and not instant and DRILL.begin_load(mode))
 
 
 def _set_drill_status(text):

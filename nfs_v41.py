@@ -1769,8 +1769,12 @@ def switch_drill_mode(mode):
         if DRILL_MODE:
             fetch_drill_query(force=True)
 
+    # Only the monitor-backed drills warn about the cold-entry wait; the
+    # exporter modes below scrape in 1.2-2.4 s and must keep the plain
+    # wording, even though [v] names a "view" mode in both places.
     vast_drill.with_loading_status(
-        _set_drill_status, render_screen, mode, _work)
+        _set_drill_status, render_screen, mode, _work,
+        first_time=DRILL.begin_load(mode) if DRILL else False)
 
 
 def enter_exporter_mode(mode):
