@@ -16,7 +16,7 @@ Live multi-protocol performance statistics for **VAST Data** clusters.
 
 | Capability | Detail |
 |------------|--------|
-| Protocols | NFS v3, NFS v4.1, SMB/SMB2, S3 object storage, NVMe over TCP (block) |
+| Protocols | NFS v3, NFS v4.1, SMB/SMB2, S3 object storage, NVMe-oTCP (block) |
 | Live TUI | Health badge, workload mix, ops/s, latency, throughput, I/O size |
 | Drill-down | Keyboard shortcuts for cNode, view, tenant, VIP, host (protocol-dependent) |
 | Capture | CSV append and optional OpenMetrics/OpenTelemetry JSON Lines export |
@@ -101,8 +101,8 @@ Build your own locally: see [Building stand-alone binaries](#building-stand-alon
 
 ```bash
 ./opstat              # no args on a TTY -> wizard
-./opstat --menu       # force wizard
-./opstat --no-menu ...  # never launch wizard
+./opstat --menu       # request wizard (still requires a TTY)
+./opstat --no-menu ... # never launch wizard (overrides --menu)
 ```
 
 The wizard never prints secrets. It exports `VAST_PASSWORD` / `VAST_TOKEN` into the
@@ -138,7 +138,7 @@ Run `./opstat --help` for the authoritative list. Summary:
 | `--vms HOST` | (required) | VMS hostname or IP |
 | `--vms-port PORT` | `443` | VMS HTTPS port |
 | `--user USER` | `admin` | VMS username |
-| `--password PASS` | prompt / env | Prefer `VAST_PASSWORD` or interactive prompt |
+| `--password PASS` | prompt / env | Prefer `VAST_PASSWORD` or the interactive prompt; passing it here warns, because `ps` and shell history expose it. `VAST_TOKEN` takes precedence over any password |
 
 #### Runtime
 
@@ -164,7 +164,7 @@ Run `./opstat --help` for the authoritative list. Summary:
 
 | Option | Description |
 |--------|-------------|
-| `--log-api-calls` | Write VMS REST traffic to `/tmp/opstat-api-*.log` (secrets redacted) |
+| `--log-api-calls` | Write VMS REST traffic to `/tmp/opstat-api-*.log`. opstat never writes credentials to it (auth lives in headers, which are not logged); the file does contain cluster identifiers, so do not commit it |
 | `--export-openmetrics` | Stream gauges to JSON Lines each refresh |
 | `--openmetrics-file FILE` | Custom `.jsonl` path (else auto-named under `/tmp`) |
 
@@ -173,7 +173,7 @@ Run `./opstat --help` for the authoritative list. Summary:
 | Option | Description |
 |--------|-------------|
 | `--menu` / `-i` | Launch wizard |
-| `--no-menu` | Suppress wizard |
+| `--no-menu` | Never launch the wizard (overrides `--menu`) |
 
 ---
 
@@ -273,7 +273,7 @@ Expected: wizard prompts for protocol, VMS host, credentials, options; then the 
 ./opstat --nfs --version=3.0 --vms vms.example.com --user admin
 ```
 
-Expected: four-panel NFS v3 dashboard; password prompt if `VAST_PASSWORD` unset; Ctrl-C cleans up monitors.
+Expected: four-panel NFS v3 dashboard; password prompt if neither `VAST_TOKEN` nor `VAST_PASSWORD` is set; Ctrl-C cleans up monitors.
 
 ### NFS v4.1 with rolling average and CSV
 
@@ -469,7 +469,7 @@ CLAUDE.md              # Claude Code entrypoint (imports AGENTS.md)
 .claude/               # Agent rules, reviewers, skills, permission policy
 docs/                  # Engineering documentation — see docs/README.md
 tests/                 # pytest suite + mock_vms.py VMS test double
-S3_README.md           # S3 protocol reference
+*_README.md            # Per-protocol references: NFSv3, NFSv41, SMB, S3, NVMe_TCP
 scripts/               # validate.sh, loadgens (see scripts/README-systemd.md), build helpers
 releases/              # Local binary build staging (not committed)
 .github/workflows/     # pytest matrix (3.8–3.14) and tag-triggered releases
