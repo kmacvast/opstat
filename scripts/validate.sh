@@ -39,7 +39,7 @@ cd "$REPO_ROOT" || exit 2
 # tests) should not trip the gate, but losing any whole suite must - the
 # smallest suite this guards is worth ~8 tests, and the openssl-gated block is
 # ~180. History: 395 when the suite collected 400; raised with the suite at 504.
-MIN_TESTS=945
+MIN_TESTS=955
 
 FAST=0
 ALLOW_MISSING_OPENSSL=0

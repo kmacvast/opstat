@@ -114,11 +114,18 @@ its own visible act — not folded into an unrelated change.
 
 Rendering tests capture frames from `_render_frame()` without a terminal, which
 covers layout, width and footer presence. It does **not** cover the event loop,
-key handling, resize signals, or perceived responsiveness. Those need a real
-process in a pseudo-terminal, and no PTY harness is committed — the one used for
-the benchmark numbers in [docs/REFACTOR_HANDOFF.md](../../docs/REFACTOR_HANDOFF.md)
-lived in a session scratchpad. Treat interactive claims as unproven unless a PTY
-run or a real-cluster session backed them.
+key handling, or perceived responsiveness.
+
+**Resize is the one interactive behaviour that IS committed-PTY covered**:
+`tests/test_terminal_resize.py` runs a real engine under `pty.fork`, resizes
+the same running process and measures convergence. It is POSIX-only, so
+Windows interactive behaviour remains uncovered (FR5). Everything else
+interactive — keypress-to-repaint latency, resize *responsiveness* beyond
+correctness, terminal-emulator differences — still has no harness; the one
+behind the benchmark numbers in
+[docs/REFACTOR_HANDOFF.md](../../docs/REFACTOR_HANDOFF.md) lived in a session
+scratchpad. Treat those claims as unproven unless a PTY run or a real-cluster
+session backed them.
 
 ### Report honestly
 

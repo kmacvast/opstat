@@ -65,6 +65,31 @@ outside the column. Sub-microsecond latencies rendered as `0 µs`. Both were
   actually has, with colour at 80 and 40. It does **not** cover populated
   drill row tables, the scoped `| clients …` title variants, or any real
   terminal.
+- **Terminal width comes from the terminal, never the environment.** Use
+  `vast_common.terminal_width(fallback, cap)`, which asks the tty's own file
+  descriptor and only falls back to `shutil.get_terminal_size` when no stream
+  is a terminal (pipes, and the render suites). `shutil` honours `COLUMNS`
+  *before* the ioctl, and an exported stale `COLUMNS` then pins the width
+  permanently: measured in a real pty on 2026-08-25, with `COLUMNS=200` and
+  the terminal resized 120 -> 80 -> 40, opstat kept emitting 120-column
+  frames and **never converged**, wrapping the display indefinitely.
+- **Resize needs no SIGWINCH, and there is deliberately no handler.** Every
+  engine re-reads the width inside `_render_frame`, and every main loop
+  repaints unconditionally each tick via `guarded_poll(poll_tick,
+  render_screen)`, so the next scheduled repaint adapts on its own - in
+  every mode, including the delegation panel, which has no timed re-query of
+  its own. **No keypress is required**, and no frame wider than the new
+  terminal is ever emitted.
+  The convergence bound is one refresh interval **plus the in-flight fetch**,
+  because `guarded_poll` renders after fetching. Measured at 2.4-5.1 s with
+  `--refresh 5` **against the in-process mock** (~ms loopback): on a real
+  cluster a poll cycle is several monitor queries at seconds each, so expect
+  up to a full cycle. That is a latency figure, not a correctness one.
+  If a future change caches the width, `tests/test_terminal_resize.py`
+  catches it by resizing a real process in a real pty. It would NOT catch a
+  SIGWINCH handler being added - that would only converge faster. The suite
+  is POSIX-only (`pty.fork` via `importorskip`); Windows terminal behaviour
+  is FR5's scope and is not covered.
 - **Measure width with `display_width`, truncate with `truncate_display`,
   and strip trailing padding with `rstrip_display` - never `len()` or bare
   `str.rstrip()`.** `truncate_display` is ANSI-aware by construction:
@@ -176,12 +201,14 @@ Frames are captured from `_render_frame()` with no terminal attached.
 
 ## What automated enforcement CANNOT detect
 
-- **Whether the interface feels responsive.** No committed test drives a
-  pseudo-terminal. Perceived latency, keypress-to-repaint, and resize behavior
-  under a real terminal are unmeasured by the suite; the benchmark harness that
-  produced the numbers in
+- **Whether the interface feels responsive.** Perceived latency and
+  keypress-to-repaint under a real terminal are still unmeasured; the
+  benchmark harness that produced the numbers in
   [docs/REFACTOR_HANDOFF.md](../../docs/REFACTOR_HANDOFF.md) was a scratch
-  script and is not committed.
+  script and is not committed. **Resize is the exception** —
+  `tests/test_terminal_resize.py` drives a real pty and measures it — but
+  that covers resize *correctness and convergence*, not how the interface
+  feels, and it is POSIX-only.
 - **Whether a panel is comprehensible.** Tests assert the footer is present, not
   that the screen makes sense. The footer defect, the identical hostnames and
   the `0 µs` latencies were all found by a human looking at a real screen.

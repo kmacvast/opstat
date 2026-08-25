@@ -1035,7 +1035,13 @@ def _nvme_frame(engine, columns=120):
     import tui_layout as _tl
 
     real_size = _sh.get_terminal_size
+    real_width = vast_common.terminal_width
     buf, real_stdout = _io.StringIO(), _sys.stdout
+    # Patch the real width seam, not shutil: vast_common.terminal_width
+    # asks the tty first, so under `pytest -s` (stdout IS a terminal)
+    # patching shutil alone left these suites rendering at the real
+    # terminal width and quietly testing nothing.
+    vast_common.terminal_width = lambda fallback, cap: min(columns, cap)
     _sh.get_terminal_size = lambda fallback=(80, 24): _os.terminal_size(
         (columns, 40))
     _sys.stdout = buf
@@ -1044,6 +1050,7 @@ def _nvme_frame(engine, columns=120):
     finally:
         _sys.stdout = real_stdout
         _sh.get_terminal_size = real_size
+        vast_common.terminal_width = real_width
     return _tl.strip_ansi(buf.getvalue())
 
 

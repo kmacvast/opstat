@@ -97,7 +97,13 @@ def render_frame(module, columns=200, lines=40):
     import os
 
     real_size = shutil.get_terminal_size
+    real_width = vast_common.terminal_width
     buf, real_stdout = io.StringIO(), sys.stdout
+    # Patch the real width seam, not shutil: vast_common.terminal_width
+    # asks the tty first, so under `pytest -s` (stdout IS a terminal)
+    # patching shutil alone left these suites rendering at the real
+    # terminal width and quietly testing nothing.
+    vast_common.terminal_width = lambda fallback, cap: min(columns, cap)
     shutil.get_terminal_size = lambda fallback=(80, 24): os.terminal_size(
         (columns, lines))
     sys.stdout = buf
@@ -106,6 +112,7 @@ def render_frame(module, columns=200, lines=40):
     finally:
         sys.stdout = real_stdout
         shutil.get_terminal_size = real_size
+        vast_common.terminal_width = real_width
     return tui_layout.strip_ansi(buf.getvalue())
 
 

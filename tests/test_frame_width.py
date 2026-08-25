@@ -91,7 +91,13 @@ def _args(port, name):
 
 def render(module, columns):
     real_size = shutil.get_terminal_size
+    real_width = vast_common.terminal_width
     buf, real_stdout = io.StringIO(), sys.stdout
+    # Patch the real width seam, not shutil: vast_common.terminal_width
+    # asks the tty first, so under `pytest -s` (stdout IS a terminal)
+    # patching shutil alone left these suites rendering at the real
+    # terminal width and quietly testing nothing.
+    vast_common.terminal_width = lambda fallback, cap, c=columns: min(c, cap)
     shutil.get_terminal_size = lambda fallback=(80, 24), c=columns: (
         os.terminal_size((c, 40)))
     sys.stdout = buf
@@ -100,6 +106,7 @@ def render(module, columns):
     finally:
         sys.stdout = real_stdout
         shutil.get_terminal_size = real_size
+        vast_common.terminal_width = real_width
     return buf.getvalue()
 
 
