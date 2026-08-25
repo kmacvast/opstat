@@ -341,10 +341,15 @@
       "blocked_by": [],
       "related_decisions": [],
       "related_legacy_frs": [],
-      "evidence": [],
-      "notes": [],
+      "evidence": [
+        "2026-08-18 (manual-testing pass, measured on the mock and with realistic lab values; NOT a real-VMS observation): the NVMe header lines are printed WITHOUT truncation - nvme_tcp._render_frame prints `title` and the `Cluster ... VMS ... Refresh ...` meta line directly, unlike nfs_v41 which truncates both explicitly (nfs_v41.py:2200-2206, comment: 'Header lines sit outside the box borders, so they must be truncated explicitly'). Measured widths of the NVMe meta line: 79 columns with the short mock cluster name, and 112 columns with realistic lab values (cluster selab-var-203, VMS var203.selab.vastdata.com:443, OS label release-5.4.6-2628322) - so it overflows a STANDARD 80-column terminal, not merely very narrow ones. This corrects the first framing of the observation ('around 40 columns and below'), which came from a mock run with a short hostname. The 'Waiting for data...' line (60 columns) and, below ~30 columns, the title line overflow too. An overflowing header wraps and shifts every row beneath it, which is the frame-corruption mode the box renderers already guard against.",
+        "2026-08-18: the defect is NOT NVMe-only. Same probe at 80/60/40 columns: nvme_tcp overflows (max 112), nfs_v3 overflows (max 99), nfs_v41 is clean at every width (it truncates). smb and s3 print their title and sample/frame/source lines untruncated in the same shape (smb.py:2246-2252, s3.py:2190-2196) so they are very likely affected, but this pass could NOT measure them - both raised KeyError rendering without fuller row state, so treat smb/s3 as unverified rather than confirmed. Coverage explains why this survived: a whole-frame width invariant exists only for nfs_v41 (tests/test_render_navigation.py test_frame_never_exceeds_the_terminal_width); no equivalent exists for nvme/nfs_v3/smb/s3. A fix should pair header truncation with that invariant test per engine."
+      ],
+      "notes": [
+        "2026-08-18: scoped into this FR rather than given its own number - 'Narrow-terminal visual sweep and resize behavior' is already FR7 scope, and the backlog rule allocates a new FR only for genuinely new work. Not implemented in the manual-testing pass: it is pre-existing, affects normal dashboard frames as well as drill frames, and touches four engines' renderers plus new per-engine width tests - too broad to fix opportunistically inside a UI-classification change."
+      ],
       "created": "2026-08-16",
-      "updated": "2026-08-16",
+      "updated": "2026-08-18",
       "completed": null
     },
     {
