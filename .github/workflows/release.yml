@@ -75,6 +75,13 @@ jobs:
           python scripts/build_opstat.py --name "${{ matrix.artifact }}"
           ls -la releases/
 
+      # Prove the artifact actually starts and reports the right version on
+      # this platform BEFORE it is uploaded. A binary that cannot launch must
+      # never reach a Release.
+      - name: Smoke-test the built artifact
+        shell: bash
+        run: python scripts/smoke_packaged_opstat.py "releases/${{ matrix.artifact }}"
+
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:

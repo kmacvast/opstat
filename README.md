@@ -394,6 +394,36 @@ python3 scripts/build_opstat.py
 
 Artifacts land in `releases/` (local) and `dist/` during the build (ignored by git).
 
+### Verifying a build
+
+Run the artifact through the packaged smoke test — it launches the binary from a
+scratch directory, so anything that still depends on the source tree fails rather
+than passing quietly:
+
+```bash
+python3 scripts/smoke_packaged_opstat.py releases/opstat-<os>-<arch>
+```
+
+It checks that the binary starts, that `-V` and `--tool-version` report
+`opstat_version.VERSION`, that `--help` lists the supported options, that a
+missing `--vms` exits 2, and that protocol validation runs — so application
+code executes in the frozen binary, not just the argument parser. (Every
+bundled module is already proven imported by `-V` succeeding, since the
+entrypoint imports all five engines at module level.) The release workflow
+runs this on every platform it builds, before the artifact is uploaded.
+
+**Bootstrap prerequisites.** Running from source needs only Python 3.8+ — the
+runtime is standard-library only, so a bare virtualenv with no packages
+installed is enough. Building additionally needs `pyinstaller>=6.0`; nothing
+else, and no build-time code generation.
+
+**Currently validated:** macOS (Apple Silicon) — built and smoke-tested on
+macOS arm64 with Python 3.12 and PyInstaller 6.22.2, producing a ~9.2 MB
+`opstat-macos-arm64` whose `--help` is byte-identical to the source CLI's.
+Linux and Windows binaries are produced by the same script through the release
+workflow but have **not** been executed as part of this validation; Windows
+execution coverage is tracked separately (FR5).
+
 ### Versioning and releases
 
 The version lives in exactly one place, [`opstat_version.py`](opstat_version.py);
