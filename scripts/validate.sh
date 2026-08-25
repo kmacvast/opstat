@@ -38,8 +38,9 @@ cd "$REPO_ROOT" || exit 2
 # it: ordinary reorganization (merging parametrize cases, folding duplicate
 # tests) should not trip the gate, but losing any whole suite must - the
 # smallest suite this guards is worth ~8 tests, and the openssl-gated block is
-# ~180. History: 395 when the suite collected 400; raised with the suite at 504.
-MIN_TESTS=955
+# ~180. History: 395 when the suite collected 400; raised with the suite at
+# 504, and again at 1077.
+MIN_TESTS=990
 
 FAST=0
 ALLOW_MISSING_OPENSSL=0
