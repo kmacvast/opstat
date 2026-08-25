@@ -199,7 +199,19 @@ def display_width(text):
 
 
 def truncate_display(text, max_width, ellipsis="…"):
-    """Truncate *text* to *max_width* display columns, appending *ellipsis* if needed."""
+    """Truncate *text* to *max_width* display columns, appending *ellipsis* if needed.
+
+    ANSI-aware, because callers truncate already-colored strings. Escape
+    sequences occupy zero terminal columns, so they must pass through without
+    consuming budget and must never be cut in half. Counting their bytes as
+    width silently dropped real content - an 80-column NFSv4.1 header
+    truncated to 50 visible columns with color on, losing the cluster name,
+    while the same header rendered fully with color off - and a cut landing
+    inside an escape emitted a broken sequence.
+
+    Any styling still active at the cut is closed with a reset so the colour
+    cannot bleed into the rest of the terminal line.
+    """
     if max_width <= 0:
         return ""
     if display_width(text) <= max_width:
@@ -210,13 +222,24 @@ def truncate_display(text, max_width, ellipsis="…"):
     target = max_width - ell_w
     out = []
     width = 0
-    for ch in text:
-        cw = char_display_width(ch)
+    styled = False
+    index, length = 0, len(text)
+    while index < length:
+        if text[index] == "\033":
+            match = _ANSI_RE.match(text, index)
+            if match:
+                sequence = match.group(0)
+                out.append(sequence)
+                styled = sequence != _RST
+                index = match.end()
+                continue
+        cw = char_display_width(text[index])
         if width + cw > target:
             break
-        out.append(ch)
+        out.append(text[index])
         width += cw
-    return "".join(out) + ellipsis
+        index += 1
+    return "".join(out) + ellipsis + (_RST if styled else "")
 
 
 def pad_display(text, width, align="<"):

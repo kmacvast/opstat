@@ -657,6 +657,9 @@ def _vlen(s):
 
 
 def box_top(title, width):
+    # A title longer than the frame would overflow the terminal and corrupt
+    # every row below it (box_row truncates its content; the title never was).
+    title = truncate_display(title, max(1, width - 6))
     raw_pre = f"{_TL}{_H} {title} "
     fill = max(0, width - display_width(raw_pre) - 1)
     if _COLOR:
@@ -2128,7 +2131,12 @@ def _render_frame():
         title += c("  - HOST INITIATOR VIEW", _BYELLOW)
     if CSV_FILE:
         title += c(f"  csv:{CSV_FILE}", _DIM)
-    print(title)
+    # Header lines sit outside the box borders, so they must be truncated
+    # explicitly: an untruncated line wraps on a narrow terminal, shifting
+    # every row below it and corrupting the frame. With a realistic cluster
+    # name, FQDN and OS build this meta line measured 114 columns - it
+    # overflowed a standard 80-column terminal, not just a narrow one.
+    print(truncate_display(title, width))
     meta = (
         c("Cluster ", _DIM) + c(CLUSTER_NAME or "-", _BWHITE)
         + c("   VMS ", _DIM) + c(f"{VMS}:{PORT}", _BWHITE)
@@ -2137,19 +2145,22 @@ def _render_frame():
     os_label = format_os_release(CLUSTER_OS)
     if os_label:
         meta += c(f"   {os_label}", _DIM)
-    print(c("  ", _DIM) + meta)
+    print(truncate_display(c("  ", _DIM) + meta, width))
     print(c(_H * width, _DIM))
 
     # Startup / waiting frame: keep the help bar (footer) - never a bare early
     # return that drops the navigation controls.
     if STARTUP_STATUS or DRILL_STATUS or not rows:
         if STARTUP_STATUS:
-            print(c("  " + STARTUP_STATUS, _BYELLOW))
+            print(truncate_display(c("  " + STARTUP_STATUS, _BYELLOW), width))
         elif DRILL_STATUS:
-            print(c("  " + DRILL_STATUS, _BYELLOW))
+            # Fitted to the terminal only - the cold-entry wording itself is
+            # unchanged (see vast_drill.loading_message).
+            print(truncate_display(c("  " + DRILL_STATUS, _BYELLOW), width))
         else:
-            print(c(f"  Waiting for data…  VMS={VMS}:{PORT}"
-                    f"  cluster={CLUSTER_NAME or '-'}", _DIM))
+            print(truncate_display(
+                c(f"  Waiting for data…  VMS={VMS}:{PORT}"
+                  f"  cluster={CLUSTER_NAME or '-'}", _DIM), width))
         if DRILL_ERROR and NO_TELEMETRY_MARKER in DRILL_ERROR:
             print(c("  " + truncate_display(str(DRILL_ERROR), width - 2),
                     _YELLOW))

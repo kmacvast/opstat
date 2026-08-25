@@ -441,6 +441,9 @@ def fmt_delta(value, precision=2):
 
 
 def box_top(title, width):
+    # A title longer than the frame would overflow the terminal and corrupt
+    # every row below it (box_row truncates its content; the title never was).
+    title = truncate_display(title, max(1, width - 6))
     raw_pre = f"{_TL}{_H} {title} "
     fill = max(0, width - display_width(raw_pre) - 1)
     if _COLOR:
@@ -2243,14 +2246,17 @@ def _render_frame():
         title += c(f"   | {DRILL_MODE.upper()} DRILL", _BYELLOW)
     if CSV_FILE:
         title += c(f"   csv:{CSV_FILE}", _DIM)
-    print(title)
+    # Header lines sit outside the box borders, so they must be truncated
+    # explicitly: an untruncated line wraps on a narrow terminal, shifting
+    # every row below it and corrupting the frame.
+    print(truncate_display(title, width))
     frame_note = f"sample-average {API_TIME_FRAME}" if SAMPLE_AVERAGE_MODE else f"frame {API_TIME_FRAME}"
     os_label = format_os_release(CLUSTER_OS)
-    print(c(
+    print(truncate_display(c(
         f"  sample {LAST_SAMPLE}   {frame_note}   source {METRICS_SOURCE}"
         + (f"   {os_label}" if os_label else ""),
         _DIM,
-    ))
+    ), width))
     print()
 
     if STARTUP_STATUS:

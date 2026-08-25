@@ -367,6 +367,10 @@ _COLOR = False
 
 def box_top(title, width):
     """Print: ┌─ TITLE ─────────────────────┐"""
+    # A title longer than the frame would overflow the terminal and
+    # corrupt every row below it (box_row truncates its content; the
+    # title never was).
+    title = truncate_display(title, max(1, width - 6))
     raw_pre = f"{_TL}{_H} {title} "
     fill    = max(0, width - display_width(raw_pre) - 1)
     if _COLOR:
@@ -1936,6 +1940,13 @@ def _render_frame():
         + (f"  {os_label}" if os_label else ""),
         _DIM,
     )
+    # Header lines sit outside the box borders, so they must be truncated
+    # explicitly: an untruncated line wraps on a narrow terminal, shifting
+    # every row below it and corrupting the frame. A realistic cluster name
+    # plus FQDN and OS build ran these to 99 columns - past a standard
+    # 80-column terminal, not just an unusually narrow one.
+    title_line = truncate_display(title_line, width)
+    info_line = truncate_display(info_line, width)
 
     # ── Startup / waiting frame: keep the header and footer (the common path
     #    owns the footer - never a bare early return). ─────────────────────────
@@ -1944,10 +1955,11 @@ def _render_frame():
         print(info_line)
         print(c(_H * width, _DIM))
         if STARTUP_STATUS:
-            print(c("  " + STARTUP_STATUS, _BYELLOW))
+            print(truncate_display(c("  " + STARTUP_STATUS, _BYELLOW), width))
         else:
-            print(c(f"  Waiting for data…  VMS={VMS}:{PORT}"
-                    f"  cluster={CLUSTER_NAME or '?'}", _DIM))
+            print(truncate_display(
+                c(f"  Waiting for data…  VMS={VMS}:{PORT}"
+                  f"  cluster={CLUSTER_NAME or '?'}", _DIM), width))
         print(c(_H * width, _DIM))
         print(_footer_keys(width), flush=True)
         return
@@ -1983,7 +1995,9 @@ def _render_frame():
         + "   " + delta_arrow(total_bw) + " " + bw_s
     )
     print(c(_H * width, _DIM))
-    print(foot)
+    # The grand-total line is drawn outside the box borders too, so it needs
+    # the same explicit truncation as the header lines.
+    print(truncate_display(foot, width))
     print(_footer_keys(width), flush=True)
 
 

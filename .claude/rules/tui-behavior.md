@@ -50,6 +50,21 @@ outside the column. Sub-microsecond latencies rendered as `0 µs`. Both were
 - No silent truncation of controls. The frame must never exceed the terminal
   width; the footer degrades legibly rather than vanishing or wrapping into
   garbage.
+- **Every rendered line obeys the width invariant, including lines drawn
+  outside the box machinery** - title, cluster/VMS metadata, sample/frame/
+  source, waiting and status lines, and grand-total rows. Those must be
+  passed through `truncate_display` explicitly; the box helpers cannot do it
+  for them. Four engines drifted here until 2026-08-25: with realistic
+  values the NVMe meta line measured 114 columns and the NFSv3 header 99,
+  overflowing a *standard 80-column* terminal, and box titles overflowed
+  below ~26 columns. `tests/test_frame_width.py` now pins the invariant for
+  every engine, state and width, in both colour modes.
+- **Measure width with `display_width`, and truncate with `truncate_display`
+  - never `len()`.** `truncate_display` is ANSI-aware by construction:
+  escapes cost zero columns, are never split, and open styling is closed
+  with a reset. It previously counted escape bytes against the budget, so
+  with colour on an 80-column header rendered 50 visible columns and lost
+  the cluster name - a bug invisible to every no-colour test.
 
 ### Startup and shutdown are loading states too
 

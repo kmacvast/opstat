@@ -78,3 +78,65 @@ def test_glyph_set_modes():
     asc = tl.glyph_set(False)
     assert utf["H"] != asc["H"]
     assert asc["MUS"] == "us"
+
+
+# ---------------------------------------------------------------------------
+# truncate_display is ANSI-aware (FR7 narrow-terminal sweep).
+#
+# Callers truncate already-colored strings. Escape sequences occupy zero
+# terminal columns, so counting their bytes against the budget silently threw
+# away real content: an 80-column NFSv4.1 header rendered only 50 visible
+# columns with color on - losing the cluster name - while the same header was
+# complete with color off. A cut landing inside an escape also emitted a
+# broken sequence.
+# ---------------------------------------------------------------------------
+import re as _re
+
+
+def _colored(text, code):
+    return f"{code}{text}{tl._RST}"
+
+
+def test_escapes_do_not_consume_truncation_budget():
+    plain = "hello world-of-text-that-is-long"
+    styled = _colored("hello", tl._BCYAN) + plain[5:]
+    assert tl.display_width(styled) == len(plain)
+    cut = tl.truncate_display(styled, 12)
+    assert tl.display_width(cut) == 12, (
+        "escape bytes were counted as visible columns: %r" % cut)
+    assert tl.strip_ansi(cut) == tl.truncate_display(plain, 12)
+
+
+def test_truncation_never_cuts_an_escape_in_half():
+    styled = _colored("abcdefghij", tl._BWHITE) * 4
+    for width in range(1, 40):
+        cut = tl.truncate_display(styled, width)
+        assert not _re.search(r"\033(?!\[[0-9;]*m)", cut), (
+            "broken escape at width %d: %r" % (width, cut))
+
+
+def test_truncation_closes_styling_it_leaves_open():
+    styled = tl._BCYAN + "abcdefghijklmnop"      # opened, never closed
+    cut = tl.truncate_display(styled, 8)
+    assert cut.endswith(tl._RST), (
+        "colour would bleed past the truncation point: %r" % cut)
+
+
+def test_already_reset_text_is_not_given_a_redundant_reset():
+    styled = _colored("abcdefghijklmnop", tl._BCYAN)
+    cut = tl.truncate_display(styled, 40)
+    assert cut == styled, "text that already fits must be returned unchanged"
+
+
+def test_colored_and_plain_truncate_to_the_same_visible_text():
+    plain = "cluster selab-var-203  VMS var203.selab.vastdata.com:443  refresh 5s"
+    styled = (_colored("cluster ", tl._DIM)
+              + _colored("selab-var-203", tl._BWHITE)
+              + "  VMS " + _colored("var203.selab.vastdata.com:443",
+                                    tl._BWHITE)
+              + _colored("  refresh 5s", tl._DIM))
+    for width in (80, 60, 40, 24, 10):
+        assert tl.strip_ansi(
+            tl.truncate_display(styled, width)
+        ) == tl.truncate_display(plain, width), (
+            "colour changed what content survived at width %d" % width)
