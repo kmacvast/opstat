@@ -52,3 +52,47 @@ cluster-scoped for exactly this reason.
 A build that publishes NFS host_view series (or a protocol-aware
 ViewMetrics) is available for validation — that work enables the capability
 branch; it does not contradict this record.
+
+## 2026-08-25 corrective evidence (appended; the historical record above is
+## preserved as written)
+
+The reopen clause was exercised: FR14's GET-only host_view probe
+(`scripts/opstat-lab-fr14-hostview-attribution-probe.sh`) ran four times on
+2026-08-25 across var203 (5.4.6.0) and var204 (5.5.0.1), including one
+**corrective** run after the first NFS3 run was found to have its workload
+pointed at a different cluster entirely (the nfs3-loadgen's mount targeted
+172.200.202.x while var204 was probed — the probe now hard-fails on that
+mismatch).
+
+**Corrective var204 / 5.5.0.1 result — decisive negative.** With
+`/mnt/var204-nfs3` mounted vers=3 from 172.200.204.6 (the probed cluster) and
+1,112,397 NFSv3 client operations proven through it during the window
+(~5–6k ops/s, client 172.200.14.198, fio under `/kmacs/nfstest`), host_view
+attributed **none of it**: across six scrapes the `protocol="NFS3"` rows
+never included the loaded path, while the **same client's NFSv4.1 traffic to
+the same `/kmacs/nfstest` subtree was attributed continuously** (~304 IOPS)
+in the same scrapes. `protocol="NFS3"` rows existed only for unrelated idle
+`/jpalumbo/*` paths from another client.
+
+**Refinement of the historical observation, not a rewrite.** The 2026-08-17
+capture recorded *no NFS series under any protocol label* on var203/5.4.6.
+On 2026-08-25, var203 (still 5.4.6.0) **did** publish `protocol="NFS3"` rows
+correctly attributing an unrelated k8s tenant's background NFSv3 writes
+(~719 KB/s to a csi path, `tenant="mars-k8s-tenant"`). host_view therefore
+demonstrably *can* carry the NFS3 label with real values. The supported
+conclusion is narrower than "host_view never carries NFS3":
+
+> **Neither validated lab cluster provides reliable per-view host_view
+> attribution for a controlled first-party NFSv3 workload.** The label can
+> appear, and some background NFS3 traffic has been attributed elsewhere,
+> but a proven ~5–6k ops/s NFSv3 load produced no attribution on the
+> 5.5.0.1 build.
+
+**Decision unchanged.** The honest unavailable notice remains the correct
+production behavior on both validated capability shapes, and
+`view_attribution_source()` remains deterministic `None`. Enablement still
+requires a build (or configuration) that demonstrably attributes a
+controlled NFSv3 workload, validated live. Evidence archives:
+`opstat-fr14-hostview-probe-20260825-{204140,204320,204447,210134}.zip`
+(returned to the repository owner; identifiers per lab policy stay out of
+the tree beyond the cluster names already recorded here).

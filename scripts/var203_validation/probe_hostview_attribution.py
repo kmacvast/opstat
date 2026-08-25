@@ -16,8 +16,18 @@ and parses the target protocols through the PRODUCTION parser
 (``nfs4_native.parse_host_view``) so the probe proves the exact code path the
 drill would use, not a lookalike.
 
-Safety contract: two read-only GETs per sample (/clusters/ once, then the
-host_view scrape); no monitors, no writes, no non-GET requests of any kind.
+Safety contract: read-only GETs only (/clusters/ and /vips/ once, then one
+host_view scrape per sample); no monitors, no writes, no non-GET requests of
+any kind.
+
+Target-consistency hard-fail: OPSTAT_WORKLOAD_IP names the server address the
+workload actually targets (the wrapper derives it from the mount or loadgen
+configuration). The probe fetches the VMS's own /vips/ inventory and REFUSES
+to run the scrapes unless that address belongs to the probed cluster - a
+workload pointed at another cluster must never be accepted as evidence. The
+first FR14 NFS3 run demonstrated exactly that failure: 866k proven client ops
+against 172.200.202.x while var204 was probed, yielding a misleading
+PRESENT(idle).
 
 Environment:
   OPSTAT_VMS                  target VMS host (required)
@@ -29,6 +39,9 @@ Environment:
   OPSTAT_PROBE_PROTOCOLS      default NFS3,NFS4,SMB2,S3,BLOCK,NDB
   OPSTAT_PROBE_OUT            output directory (required; the lab wrapper
                               points it beneath the run dir)
+  OPSTAT_WORKLOAD_IP          server IP the workload targets (required; the
+                              wrapper derives it - the probe exits 3 if it
+                              is absent or not owned by the probed VMS)
 
 Python 3.8+, stdlib only.
 """
@@ -52,6 +65,61 @@ import vast_common                                          # noqa: E402
 
 _SERIES = re.compile(r"^(vast_host_view_[a-z_]+)\{([^}]*)\}\s+(\S+)")
 _LABEL = re.compile(r'(\w+)="([^"]*)"')
+_IPV4 = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
+
+
+def _ip_key(ip):
+    try:
+        a, b, c, d = (int(x) for x in ip.split("."))
+    except ValueError:
+        return None
+    if max(a, b, c, d) > 255:
+        return None
+    return (a << 24) | (b << 16) | (c << 8) | d
+
+
+def collect_vip_addresses(payload):
+    """Every IPv4 literal in the /vips/ payload, plus (start, end) ranges.
+
+    VIP objects vary by build (ip/address literals, or start/end range
+    fields), so gather both rather than assuming one schema."""
+    literals, ranges = set(), []
+
+    def walk(node):
+        if isinstance(node, dict):
+            starts = {k: v for k, v in node.items()
+                      if isinstance(v, str) and _IPV4.match(v)
+                      and "start" in k.lower()}
+            ends = {k: v for k, v in node.items()
+                    if isinstance(v, str) and _IPV4.match(v)
+                    and "end" in k.lower()}
+            if starts and ends:
+                for sv in starts.values():
+                    for ev in ends.values():
+                        ranges.append((sv, ev))
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+        elif isinstance(node, str) and _IPV4.match(node):
+            literals.add(node)
+
+    walk(payload)
+    return literals, ranges
+
+
+def vms_owns_ip(ip, literals, ranges):
+    if ip in literals:
+        return True
+    key = _ip_key(ip)
+    if key is None:
+        return False
+    for start, end in ranges:
+        lo, hi = _ip_key(start), _ip_key(end)
+        if lo is not None and hi is not None and lo <= key <= hi:
+            return True
+    return False
 
 
 def log(msg):
@@ -133,9 +201,33 @@ def main():
     log("cluster: %s  sw_version: %s  target: %s:%d"
         % (cluster_name, sw_version, vms, port))
 
+    # ---- target-consistency hard-fail (never accept cross-cluster load) ----
+    workload_ip = os.environ.get("OPSTAT_WORKLOAD_IP", "").strip()
+    if not workload_ip or not _IPV4.match(workload_ip):
+        print("ERROR: OPSTAT_WORKLOAD_IP is missing or not an IPv4 address "
+              "(%r). The wrapper must derive the workload's actual server "
+              "address; refusing to scrape without it." % workload_ip,
+              file=sys.stderr)
+        return 3
+    vips_payload = vast_common.request("GET", "/vips/")
+    literals, ranges = collect_vip_addresses(vips_payload)
+    if not vms_owns_ip(workload_ip, literals, ranges):
+        print("ERROR: TARGET MISMATCH - the workload targets %s, but %s "
+              "(cluster %s) does not own that address.\n  VIP literals: %s\n"
+              "  VIP ranges: %s\nEvidence from a workload pointed at another "
+              "cluster is not evidence about this one; fix the mount/loadgen "
+              "target or probe the cluster that owns %s."
+              % (workload_ip, vms, cluster_name, sorted(literals),
+                 ranges, workload_ip), file=sys.stderr)
+        return 3
+    log("workload target %s is owned by %s - consistency check PASS"
+        % (workload_ip, cluster_name))
+
     report = {
         "cluster": cluster_name, "sw_version": sw_version,
         "vms": vms, "port": port, "targets": targets,
+        "workload_ip": workload_ip,
+        "vip_literals": sorted(literals), "vip_ranges": ranges,
         "collected_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "samples": [],
     }

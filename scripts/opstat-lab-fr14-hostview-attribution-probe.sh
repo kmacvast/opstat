@@ -32,6 +32,7 @@ REPO="${OPSTAT_REPO:-$HOME/git/opstat}"
 VMS="${OPSTAT_VMS:-var204.selab.vastdata.com}"
 LOADGEN="${OPSTAT_LOADGEN:-nfs3-loadgen}"
 NFS3_MOUNT="${OPSTAT_NFS3_MOUNT:-/mnt/kmacs-root}"
+SMB_MOUNT="${OPSTAT_SMB_MOUNT:-/mnt/smbtest}"
 DTS=$(date +%Y%m%d-%H%M%S)
 RUN="$HOME/kjmtmp/opstat/fr14-$DTS"
 ZIP="$HOME/opstat-fr14-hostview-probe-$DTS.zip"
@@ -81,6 +82,38 @@ if [ "$state" = "active" ]; then pass "$LOADGEN active"; else
 fi
 systemctl status "$LOADGEN.service" --no-pager -l > "$RUN/logs/loadgen-status.txt" 2>&1
 
+# -------- 3b. derive the workload's ACTUAL server address, protocol-aware.
+# The first FR14 NFS3 run proved why this is mandatory: 866k client ops went
+# to 172.200.202.x while var204 was probed, and the probe reported a
+# misleading PRESENT(idle). The probe itself now refuses to scrape unless
+# this address is owned by the probed VMS (checked against live /vips/).
+# This wrapper only DERIVES and REPORTS; it repairs nothing.
+section "3b. workload target derivation"
+WORKLOAD_IP=""
+case "$LOADGEN" in
+  nfs3-loadgen|nfs41-loadgen)
+    SRC=$(findmnt -no SOURCE "$NFS3_MOUNT" 2>/dev/null)
+    WORKLOAD_IP="${SRC%%:*}"
+    [ -n "$WORKLOAD_IP" ] && pass "NFS mount $NFS3_MOUNT served by $WORKLOAD_IP"       || err "cannot derive server from mount $NFS3_MOUNT (findmnt: '$SRC')"
+    ;;
+  smb-loadgen)
+    WORKLOAD_IP=$(grep -F " $SMB_MOUNT " /proc/mounts | grep -oE 'addr=[0-9.]+' | head -1 | cut -d= -f2)
+    [ -n "$WORKLOAD_IP" ] && pass "CIFS mount $SMB_MOUNT served by $WORKLOAD_IP"       || err "cannot derive server from CIFS mount $SMB_MOUNT"
+    ;;
+  s3-loadgen)
+    WORKLOAD_IP=$(systemctl status "$LOADGEN.service" --no-pager -l 2>/dev/null       | grep -oE '\-\-s3endpoints[= ]+https?://[0-9.]+' | grep -oE '[0-9.]+$' | head -1)
+    [ -n "$WORKLOAD_IP" ] && pass "s3-loadgen endpoint is $WORKLOAD_IP"       || err "cannot derive --s3endpoints address from $LOADGEN"
+    ;;
+  *)
+    err "no workload-target derivation rule for loadgen '$LOADGEN'"
+    ;;
+esac
+if [ -z "$WORKLOAD_IP" ]; then
+  err "workload target underivable - refusing to produce unattributable evidence"
+  exit 1
+fi
+export OPSTAT_WORKLOAD_IP="$WORKLOAD_IP"
+
 # --------------------------------------------- 4. pre-run environment capture
 section "4. pre-run capture"
 {
@@ -90,6 +123,7 @@ section "4. pre-run capture"
   echo "python        : $(python3 -V 2>&1)"
   echo "target        : $VMS"
   echo "loadgen       : $LOADGEN"
+  echo "workload_ip   : $WORKLOAD_IP"
   echo "run dir       : $RUN"
 } | tee "$RUN/prereqs.txt"
 mount | grep -iE "nfs|vast|cifs|smb" > "$RUN/logs/mounts.txt" 2>&1
@@ -104,7 +138,10 @@ python3 scripts/var203_validation/probe_hostview_attribution.py \
 PROBE_RC=${PIPESTATUS[0]}
 echo "PROBE-RC $PROBE_RC" | tee -a "$RUN/timestamps.txt"
 date '+PROBE-END %F %T' | tee -a "$RUN/timestamps.txt"
-[ "$PROBE_RC" -eq 0 ] && pass "probe rc=0" || err "probe rc=$PROBE_RC"
+if [ "$PROBE_RC" -eq 0 ]; then pass "probe rc=0"
+elif [ "$PROBE_RC" -eq 3 ]; then
+  err "TARGET MISMATCH: the workload at $WORKLOAD_IP does not belong to $VMS (see probe-output.txt). This run is NOT evidence; fix the mount/loadgen target."
+else err "probe rc=$PROBE_RC"; fi
 
 # ------------------------------------------ 6. post-run workload proof
 section "6. post-run capture and client-side workload proof"
