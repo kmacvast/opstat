@@ -3,7 +3,7 @@
   "project": "opstat",
   "source_of_truth": true,
   "updated": "2026-08-25",
-  "next_fr_number": 14,
+  "next_fr_number": 16,
   "status_values": [
     "backlog",
     "ready",
@@ -90,7 +90,7 @@
     {
       "id": "FR13",
       "title": "Prominent startup/warm-up UX for slow-to-first-data telemetry paths",
-      "priority": 9,
+      "priority": 10,
       "status": "backlog",
       "class": "ux",
       "summary": "Defensive UX: when first meaningful numbers legitimately take a long time (slow cluster/API periods), the user must immediately see a prominent, plain-English explanation that opstat is connected and preparing data - never a mostly empty screen that looks hung.",
@@ -221,7 +221,7 @@
     {
       "id": "FR4",
       "title": "Exporter scrape responsiveness",
-      "priority": 1,
+      "priority": 2,
       "status": "backlog",
       "class": "performance",
       "summary": "Determine with measurement whether the synchronous exporter scrape causes objectionable TUI stalls; do not change architecture on this FR alone.",
@@ -254,7 +254,7 @@
     {
       "id": "FR5",
       "title": "Windows validation / CI coverage",
-      "priority": 2,
+      "priority": 3,
       "status": "backlog",
       "class": "platform",
       "summary": "Exercise the Windows path instead of merely guarding it syntactically; the release workflow ships a Windows executable that no CI runs.",
@@ -283,7 +283,7 @@
     {
       "id": "FR6",
       "title": "Protocol API-efficiency re-audit",
-      "priority": 3,
+      "priority": 4,
       "status": "backlog",
       "class": "performance",
       "summary": "Establish a fresh post-refactor API-cost baseline for all five engines; audit only, no optimization in this FR.",
@@ -319,7 +319,7 @@
     {
       "id": "FR7",
       "title": "Release / product hardening",
-      "priority": 4,
+      "priority": 5,
       "status": "in_progress",
       "class": "release",
       "summary": "Make opstat cleanly installable, documented, packaged and releasable from a fresh environment on supported systems.",
@@ -367,7 +367,8 @@
         "2026-08-25: scope item 3 is now COMPLETE - the width sweep and the resize half are both done and PTY-measured. FR7 REMAINS in_progress: item 4 is partial (macOS arm64 packaging validated; Linux/Windows built but unexecuted), item 5 (upgrade/backward-compatibility sanity) is open and currently unexercisable because the only published release is v0.1.2 on an old commit, item 6 (Windows packaging) is behind FR5, and item 7 needs an end-to-end release, which needs a version-bump decision.",
         "2026-08-25: item 5 is PARTIAL by design - contract defined and statically validated against v0.1.2, real upgrade validation deferred to the existence of a second release (procedure documented in README 'Upgrading'). FR7 REMAINS in_progress: item 4 partial (macOS arm64 packaging validated; Linux/Windows built but unexecuted), item 5 partial as above, item 6 behind FR5, item 7 needs an end-to-end release and a version-bump decision.",
         "2026-08-25: OPEN TELEMETRY-SEMANTICS DEFECTS surfaced by the machine-output review and recorded in D-018 rather than fixed - each is an L1 change to what a number means and is OUT OF SCOPE for a compatibility pass: (1) drill-path row builders map a measured 0 to None before export, so an idle-but-measured target is indistinguishable from an unmeasured one (conflicts with D-009); (2) nvme_tcp does the inverse via 'as_float(...) or 0', exporting unavailable as a measured zero, so vast.nvme_tcp.operations and vast.nfs3.operations mean different things in one file; (3) aggregates sum unavailable operands as 0 with nothing marking the total understated; (4) vast.nfs3.io_size is always a derived ratio - and cross-monitor in the split case - yet exported as a plain gauge, which D-009 requires to be labelled; (5) json.dumps uses the default allow_nan=True, so a NaN/Infinity would emit a line strict JSON parsers reject (no internal path found; a VMS-supplied NaN is unproven); (6) the .jsonl export is not created 0600 though it carries the same cluster identifiers the API log protects; (7) the API log's 0600 applies at creation only. These need their own FR and an owner decision; no FR was allocated here, per instruction.",
-        "2026-08-25: item 5 is PARTIAL by design - contract defined and statically validated against v0.1.2; real upgrade validation deferred until a second release exists (procedure documented in README 'Upgrading'). FR7 REMAINS in_progress: item 4 partial (macOS arm64 packaging validated; Linux/Windows built but unexecuted), item 5 partial as above, item 6 behind FR5, item 7 needs an end-to-end release and a version-bump decision."
+        "2026-08-25: item 5 is PARTIAL by design - contract defined and statically validated against v0.1.2; real upgrade validation deferred until a second release exists (procedure documented in README 'Upgrading'). FR7 REMAINS in_progress: item 4 partial (macOS arm64 packaging validated; Linux/Windows built but unexecuted), item 5 partial as above, item 6 behind FR5, item 7 needs an end-to-end release and a version-bump decision.",
+        "2026-08-25 PAUSED (owner instruction): FR7 implementation stops while the FR14 protocol-attribution correctness findings are addressed. Status remains in_progress; no FR7 item was closed or reopened by the audit."
       ],
       "created": "2026-08-16",
       "updated": "2026-08-25",
@@ -376,7 +377,7 @@
     {
       "id": "FR8",
       "title": "Validation tooling disposition",
-      "priority": 5,
+      "priority": 6,
       "status": "backlog",
       "class": "technical_debt",
       "summary": "Decide deliberately which refactor-era probe/validator machinery becomes permanent, and archive or remove the rest safely.",
@@ -406,7 +407,7 @@
     {
       "id": "FR9",
       "title": "Validator attribution polish",
-      "priority": 6,
+      "priority": 7,
       "status": "backlog",
       "class": "technical_debt",
       "summary": "Fix the two non-blocking Round-5B attribution imperfections found in the raw API log; validator precision only, not production defects.",
@@ -435,7 +436,7 @@
     {
       "id": "FR10",
       "title": "Drill input responsiveness refinement",
-      "priority": 7,
+      "priority": 8,
       "status": "backlog",
       "class": "performance",
       "summary": "Evaluate whether the drill-query loop should become input-aware like the headline loop; measure first, refine only if users experience the bounded latency as objectionable.",
@@ -463,7 +464,7 @@
     {
       "id": "FR11",
       "title": "Startup-loading UX as general invariant",
-      "priority": 8,
+      "priority": 9,
       "status": "backlog",
       "class": "architecture",
       "summary": "Decide whether the startup loading-frame pattern should be codified as a formal invariant for future engines/features, or whether current rule coverage already suffices.",
@@ -516,6 +517,93 @@
       ],
       "created": "2026-08-16",
       "updated": "2026-08-16",
+      "completed": null
+    },
+    {
+      "id": "FR14",
+      "title": "Protocol-attribution correctness for object-scoped drills",
+      "status": "in_progress",
+      "priority": 1,
+      "created": "2026-08-25",
+      "updated": "2026-08-25",
+      "description": "THE INVARIANT: if the operator launches opstat for protocol X, every metric displayed as protocol-scoped must be attributable to protocol X. Manual lab testing (2026-08-25) showed the SMB VIEW drill on var203 presenting /kmacs/block (NVMe) and /bgolliher/nfs-source (NFS) inside 'VAST SMB ... | VIEW DRILL'. A full five-engine drill-source audit confirmed the class: every VIEW/BUCKET/TENANT drill outside the exporter-backed NFSv4.1 ones is ranked and displayed from the monitor API's ViewMetrics/TenantMetrics families, which real-VMS evidence (D-016: no protocol discriminator anywhere in the 2,626-entry catalog) proves are all-protocol. Candidate enumeration is also unfiltered (GET /views/ / GET /tenants/, every object with an id).",
+      "scope": [
+        "SMB view + tenant drills: all-protocol data under an SMB heading, no disclaimer, header claims 'source SMBCommon' (smb.py:174-200, 1953-1955, 2104-2105, 2253)",
+        "S3 bucket + tenant drills: all-protocol data RELABELLED as GET/s / PUT/s / DEL/s / LIST/s (s3.py:526-543, 1498, 1723-1754); BucketViewMetrics fallbacks in _build_bucket_drill_row are dead - those props are never requested (s3.py:519-525)",
+        "S3 vip drill: topn fallback AND a zero-override (s3.py:1977-1984) that silently replaces a MEASURED all-zero S3Common result with protocol-unattributable topn rows - violates both D-007 (topn carries no protocol label) and D-009 (zero is information)",
+        "NFSv3 + NFSv4.1 tenant drills: all-protocol TenantMetrics under protocol headings; the coverage note ('account for X% of cluster ops/s') divides all-protocol tenant ops by protocol-scoped cluster ops - a false subset claim printed up to the 1.5x bail-out (nfs_v3.py:1842-1858, nfs_v41.py:1303-1321, vast_drill.py:295-298)",
+        "Provenance line: 'source S3Common'/'source SMBCommon' rendered on frames displaying ViewMetrics/TenantMetrics/topn data (s3.py:2196-2200, smb.py:2253)",
+        "NFSv3 VIEW enable on 5.5.0.1-class builds: D-016 reopen clause - capability seam view_attribution_source() (nfs_v3.py:1249) switches on VALIDATED telemetry availability, never on version string",
+        "Unit reconciliation in the same panels: s3 converts ViewMetrics/TenantMetrics latency ns->us citing a live observation (s3.py:1461-1470) while vast_drill.build_tenant_row (used by nfs_v3/nfs_v41) and smb feed the same props to weighted_us as MICROSECONDS with no conversion - at most one is right; if s3's observation holds the other three engines inflate tenant latency 1000x. Same divergence for view bw (MB/s vs bytes/s). No decision record settles either.",
+        "nfs_v41 vestigial ViewMetrics view drill: _DRILL_CFG['view'] (nfs_v41.py:195-201) is key-unreachable but fully wired and test-exercised; one future keybinding recreates the SMB defect",
+        "nfs_v41 cnode drill tier disclosure: NFSCommon bandwidth and NfsMetrics supplement (which includes v3-only readdirplus) are coalesced under the v4.1 heading with unproven protocol scope (nfs_v41.py:62, 442-444, 692-703)",
+        "NVMe volume-scoped session renders an unscoped drill beneath the 'Scope <volumes>' banner (nvme_tcp.py:353-359, 1872-1876)"
+      ],
+      "evidence": [
+        "2026-08-25 LAB OBSERVATION (owner, var203/5.4.6): SMB VIEW drill showed /kmacs/block and /bgolliher/nfs-source. Root cause confirmed in code: GET /views/ unfiltered -> ranked by all-protocol ViewMetrics -> displayed under the SMB heading with no disclaimer.",
+        "2026-08-25 FIVE-ENGINE SOURCE AUDIT (read-only, three independent review passes + spot verification): verdict matrix recorded in the audit report. CORRECTLY PROTOCOL-SCOPED: all NFSv4.1 exporter drills (v/h/4, host_view protocol=NFS4 per D-006; native Nfs4Metrics; delegation per D-008/D-017), NVMe vip/cnode/host (BlockMetrics + proto_name=BlockCommon families, topn deliberately not used per D-007), S3+SMB cnode (proto_name=S3Common/SMBCommon), NFSv3 view unavailable notice (D-016). INCORRECTLY PRESENTED AS PROTOCOL-SCOPED: SMB view, SMB tenant, S3 bucket, S3 tenant, S3 vip (topn fallback/override paths), NFSv3 tenant, NFSv4.1 tenant.",
+        "EXISTING EVIDENCE FOR THE FIX: host_view's protocol label is a clean scalar (D-006, 5.5.0.1: NFS4/NFS3/NDB; D-016, 5.4.6: BLOCK/NDB/S3/SMB2) and the parser is already protocol-parameterised with a tenant label (nfs4_native.parse_host_view). So a protocol-scoped per-view source is RECORDED as existing for SMB2/S3 even on 5.4.6, and for NFS3 on 5.5.0.1 - unvalidated under load, which is what the committed probe decides.",
+        "2026-08-25 PROBE COMMITTED: scripts/opstat-lab-fr14-hostview-attribution-probe.sh + scripts/var203_validation/probe_hostview_attribution.py - GET-only, zero monitors, per-protocol PRESENT/ABSENT verdicts through the production parser, loadgen fail-fast, GET-only proof from the API log. Run per (cluster, protocol) pairing under active load."
+      ],
+      "notes": [
+        "REMEDIATION SHAPE (owner decision required - every item is an L1 telemetry-semantics change): per-drill, either (a) rebuild on a protocol-discriminated source (host_view protocol=X, subject to D-004/D-005 exporter-cost constraints: on-demand, throttled, never on the 5s refresh path), (b) keep the data but relabel honestly (all-protocol heading, generic READ/WRITE labels, truthful source line), or (c) D-016-style honest unavailable. The audit recommends (a) where the probe validates the source, (b)/(c) elsewhere. NOTHING was changed in this forensic pass.",
+        "Capability detection must come from telemetry availability (a validated live check), never from the VAST version string.",
+        "TenantMetrics semantics (protocol scope, latency units) have NO decision record despite four engines displaying them - the probe plus a D-014-style paired-unit check should produce one."
+      ],
+      "blocked_by": [],
+      "dependencies": [],
+      "related_decisions": [
+        "D-006",
+        "D-007",
+        "D-009",
+        "D-013",
+        "D-016"
+      ],
+      "class": "correctness",
+      "summary": "Object-scoped drills (view/bucket/tenant, and the S3 vip topn paths) present all-protocol or unattributable data under protocol-specific headings in four engines; define and enforce the invariant that a protocol screen shows only that protocol's attributable data, rebuilding on protocol-discriminated sources where validated and labelling honestly elsewhere.",
+      "acceptance_criteria": [
+        "The host_view probe ZIPs (per cluster x protocol pairing under active load) decide PRESENT/ABSENT for NFS3 (5.5.0.1), SMB2 and S3; verdicts recorded in a decision record.",
+        "No drill displays another protocol's activity under a protocol-specific heading: each contaminated drill is rebuilt on a validated protocol-discriminated source, relabelled as all-protocol, or shows the D-016-style honest notice - per owner decision, each an explicit L1 approval.",
+        "The S3 vip zero-override no longer replaces a measured zero with unattributable topn data (D-009).",
+        "The NFSv3/NFSv4.1 tenant coverage percentage is not printed when the numerator's protocol scope is broader than the denominator's.",
+        "The per-frame 'source' line names the family actually feeding the visible panel.",
+        "ViewMetrics/TenantMetrics latency and bandwidth units are reconciled across engines with a D-014-style paired probe and recorded in a decision record.",
+        "Regression tests reproduce the observed shape (a non-protocol view ranking into a protocol drill) and pin candidate filtering/labelling; capability detection is validated at runtime from telemetry availability, never from the version string."
+      ],
+      "related_legacy_frs": [],
+      "completed": null
+    },
+    {
+      "id": "FR15",
+      "title": "Cold-entry drill loading message accuracy",
+      "status": "backlog",
+      "priority": 11,
+      "created": "2026-08-25",
+      "updated": "2026-08-25",
+      "description": "The 'this can take 30+ seconds the first time...' tail (vast_drill.py:840, begin_load at 516-531) is applied to EVERY monitor-backed drill's first entry per mode per run, regardless of cost. Lab observation 2026-08-25: NFSv3 TENANT returned quickly under that warning. Audit of recorded measurements: genuinely >=30s on var203 only for NVMe vip/host/cnode (~2 min), SMB tenant (37s), S3 bucket (45s); under 30s for SMB view (9s post-batching), S3 tenant (10s); no measured reason at all for the no-ranking cnode drills (~4 calls). begin_load knows nothing about population size, per-call latency, or whether the mode ranks.",
+      "notes": [
+        "Preferred shape (owner to choose): (A) keep the 30+ tail only for modes with measured >=30s evidence, or (B) escalate: plain wording first, swap to the explanation only once entry has actually been blocked past a threshold. (B) is feasible WITHOUT threads on the chunked paths - entry is a sequence of REST calls with natural boundaries and with_startup_status already demonstrates phase-wise repainting; it cannot escalate mid-call, which bounds the error at one in-flight call. Wording pins to update in the same change: tests/test_drill_loading.py (exact strings), tests/test_nvme_drill.py:403-405.",
+        "LOADING_MESSAGES['views'] (vast_drill.py:823) is vestigial - referenced only by a test parametrization; no engine passes that mode key.",
+        "Distinct from FR13 (startup warm-up UX) and FR11 (startup-loading invariant): this is drill-entry messaging."
+      ],
+      "blocked_by": [],
+      "dependencies": [],
+      "related_decisions": [],
+      "class": "ux",
+      "summary": "The universal 'this can take 30+ seconds the first time...' cold-entry tail over-promises on fast drill paths; scope it to measured-slow modes or escalate only once entry is actually blocked past a threshold.",
+      "scope": [
+        "vast_drill.begin_load/loading_message cold-entry rule (vast_drill.py:516-531, 833-855)",
+        "Wording pins: tests/test_drill_loading.py exact strings, tests/test_nvme_drill.py:403-405",
+        "Vestigial LOADING_MESSAGES['views'] entry (vast_drill.py:823)"
+      ],
+      "acceptance_criteria": [
+        "The 30+ wording appears only on paths with recorded >=30s evidence, OR an escalation shows it only after entry has actually remained blocked beyond a threshold - no threads, no concurrency.",
+        "No path that normally returns in a few seconds claims 30+ seconds; tests updated in the same change."
+      ],
+      "related_legacy_frs": [],
+      "evidence": [
+        "2026-08-25 lab observation: NFSv3 TENANT returned quickly under the 30+ warning. Recorded measurements (docs/REFACTOR_HANDOFF.md:302-311, var203): NVMe entry ~2 min, SMB tenant 37s, S3 bucket 45s justify it; SMB view 9s post-batching, S3 tenant 10s, and the no-ranking cnode drills (~4 calls) do not."
+      ],
       "completed": null
     }
   ]
