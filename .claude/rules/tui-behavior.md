@@ -54,17 +54,30 @@ outside the column. Sub-microsecond latencies rendered as `0 µs`. Both were
   outside the box machinery** - title, cluster/VMS metadata, sample/frame/
   source, waiting and status lines, and grand-total rows. Those must be
   passed through `truncate_display` explicitly; the box helpers cannot do it
-  for them. Four engines drifted here until 2026-08-25: with realistic
-  values the NVMe meta line measured 114 columns and the NFSv3 header 99,
-  overflowing a *standard 80-column* terminal, and box titles overflowed
-  below ~26 columns. `tests/test_frame_width.py` now pins the invariant for
-  every engine, state and width, in both colour modes.
-- **Measure width with `display_width`, and truncate with `truncate_display`
-  - never `len()`.** `truncate_display` is ANSI-aware by construction:
+  for them. Four engines drifted here until 2026-08-25: with realistic values
+  (cluster `selab-var-203`, VMS `var203.selab.vastdata.com:443`, sw_version
+  `5.4.6.0.2628322`) the widest line measured 101 columns on NFSv3, 100 on
+  NVMe, 99 on SMB and 98 on S3 - all overflowing a *standard 80-column*
+  terminal - and box titles overflowed below ~26 columns.
+  `tests/test_frame_width.py` pins the invariant for every engine at
+  24-160 columns across the dashboard, startup, drill-loading, drill-header,
+  drill-error, NFSv4.1 exporter/delegation and rows-empty states each engine
+  actually has, with colour at 80 and 40. It does **not** cover populated
+  drill row tables, the scoped `| clients …` title variants, or any real
+  terminal.
+- **Measure width with `display_width`, truncate with `truncate_display`,
+  and strip trailing padding with `rstrip_display` - never `len()` or bare
+  `str.rstrip()`.** `truncate_display` is ANSI-aware by construction:
   escapes cost zero columns, are never split, and open styling is closed
   with a reset. It previously counted escape bytes against the budget, so
   with colour on an 80-column header rendered 50 visible columns and lost
-  the cluster name - a bug invisible to every no-colour test.
+  the cluster name. `str.rstrip()` has the mirror-image flaw: a trailing
+  space sitting *before* a reset escape survives it, and that stray column
+  cost the NFSv4.1 footer the final letter of `[d] Delegation` at 80
+  columns. **A colour-mode difference is invisible to every no-colour test**,
+  so anything width-sensitive needs a colour case that compares visible
+  content, not just width - eating the budget makes lines narrower, which a
+  width bound alone accepts.
 
 ### Startup and shutdown are loading states too
 

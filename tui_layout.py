@@ -198,6 +198,23 @@ def display_width(text):
     return sum(char_display_width(ch) for ch in plain)
 
 
+# A trailing space that sits BEFORE trailing escapes survives str.rstrip(),
+# because the string ends in the escape rather than the space. That costs a
+# real display column: the NFSv4.1 footer legend lost the final "n" of
+# "[d] Delegation" at 80 columns with colour on, while rendering in full with
+# colour off, because the stray column pushed it past box_row's budget.
+_TRAILING_SPACE_RE = re.compile(r"[ \t]+((?:\033\[[0-9;]*m)*)$")
+
+
+def rstrip_display(text):
+    """``str.rstrip`` for styled text: drops trailing whitespace even when
+    ANSI escapes follow it, so a line's display width does not depend on
+    whether colour is enabled."""
+    if not text:
+        return text
+    return _TRAILING_SPACE_RE.sub(r"\1", text)
+
+
 def truncate_display(text, max_width, ellipsis="…"):
     """Truncate *text* to *max_width* display columns, appending *ellipsis* if needed.
 

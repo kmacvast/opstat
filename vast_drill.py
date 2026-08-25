@@ -727,7 +727,7 @@ def nav_legend(controls):
             tui_layout.c("[%s]" % key, tui_layout._BWHITE)
             + tui_layout.c(" %s " % label, tui_layout._DIM)
         )
-    return "".join(parts).rstrip()
+    return tui_layout.rstrip_display("".join(parts))
 
 
 def nav_legend_lines(controls, width):
@@ -753,7 +753,7 @@ def nav_legend_lines(controls, width):
         seg_width = tui_layout.display_width("[%s] %s" % (key, label)) + 1
         sep_width = 1 if line_parts else 0
         if line_parts and line_width + sep_width + seg_width - 1 > width:
-            lines.append("".join(line_parts).rstrip())
+            lines.append(tui_layout.rstrip_display("".join(line_parts)))
             line_parts = []
             line_width = 0
             sep_width = 0
@@ -765,7 +765,7 @@ def nav_legend_lines(controls, width):
         )
         line_width += sep_width + seg_width
     if line_parts:
-        lines.append("".join(line_parts).rstrip())
+        lines.append(tui_layout.rstrip_display("".join(line_parts)))
     return lines or [""]
 
 
