@@ -164,6 +164,35 @@ dead PTY raised EIO and killed `cleanup()` before the drain. Cleanup output is
 now best-effort by construction (`vast_common.emit_stderr`); monitor deletion
 never depends on a writable terminal.
 
+## How the dead-scope state is presented (2026-08-18)
+
+A scope proven to publish no per-object rows is a **capability-unavailable
+state, not an error**: the VMS accepted the monitor and answered the query;
+the cluster simply cannot attribute block telemetry at that scope. It first
+shipped rendered as `Error: No per-vip block telemetry on this cluster:
+monitor responses carry no rows ... (capability probe and rank scan agree)`,
+in the generic bright-red error treatment - which reads as "opstat failed"
+and put implementation mechanics on the operator's screen.
+
+It now follows the NFSv3 per-view precedent
+([D-016](D-016-nfsv3-view-attribution-unavailable-on-546.md)): an
+informational notice naming the scope the drill already names, what is
+unavailable, and what still works.
+
+```text
+Per-VIP block telemetry is not available from this cluster.
+Cluster-level block telemetry remains available.
+Press x to return to cluster view
+```
+
+`NO_TELEMETRY_MARKER` remains the single shared contract string (the lab
+validator imports it from `nvme_tcp`), and it is now a substring of that
+first line. Only this proven state is reclassified - API failures, refused
+monitor creates, unknown modes and every other `DRILL_ERROR` still render as
+errors. The detection, the bounded O(1) capability probe and the
+per-session verdict cache are unchanged; this was presentation only, with no
+additional API calls or monitors.
+
 ## What would justify reopening
 
 A VAST build returning per-object rows at `vip`/`blockhost` scope — which the

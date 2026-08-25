@@ -143,16 +143,31 @@ _RANK_SAW_ROWS = False
 _RANK_SCORED = False
 _SCOPE_HAS_TELEMETRY = {}
 # The no-telemetry notice, built from this marker so external tooling (the
-# lab validator) can import the contract instead of guessing at a string that
-# would drift. Keep the marker stable; tests assert the notice contains it.
-NO_TELEMETRY_MARKER = "block telemetry on this cluster"
+# lab validator, which imports the constant) cannot drift from the product
+# string. Tests assert the rendered notice contains it.
+#
+# This is a CAPABILITY-UNAVAILABLE state, not a failure: the VMS accepts the
+# monitor and answers the query, the cluster just returns no per-object rows
+# for this scope (D-013 measured vip and blockhost at 0 rows per object while
+# cnode returned 120). It is presented the way NFSv3 presents its per-view
+# attribution notice - block telemetry itself is healthy, so the message says
+# what is unavailable and what still works, and the implementation mechanics
+# ("monitor responses carry no rows", "probe and rank scan agree") stay in
+# the code comments at the detection sites rather than on the operator's
+# screen.
+NO_TELEMETRY_MARKER = "block telemetry is not available from this cluster"
+NO_TELEMETRY_DETAIL = "Cluster-level block telemetry remains available."
+_RETURN_HINT = "Press x to return to cluster view"
+
+# User-facing scope names, matching what the drill panels and footer already
+# call these scopes ("HOST INITIATORS" / "[h] Host") rather than the internal
+# mode key or the object_type ("blockhost").
+_SCOPE_LABELS = {"vip": "VIP", "cnode": "cNode", "host": "host initiator"}
 
 
 def _no_telemetry_notice(mode):
-    return (
-        f"No per-{mode} {NO_TELEMETRY_MARKER}: monitor responses carry no "
-        f"rows for any {mode} object (capability probe and rank scan agree)."
-    )
+    label = _SCOPE_LABELS.get(mode, str(mode))
+    return f"Per-{label} {NO_TELEMETRY_MARKER}."
 
 # Metrics not exposed on current VMS builds - surfaced in discover-metrics notes.
 _UNAVAILABLE_TELEMETRY = (
@@ -1996,6 +2011,16 @@ def _render_path_table(width):
         mode_title = "DRILL"
         col_name = "-"
     print(box_top(mode_title, width))
+    if DRILL_ERROR and NO_TELEMETRY_MARKER in DRILL_ERROR:
+        # Capability notice, not an error (D-013): block telemetry is
+        # healthy; this scope simply publishes no per-object rows. Same
+        # treatment NFSv3 gives its per-view attribution notice - no
+        # "Error:" prefix, no red, and it says what still works.
+        print(box_row(c(DRILL_ERROR, _YELLOW), width))
+        print(box_row(c(NO_TELEMETRY_DETAIL, _DIM), width))
+        print(box_row(c(_RETURN_HINT, _DIM), width))
+        print(box_bottom(width))
+        return
     if DRILL_ERROR:
         print(box_row(c(f"Error: {DRILL_ERROR}", _BRED), width))
         print(box_bottom(width))
@@ -2125,7 +2150,13 @@ def _render_frame():
         else:
             print(c(f"  Waiting for data…  VMS={VMS}:{PORT}"
                     f"  cluster={CLUSTER_NAME or '-'}", _DIM))
-        if DRILL_ERROR:
+        if DRILL_ERROR and NO_TELEMETRY_MARKER in DRILL_ERROR:
+            print(c("  " + truncate_display(str(DRILL_ERROR), width - 2),
+                    _YELLOW))
+            print(c("  " + truncate_display(NO_TELEMETRY_DETAIL, width - 2),
+                    _DIM))
+            print(c("  " + truncate_display(_RETURN_HINT, width - 2), _DIM))
+        elif DRILL_ERROR:
             print(c("  " + truncate_display(str(DRILL_ERROR), width - 2), _BRED))
         _render_help_bar(width)
         return

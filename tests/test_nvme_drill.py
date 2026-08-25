@@ -29,6 +29,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import tui_layout
 import vast_common
 from tests.mock_vms import CNODES, VIPS, _ACTIVE_BLOCK_INDEXES_CNODE, MockVMS
 
@@ -1006,3 +1007,236 @@ def test_manual_refresh_check_failure_still_quits_the_session(monkeypatch):
     assert "quit" in events, "exception path abandoned the opstat session"
     assert "cleanup" in events, "exception path skipped cleanup accounting"
     assert events.index("quit") < events.index("cleanup")
+
+
+# ---------------------------------------------------------------------------
+# Capability notice vs real error (manual-testing follow-up).
+#
+# A scope that publishes no per-object rows is a CAPABILITY-UNAVAILABLE
+# state, not a failure: the VMS accepts the monitor and answers the query
+# (D-013 measured vip and blockhost at 0 rows per object while cnode
+# returned 120). It used to render as "Error: ..." in bright red, which read
+# as "opstat broke". NFSv3 already set the precedent for the honest form -
+# these mirror tests/test_drill_semantics.py's NFSv3 pair.
+# ---------------------------------------------------------------------------
+def _live_dashboard(engine):
+    """Populate headline rows so frames take the normal (not waiting) path."""
+    engine.poll_tick()
+    assert engine.LAST_ROWS, "fixture assumption: headline rows expected"
+
+
+def _nvme_frame(engine, columns=120):
+    """One composed frame from the production renderer, ANSI stripped."""
+    import io as _io
+    import os as _os
+    import shutil as _sh
+    import sys as _sys
+
+    import tui_layout as _tl
+
+    real_size = _sh.get_terminal_size
+    buf, real_stdout = _io.StringIO(), _sys.stdout
+    _sh.get_terminal_size = lambda fallback=(80, 24): _os.terminal_size(
+        (columns, 40))
+    _sys.stdout = buf
+    try:
+        engine._render_frame()
+    finally:
+        _sys.stdout = real_stdout
+        _sh.get_terminal_size = real_size
+    return _tl.strip_ansi(buf.getvalue())
+
+
+def _dead_scope_frame(engine, vms, key, object_type, population=None,
+                      columns=120):
+    """Drive a scope the cluster answers but cannot attribute per object."""
+    vms.state.batch_unsplittable = {object_type: "no_matching_rows"}
+    if population is not None:
+        vms.state.vips = _vip_population(population)
+    try:
+        _live_dashboard(engine)
+        engine._dispatch_key(key)
+        return _nvme_frame(engine, columns=columns)
+    finally:
+        vms.state.vips = None
+        vms.state.batch_unsplittable = {}
+
+
+def test_vip_no_telemetry_renders_as_a_capability_notice(nvme, capsys):
+    engine, vms = nvme
+    frame = _dead_scope_frame(engine, vms, "i", "vip", population=50)
+    capsys.readouterr()
+
+    assert "Per-VIP block telemetry is not available from this cluster." in frame
+    assert "Cluster-level block telemetry remains available." in frame
+    assert "Press x to return to cluster view" in frame
+    assert "Error:" not in frame, (
+        "a proven capability-unavailable scope must not read as a failure")
+    # Implementation mechanics stay in the code, not on the operator's screen.
+    assert "monitor responses carry no rows" not in frame
+    assert "capability probe and rank scan agree" not in frame
+
+
+def test_host_no_telemetry_gets_the_same_capability_treatment(nvme, capsys):
+    """blockhost reaches the identical proven state (D-013) and must get the
+    identical treatment, named the way the drill already names it."""
+    engine, vms = nvme
+    frame = _dead_scope_frame(engine, vms, "h", "blockhost")
+    capsys.readouterr()
+
+    assert engine.NO_TELEMETRY_MARKER in engine.DRILL_ERROR, (
+        "fixture assumption: the host scope must reach the no-telemetry state")
+    assert ("Per-host initiator block telemetry is not available from this "
+            "cluster.") in frame
+    assert "Cluster-level block telemetry remains available." in frame
+    assert "Error:" not in frame
+    assert "blockhost" not in frame, (
+        "the notice must use the drill's own name, not the object_type")
+
+
+def test_capability_notice_keeps_the_footer_and_x_returns(nvme, capsys):
+    engine, vms = nvme
+    frame = _dead_scope_frame(engine, vms, "i", "vip", population=50)
+    capsys.readouterr()
+    assert "[q]" in frame and "[x]" in frame, "footer lost on the notice frame"
+
+    outcome = engine._dispatch_key("x")
+    capsys.readouterr()
+    assert outcome == "refresh"
+    assert engine.DRILL_ERROR is None, "x did not clear the notice state"
+    back = _nvme_frame(engine)
+    capsys.readouterr()
+    assert engine.NO_TELEMETRY_MARKER not in back, "notice survived the exit"
+    assert "[q]" in back
+
+
+@pytest.mark.parametrize("columns", [120, 100, 80, 60, 40])
+def test_capability_notice_fits_narrow_terminals(nvme, capsys, columns):
+    """The notice uses the existing box/truncation machinery, so its own
+    lines never exceed the terminal and the footer survives.
+
+    Scoped to the lines this notice owns on purpose: the NVMe header meta
+    line ("Cluster ... VMS ... Refresh") has never been truncated and can
+    exceed a very narrow terminal on any frame, drill or dashboard. That is
+    pre-existing and out of scope here.
+    """
+    engine, vms = nvme
+    frame = _dead_scope_frame(engine, vms, "i", "vip", population=50,
+                              columns=columns)
+    capsys.readouterr()
+    assert "[q]" in frame, f"footer vanished at {columns} columns"
+    notice_lines = [
+        line for line in frame.split("\n")
+        if engine.NO_TELEMETRY_MARKER in line
+        or engine.NO_TELEMETRY_DETAIL in line
+        or "Press x to return" in line
+    ]
+    assert notice_lines, f"notice not rendered at {columns} columns"
+    for line in notice_lines:
+        assert tui_layout.display_width(line) <= columns, (
+            f"notice line wider than terminal at {columns} cols: {line!r}")
+
+
+def test_a_genuine_drill_error_still_renders_as_an_error(nvme, capsys):
+    """Only the proven NO_TELEMETRY_MARKER state is reclassified. An API
+    failure, a bad mode, a refused monitor - all still read as errors."""
+    engine, vms = nvme
+    _live_dashboard(engine)
+    engine.enter_drill_mode("not-a-mode")
+    frame = _nvme_frame(engine)
+    capsys.readouterr()
+    assert "Error:" in frame, "a real failure must still read as an error"
+    assert engine.NO_TELEMETRY_MARKER not in frame
+    assert "Cluster-level block telemetry remains available." not in frame
+    engine.exit_drill_mode()
+
+
+def test_api_failure_on_drill_entry_still_renders_as_an_error(nvme,
+                                                              monkeypatch,
+                                                              capsys):
+    engine, vms = nvme
+    _live_dashboard(engine)
+    real_request = engine.api_request
+
+    def boom(method, path, payload=None):
+        if path == "/vips/":
+            raise RuntimeError("GET /vips/ failed: HTTP 500: server on fire")
+        return real_request(method, path, payload)
+
+    monkeypatch.setattr(engine, "api_request", boom)
+    engine._dispatch_key("i")
+    frame = _nvme_frame(engine)
+    capsys.readouterr()
+    assert "Error:" in frame
+    assert "Cannot fetch vip objects" in frame
+    assert engine.NO_TELEMETRY_MARKER not in frame
+    engine.exit_drill_mode()
+
+
+def test_rendering_the_notice_costs_no_calls_and_no_monitors(nvme, capsys):
+    """Re-rendering a cached dead-scope verdict is free: the classification
+    is presentation only and must not re-probe."""
+    engine, vms = nvme
+    vms.state.vips = _vip_population(50)
+    vms.state.batch_unsplittable = {"vip": "no_matching_rows"}
+    try:
+        _live_dashboard(engine)
+        engine._dispatch_key("i")
+        capsys.readouterr()
+        before = set(vms.live_monitors())
+        vms.reset_calls()
+        for _ in range(3):
+            _nvme_frame(engine)
+        capsys.readouterr()
+        assert vms.calls() == [], "rendering the notice issued API calls"
+        assert set(vms.live_monitors()) == before, (
+            "rendering the notice created or deleted monitors")
+
+        # And re-entering the known-dead scope stays free (bounded probe
+        # behaviour unchanged by the presentation fix).
+        vms.reset_calls()
+        engine._dispatch_key("i")
+        capsys.readouterr()
+        posts = [call for call in vms.calls() if call[1] == "POST"]
+        assert posts == [], "re-entry re-probed a scope already proven dead"
+    finally:
+        vms.state.vips = None
+        vms.state.batch_unsplittable = {}
+
+
+def test_notice_and_detail_are_shared_constants():
+    """One source of truth: the lab validator imports the marker, so the
+    rendered notice must carry it and the detail line must be a constant
+    rather than a string duplicated at each render site."""
+    import nvme_tcp
+
+    for mode, label in (("vip", "VIP"), ("host", "host initiator"),
+                        ("cnode", "cNode")):
+        notice = nvme_tcp._no_telemetry_notice(mode)
+        assert nvme_tcp.NO_TELEMETRY_MARKER in notice
+        assert notice.startswith("Per-%s " % label)
+    assert nvme_tcp.NO_TELEMETRY_DETAIL == (
+        "Cluster-level block telemetry remains available.")
+
+
+def test_capability_notice_is_the_same_before_headline_rows_arrive(nvme,
+                                                                   capsys):
+    """The frame takes a different path when no headline rows exist yet; the
+    capability notice must read identically there - same wording, no
+    red-error treatment, footer intact."""
+    engine, vms = nvme
+    vms.state.vips = _vip_population(50)
+    vms.state.batch_unsplittable = {"vip": "no_matching_rows"}
+    try:
+        assert engine.LAST_ROWS == [], "fixture assumption: no rows yet"
+        engine._dispatch_key("i")
+        frame = _nvme_frame(engine)
+        capsys.readouterr()
+        assert "Per-VIP block telemetry is not available from this cluster." in frame
+        assert "Cluster-level block telemetry remains available." in frame
+        assert "Press x to return to cluster view" in frame
+        assert "Error:" not in frame
+        assert "[q]" in frame
+    finally:
+        vms.state.vips = None
+        vms.state.batch_unsplittable = {}

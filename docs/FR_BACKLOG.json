@@ -80,10 +80,11 @@
         "2026-08-17: surgical check prepared - probe --view-ids 1,217 pins both path-'/' view objects; committed lab script scripts/opstat-lab-fr3-fr1-validation.sh runs it under proven NFSv3 load with client-side mountstats deltas. Expected outcome ~0 ViewMetrics activity on both, finalizing NO VALID NFSV3 VIEW ATTRIBUTION SOURCE ON 5.4.6.",
         "2026-08-17: recommended product direction (NOT yet implemented, awaiting owner approval): honest unavailable-state notice on builds without a valid source (D-009/NVMe dead-scope pattern), with future capability detection - use host_view protocol=NFS3 when a build publishes it (5.5.0.1-class evidence) and fall back to the honest notice otherwise. Explicit all-protocol relabel rejected as primary: it keeps a misleading-adjacent panel under an NFSv3 screen while SMB/S3 engines already own their per-protocol view drills.",
         "2026-08-17 Stage A: honest unavailable state IMPLEMENTED (bb6061d) - capability seam view_attribution_source(), zero-API-cost VIEW entry, notice-not-error rendering, D-016 recorded; view-row builder regressions preserved as pure vast_drill tests and engine protections converted to the tenant drill; large-population coverage remains in SMB/S3/NVMe suites. Real-VMS validation pending via scripts/opstat-lab-fr1-unavailable-validation.sh (in-process production-path validator, mock-proven 13/13). FR1 moves to done only on returned Stage-B evidence.",
-        "2026-08-17: DONE - Telemetry Correctness milestone complete (FR1 + FR3)."
+        "2026-08-17: DONE - Telemetry Correctness milestone complete (FR1 + FR3).",
+        "2026-08-18 (manual-testing pass): nfs_v3.view_attribution_source() still returns the deliberate D-016 capability result, so [v] renders the honest unavailable notice on every build. Making it a dynamic probe remains a KNOWN FUTURE VALIDATION OPPORTUNITY behind that seam, gated on real-VMS evidence from a 5.5.0.1-class cluster that publishes protocol-labeled host_view NFS series - not unfinished work, and not a new FR (D-016 already records the reopening condition)."
       ],
       "created": "2026-08-16",
-      "updated": "2026-08-17",
+      "updated": "2026-08-18",
       "completed": "2026-08-17"
     },
     {
