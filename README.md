@@ -394,6 +394,32 @@ python3 scripts/build_opstat.py
 
 Artifacts land in `releases/` (local) and `dist/` during the build (ignored by git).
 
+### Versioning and releases
+
+The version lives in exactly one place, [`opstat_version.py`](opstat_version.py);
+the entrypoint, all five engines, the packaged binary and this documentation all
+derive from or are test-enforced against it.
+
+To cut a release:
+
+```bash
+# 1. set VERSION in opstat_version.py to the new X.Y.Z
+# 2. update the "**Version:**" lines in README.md and the protocol READMEs
+./scripts/validate.sh          # fails if any surface still disagrees
+git tag vX.Y.Z                 # release tags are exactly v + the version
+git push --tags
+```
+
+Pushing a `vX.Y.Z` tag runs [`.github/workflows/release.yml`](.github/workflows/release.yml),
+which **verifies the tag matches `opstat_version.VERSION` before anything is built
+or published** and then builds Linux, macOS (Apple Silicon) and Windows binaries and
+attaches them to the GitHub Release. A tag that disagrees with the runtime version
+fails the run rather than shipping a mismatched binary.
+
+Tags outside the `vX.Y.Z` namespace — for example
+`checkpoint-0.1.2-refactor-complete` — are **not** releases: they do not match the
+workflow trigger and are never published.
+
 ### Manual PyInstaller command
 
 ```bash
