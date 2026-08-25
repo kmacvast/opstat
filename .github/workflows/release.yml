@@ -1,8 +1,10 @@
 # Build and publish standalone opstat binaries on tag push.
 #
-# Triggers: git tag vX.Y.Z && git push --tags
-# Gate:     the tag must match opstat_version.VERSION exactly, or the run
-#           fails before anything is built or published
+# Triggers: any tag matching v* (git push --tags)
+# Gate:     only a tag of the exact form vX.Y.Z matching opstat_version.VERSION
+#           can pass. Anything else (v1, vfoo, v0.1.2-rc1, or a version that
+#           disagrees with the runtime) fails the run before anything is built
+#           or published. checkpoint-* tags do not match the trigger at all.
 # Matrix:   Ubuntu, macOS (Apple Silicon), Windows (native PyInstaller per OS)
 # Result:   Artifacts uploaded to the GitHub Release for that tag
 # Note:     Intel macOS (x86_64) builds are intentionally not produced.
@@ -87,6 +89,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Re-verify the tag matches the runtime version
+        run: python scripts/check_version_contract.py --tag "$GITHUB_REF_NAME"
 
       - name: Download all binaries
         uses: actions/download-artifact@v4

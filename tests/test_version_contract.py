@@ -88,6 +88,39 @@ def test_the_entrypoint_derives_the_version():
     assert module["VERSION"] is opstat_version.VERSION
 
 
+def test_no_source_file_hardcodes_a_version_in_prose():
+    """A comment can carry a version too, and it must be flagged by SHAPE,
+    not by value: the entrypoint's own header said "(v0.1.2)" four lines
+    above the constant this slice removed, and three engines carried
+    "# Version: 0.1.1" while their code said 0.1.2. A guard keyed on the
+    current version would have gone quiet on exactly those stale lines.
+
+    VAST cluster versions ("VAST OS 5.5.0.1", "var204/5.5.0.1") are a
+    different thing and appear legitimately in comments.
+    """
+    offenders = []
+    scanned = sorted(ROOT.glob("*.py")) + [ROOT / "opstat"] + sorted(
+        (ROOT / "scripts").glob("*.py"))
+    for path in scanned:
+        if path.name == "opstat_version.py":
+            continue
+        for number, line in enumerate(path.read_text().splitlines(), 1):
+            stripped = line.strip()
+            if not stripped.startswith("#"):
+                continue
+            if "module-local" in stripped:      # explicitly not the tool version
+                continue
+            # A "vX.Y.Z" tag spelling, or a "Version: X.Y.Z" header claim -
+            # regardless of which version it names.
+            if re.search(r"\bv\d+\.\d+\.\d+\b", stripped) or \
+                    re.search(r"Version\s*:\s*\d+\.\d+\.\d+", stripped):
+                offenders.append(f"{path.name}:{number}: {stripped}")
+    assert not offenders, (
+        "source comments state a version; delete them or annotate them as "
+        "module-local - opstat_version.py is the only place a version "
+        "belongs:\n  " + "\n  ".join(offenders))
+
+
 def test_no_module_redefines_the_version_literal():
     """The failure this whole slice exists to prevent: a second copy that
     happens to agree today and silently drifts tomorrow."""
@@ -125,11 +158,13 @@ def test_matching_release_tag_is_accepted():
     assert ok, message
 
 
-@pytest.mark.parametrize("tag", ["v9.9.9", "v0.0.1", "v1.0.0"])
-def test_mismatched_release_tag_is_rejected(tag):
+@pytest.mark.parametrize("bump", [1, 2, 3])
+def test_mismatched_release_tag_is_rejected(bump):
+    """Derived from VERSION so the case can never collide with it."""
+    parts = [int(p) for p in VERSION.split(".")]
+    parts[0] += bump
+    tag = "v%d.%d.%d" % tuple(parts)
     gate = load_gate()
-    if tag == f"v{VERSION}":
-        pytest.skip("that is the current version")
     ok, message = gate.check(tag)
     assert not ok
     assert "MISMATCH" in message and VERSION in message
@@ -159,7 +194,8 @@ def test_the_gate_exits_nonzero_on_mismatch():
     script = str(ROOT / "scripts" / "check_version_contract.py")
     good = subprocess.run([sys.executable, script, "--tag", f"v{VERSION}"],
                           capture_output=True, text=True, timeout=60)
-    bad = subprocess.run([sys.executable, script, "--tag", "v9.9.9"],
+    other = "v%d.0.0" % (int(VERSION.split(".")[0]) + 1)   # never == VERSION
+    bad = subprocess.run([sys.executable, script, "--tag", other],
                          capture_output=True, text=True, timeout=60)
     assert good.returncode == 0, good.stderr
     assert bad.returncode != 0, "a mismatched tag must fail the release run"
@@ -181,37 +217,103 @@ def workflow_text():
     return (ROOT / ".github" / "workflows" / "release.yml").read_text()
 
 
+def workflow_active_lines():
+    """The workflow with comment-only lines removed.
+
+    Substring checks over the raw text could not tell a live step from a
+    commented-out one: commenting out the gate step left every assertion
+    green while the release verified nothing.
+    """
+    return [line for line in workflow_text().splitlines()
+            if not line.strip().startswith("#")]
+
+
+def workflow_jobs():
+    """{job name: [its active lines]} - tolerant of job ordering, since
+    assertions keyed on byte offsets broke when jobs were merely reordered."""
+    jobs, current = {}, None
+    for line in workflow_active_lines():
+        match = re.match(r"^(\s{2})(\w[\w-]*):\s*$", line)
+        if match and not line.startswith("   "):
+            current = match.group(2)
+            jobs[current] = []
+        elif current is not None:
+            jobs[current].append(line)
+    return jobs
+
+
+def gate_invocations(lines):
+    """Active `run:` lines that actually invoke the version gate."""
+    return [l for l in lines if "check_version_contract.py" in l
+            and re.search(r"\brun\s*:", l)]
+
+
+def trigger_patterns():
+    """EVERY tag glob under on.push.tags - reading only the first entry hid
+    a second, permissive one."""
+    lines = workflow_active_lines()
+    patterns, in_tags = [], False
+    for line in lines:
+        if re.match(r"^\s*tags\s*:", line):
+            in_tags = True
+            inline = re.search(r"tags\s*:\s*\[(.+)\]", line)
+            if inline:                       # flow style: tags: ["v*", ...]
+                patterns += re.findall(r"[\"']([^\"']+)[\"']", inline.group(1))
+                in_tags = False
+            continue
+        if in_tags:
+            item = re.match(r"^\s*-\s*[\"']?([^\"'\s]+)[\"']?\s*$", line)
+            if item:
+                patterns.append(item.group(1))
+            elif line.strip():
+                in_tags = False
+    return patterns
+
+
 def test_the_workflow_runs_the_version_gate():
-    text = workflow_text()
-    assert "scripts/check_version_contract.py" in text, (
-        "the release workflow no longer verifies the tag against VERSION")
-    assert "$GITHUB_REF_NAME" in text, "the gate is not given the pushed tag"
+    jobs = workflow_jobs()
+    assert "test" in jobs, "the release workflow lost its test job"
+    invocations = gate_invocations(jobs["test"])
+    assert invocations, (
+        "the release workflow no longer verifies the tag against VERSION "
+        "(a commented-out step does not count)")
+    assert any("GITHUB_REF_NAME" in l for l in invocations), (
+        "the gate is not given the pushed tag")
 
 
 def test_the_gate_runs_before_anything_is_built_or_published():
     """Ordering is the whole point: the check must block the build, not run
-    beside it. build needs test (where the gate lives); publish needs build."""
-    text = workflow_text()
-    gate_at = text.index("check_version_contract.py")
-    build_at = text.index("\n  build:")
-    assert gate_at < build_at, "the version gate must precede the build job"
-    build_block = text[build_at:text.index("\n  publish:")]
-    assert "needs: test" in build_block, "build no longer waits for the gate"
-    assert "needs: build" in text[text.index("\n  publish:"):], (
+    beside it. build waits on test (where the gate lives); publish waits on
+    build and re-verifies immediately before publication."""
+    jobs = workflow_jobs()
+    for job in ("test", "build", "publish"):
+        assert job in jobs, f"release workflow lost its {job} job"
+    build_needs = " ".join(jobs["build"])
+    publish_needs = " ".join(jobs["publish"])
+    assert re.search(r"needs\s*:\s*\[?\s*[\"']?test\b", build_needs), (
+        "build no longer waits for the gate")
+    assert re.search(r"needs\s*:\s*\[?\s*[\"']?build\b", publish_needs), (
         "publish no longer waits for the build")
+    assert gate_invocations(jobs["publish"]), (
+        "publish no longer re-verifies the tag immediately before publishing")
 
 
 def test_the_workflow_only_triggers_on_release_tags():
-    """checkpoint-* must not match the trigger - that is why the earlier
-    checkpoint tag was renamed out of the v* namespace."""
-    text = workflow_text()
-    trigger = re.search(r"on:\s*\n\s*push:\s*\n\s*tags:\s*\n\s*-\s*\"([^\"]+)\"", text)
-    assert trigger, "could not read the tag trigger"
-    pattern = trigger.group(1)
-    assert pattern.startswith("v"), pattern
-    assert not any(t.startswith(pattern[:-1]) for t in
-                   ("checkpoint-0.1.2-refactor-complete", "release-0.1.2")), (
-        f"trigger {pattern!r} would match a non-release tag")
+    """checkpoint-* must not match ANY trigger entry - that is why the
+    earlier checkpoint tag was renamed out of the v* namespace."""
+    import fnmatch
+
+    patterns = trigger_patterns()
+    assert patterns, "could not read the tag triggers"
+    assert any(fnmatch.fnmatch(f"v{VERSION}", p) for p in patterns), (
+        f"triggers {patterns} would not match this release's own tag")
+    for not_a_release in ("checkpoint-0.1.2-refactor-complete",
+                          "checkpoint-1.0.0", "release-0.1.2", "main",
+                          "lab-snapshot"):
+        matched = [p for p in patterns if fnmatch.fnmatch(not_a_release, p)]
+        assert not matched, (
+            f"trigger(s) {matched} would start a release run for "
+            f"{not_a_release!r}")
 
 
 def test_the_build_script_bundles_the_version_module():
@@ -234,14 +336,26 @@ def test_artifact_names_do_not_embed_a_version():
 # ---------------------------------------------------------------------------
 # Documentation claims
 # ---------------------------------------------------------------------------
-def test_active_version_claims_match_the_runtime(  ):
-    """"**Version:** X.Y.Z" is an active claim about the current build."""
+def test_active_version_claims_match_the_runtime():
+    """"**Version:** X.Y.Z" is an active claim about the current build.
+
+    Swept across every tracked markdown file rather than an allowlist: a
+    wrong version added to a doc nobody listed would otherwise be invisible.
+    """
+    for path in sorted(ROOT.glob("*.md")) + sorted(ROOT.glob("*/*.md")):
+        if any(str(path.relative_to(ROOT)).startswith(h.rstrip("/"))
+               for h in HISTORICAL):
+            continue
+        claims = re.findall(r"\*\*Version:\*\*\s*(\d+\.\d+\.\d+)",
+                            path.read_text())
+        wrong = [c for c in claims if c != VERSION]
+        assert not wrong, (
+            f"{path.name} claims version {wrong} but the runtime is {VERSION}")
+    # And the docs that are SUPPOSED to carry one still do.
     for name in ACTIVE_VERSION_DOCS:
         text = (ROOT / name).read_text()
-        claims = re.findall(r"\*\*Version:\*\*\s*(\d+\.\d+\.\d+)", text)
-        assert claims, f"{name} no longer states a version"
-        wrong = [c for c in claims if c != VERSION]
-        assert not wrong, f"{name} claims {wrong} but the runtime is {VERSION}"
+        assert re.search(r"\*\*Version:\*\*\s*%s" % re.escape(VERSION), text), (
+            f"{name} no longer states the current version")
 
 
 def test_documented_cli_output_matches_the_runtime():
@@ -261,15 +375,19 @@ def test_current_version_section_headings_match():
                 f"{name} has a current-version heading claiming v{heading}")
 
 
-def test_historical_version_references_are_left_alone():
+@pytest.mark.parametrize("relative,needle", [
+    ("SMB_OPCODES.md", "pre-v0.1.2"),
+    ("images/README.md", "v0.1.2"),
+    ("docs/VAST_LAB_HANDOFF.md", "opstat v0.1.2"),
+])
+def test_historical_version_references_are_left_alone(relative, needle):
     """Guards against an over-eager future sweep: these correctly name an
-    older build or a captured artefact and must not be rewritten."""
-    opcodes = (ROOT / "SMB_OPCODES.md").read_text()
-    assert "pre-v0.1.2" in opcodes, (
-        "historical 'pre-v0.1.2' evidence was rewritten")
-    handoff = (ROOT / "docs" / "VAST_LAB_HANDOFF.md").read_text()
-    assert re.search(r"opstat v\d+\.\d+\.\d+", handoff), (
-        "the captured lab frame lost its version stamp")
+    older build or a captured artefact and must not be rewritten. Driven
+    from HISTORICAL so the list and the protection cannot diverge."""
+    assert any(relative.startswith(h.rstrip("/")) for h in HISTORICAL), (
+        f"{relative} is protected here but missing from HISTORICAL")
+    assert needle in (ROOT / relative).read_text(), (
+        f"historical evidence in {relative} was rewritten: {needle!r} is gone")
 
 
 def test_readme_documents_the_release_procedure():

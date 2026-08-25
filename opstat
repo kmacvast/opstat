@@ -4,7 +4,7 @@
 # Description: Multi-protocol VAST performance statistics tool. Phase 1 routes
 #              --nfs --version=3.0 to NFS v3; --nfs --version=4.1 to NFS v4.1;
 #              Phase 2 routes --block --nvme-over-tcp to NVMe-oTCP block statistics;
-#              --smb routes to SMB statistics (v0.1.2); --s3 routes to S3
+#              --smb routes to SMB statistics; --s3 routes to S3
 #              object storage statistics.
 #
 # Author: KMac kmac@vastdata.com

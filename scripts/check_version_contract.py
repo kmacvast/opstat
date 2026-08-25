@@ -58,10 +58,35 @@ def check(tag):
             "reports %s.\n"
             "  Publishing would ship binaries that disagree with their own "
             "release.\n"
-            "  Fix: set VERSION in opstat_version.py to %s and re-tag, or "
-            "tag v%s instead."
+            "  Fix: either set VERSION in opstat_version.py to %s and tag "
+            "the new commit, or tag v%s to match the current runtime.\n"
+            "  Do NOT move or delete a tag that has already been pushed."
             % (tag, claimed, VERSION, claimed, VERSION))
     return True, "tag '%s' matches runtime version %s" % (tag, VERSION)
+
+
+def existing_release_tag_warning():
+    """Warn when v<VERSION> is already a tag in this clone.
+
+    v0.1.2 is already published (it points at a commit far behind main), so
+    the gate's one permitted tag is taken: the next release must begin with a
+    VERSION bump. Moving a published tag is a prohibited destructive git
+    action, so surfacing this early matters. Best-effort and never fatal -
+    a CI checkout may not have tags, and this is advice, not a verdict.
+    """
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["git", "tag", "--list", "v%s" % VERSION],
+            cwd=_ROOT, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except (OSError, ValueError):                      # pragma: no cover
+        return None
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    return ("NOTE: tag v%s already exists in this clone. A release needs a "
+            "NEW version: bump VERSION in opstat_version.py rather than "
+            "re-pointing a published tag." % VERSION)
 
 
 def build_parser():
@@ -76,6 +101,9 @@ def main():
     args = build_parser().parse_args()
     if args.tag is None:
         print(VERSION)
+        warning = existing_release_tag_warning()
+        if warning:
+            print(warning, file=sys.stderr)
         return 0
     ok, message = check(args.tag)
     print(("OK: " if ok else "ERROR: ") + message,

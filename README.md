@@ -403,22 +403,33 @@ derive from or are test-enforced against it.
 To cut a release:
 
 ```bash
-# 1. set VERSION in opstat_version.py to the new X.Y.Z
-# 2. update the "**Version:**" lines in README.md and the protocol READMEs
+# 1. set VERSION in opstat_version.py to the new X.Y.Z  (the only version edit)
+# 2. update the documented current-version claims:
+#      README.md          "**Version:**" line, and the two "opstat X.Y.Z"
+#                         sample banners
+#      SMB_README.md      "**Version:**" line and the "Dashboard Panels (vX.Y.Z)" heading
+#      S3_README.md       the same two
+#    tests/test_version_contract.py is the definitive list of enforced surfaces.
 ./scripts/validate.sh          # fails if any surface still disagrees
 git tag vX.Y.Z                 # release tags are exactly v + the version
 git push --tags
 ```
 
-Pushing a `vX.Y.Z` tag runs [`.github/workflows/release.yml`](.github/workflows/release.yml),
-which **verifies the tag matches `opstat_version.VERSION` before anything is built
-or published** and then builds Linux, macOS (Apple Silicon) and Windows binaries and
-attaches them to the GitHub Release. A tag that disagrees with the runtime version
-fails the run rather than shipping a mismatched binary.
+**`v0.1.2` is already published** (it points at an old commit), so the next release
+must start with a version bump — never by re-pointing an existing tag.
 
-Tags outside the `vX.Y.Z` namespace — for example
-`checkpoint-0.1.2-refactor-complete` — are **not** releases: they do not match the
-workflow trigger and are never published.
+Pushing a `v*` tag runs [`.github/workflows/release.yml`](.github/workflows/release.yml),
+which **verifies the tag matches `opstat_version.VERSION` before anything is built or
+published**, and again immediately before publication. It then builds Linux, macOS
+(Apple Silicon) and Windows binaries and attaches them to the GitHub Release. A tag
+that disagrees with the runtime version — or that is not of the exact form `vX.Y.Z`,
+such as `v1` or `v0.1.2-rc1` — fails the run rather than shipping a mismatched binary.
+
+Tags outside the `v` namespace — for example `checkpoint-0.1.2-refactor-complete` —
+do not match the workflow trigger at all and are never published.
+
+One caveat inherent to GitHub Actions: a workflow runs from the *tagged* commit, so
+tagging a commit from before this gate existed would run the older, ungated workflow.
 
 ### Manual PyInstaller command
 

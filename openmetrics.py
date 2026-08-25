@@ -8,7 +8,7 @@
 #              Read-only with respect to VAST; only writes a local file.
 #
 # Author: KMac kmac@vastdata.com
-# Version: 1.0.0
+# Version: 1.0.0  (module-local; the tool version lives in opstat_version.py)
 ################################################################################
 """JSON Lines OpenMetrics exporter.
 

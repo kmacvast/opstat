@@ -10,7 +10,7 @@
 #              command line, in `ps`, or in the printed "equivalent command".
 #
 # Author: KMac kmac@vastdata.com
-# Version: 1.0.0
+# Version: 1.0.0  (module-local; the tool version lives in opstat_version.py)
 ################################################################################
 """Interactive launcher for opstat.
 
