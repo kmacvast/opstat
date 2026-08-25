@@ -522,6 +522,16 @@ def build_drill_prop_list(mode):
     Bucket (view) monitors use ViewMetrics only. VMS rejects mixing
     ViewMetrics and BucketViewMetrics in one monitor; BucketViewMetrics
     is probed separately during --discover-metrics.
+
+    DEAD FOR BUCKET AND TENANT since 2026-08-25 (FR14): both scopes return a
+    capability notice from enter_drill_mode before any monitor is built,
+    because ViewMetrics/TenantMetrics carry no protocol discriminator
+    (D-016) and rendered other protocols' traffic as S3 REST verbs. These
+    branches are retained ONLY as the shape the pending host_view
+    protocol=S3 rebuild will replace once first-party evidence validates it.
+    Re-enabling them by relaxing bucket_attribution_source() /
+    tenant_attribution_source() would reintroduce the defect - which
+    tests/test_smb_s3_drill.py fails on.
     """
     if mode == "bucket":
         return [
@@ -1666,29 +1676,6 @@ def _vip_topn_activity_rows():
     return ranked
 
 
-def _build_vip_rows_from_topn():
-    """Build drill rows from VIP topn when ProtoMetrics monitors are idle."""
-    rows = []
-    for item in _vip_topn_activity_rows()[:_MAX_DRILL_OBJECTS]:
-        get_ops = item.get("read") or 0.0
-        put_ops = item.get("write") or 0.0
-        delete_ops = item.get("md_write") or 0.0
-        list_ops = item.get("md_read") or 0.0
-        ops = item.get("ops") or 0.0
-        bw_mbs = item.get("bw_mbs") or None
-        latency_us = item.get("latency_us")
-        if not any((ops, bw_mbs, get_ops, put_ops, delete_ops, list_ops)):
-            continue
-        row = _drill_rest_fields(
-            get_ops, put_ops, delete_ops, list_ops, latency_us, bw_mbs, item["title"],
-        )
-        # If iops.total is present but read/write split is missing, keep total.
-        if (row.get("total_ops") or 0) <= 0 and ops > 0:
-            row["total_ops"] = ops
-        rows.append(row)
-    return rows
-
-
 def _build_bucket_drill_row(result, obj_name):
     values, _prop_idx, _sample = _view_values_from_result(result)
     read_ops = (
@@ -1790,12 +1777,55 @@ def _rank_drill_candidates(mode, objects, cfg):
     )
 
 
+VIP_UNAVAILABLE_MARKER = "Per-VIP S3 attribution is not available"
+VIP_UNAVAILABLE_NOTICE = (
+    "Per-VIP S3 attribution is not available from this cluster.")
+BUCKET_UNAVAILABLE_MARKER = "Per-bucket S3 attribution is not available"
+BUCKET_UNAVAILABLE_NOTICE = (
+    "Per-bucket S3 attribution is not available from this cluster.")
+TENANT_UNAVAILABLE_MARKER = "Per-tenant S3 attribution is not available"
+TENANT_UNAVAILABLE_NOTICE = (
+    "Per-tenant S3 attribution is not available from this cluster.")
+SCOPE_UNAVAILABLE_DETAIL = "Cluster-level S3 telemetry remains available."
+
+
+def bucket_attribution_source():
+    """Decide the per-bucket S3 attribution source for this cluster.
+
+    A capability result, not an eternal declaration (D-016 pattern, FR14).
+    The previous implementation ranked and displayed the monitor API's
+    ViewMetrics family, which has no protocol discriminator - on a mixed
+    cluster it relabelled other protocols' view traffic as GET/s / PUT/s.
+    host_view protocol=S3 rows carry a native bucket label and were observed
+    attributing third-party S3 traffic on var203, but a first-party
+    correlation run has not been performed yet; until it validates, None
+    means "this cluster's per-bucket S3 question has no honest answer here".
+    """
+    return None
+
+
+def tenant_attribution_source():
+    """Same capability shape for tenant scope (TenantMetrics is likewise
+    protocol-blind; the host_view tenant label awaits the same first-party
+    S3 validation)."""
+    return None
+
+
 def enter_drill_mode(mode):
     global DRILL_MODE, DRILL_OBJECTS, DRILL_MONITORS, DRILL_ERROR, LAST_DRILL_ROWS
 
     cfg = _DRILL_CFG.get(mode)
     if not cfg:
         DRILL_ERROR = f"Unknown drill mode: {mode}"
+        return
+
+    if mode == "bucket" and bucket_attribution_source() is None:
+        # Honest unavailable state (FR14): zero API calls, zero monitors,
+        # instead of all-protocol ViewMetrics relabelled as S3 REST verbs.
+        DRILL_ERROR = BUCKET_UNAVAILABLE_NOTICE
+        return
+    if mode == "tenant" and tenant_attribution_source() is None:
+        DRILL_ERROR = TENANT_UNAVAILABLE_NOTICE
         return
 
     try:
@@ -1888,27 +1918,19 @@ def enter_drill_mode(mode):
                 last_error = str(e)
 
     if not new_monitors:
-        # VIP often lacks ProtoMetrics on object_type=vip; fall back to topn-only.
         if mode == "vip":
-            _fetch_vip_topn()
-            topn_rows = _build_vip_rows_from_topn()
-            if topn_rows:
-                DRILL_MONITORS = []
-                DRILL_MODE = mode
-                DRILL_ERROR = None
-                LAST_DRILL_ROWS = topn_rows
-                return
-        hint = ""
-        if mode == "bucket":
-            hint = " (bucket/view monitors require seconds resolution without aggregation)"
-        elif mode == "tenant":
-            hint = " (tenant scope requires TenantMetrics counters)"
-        elif mode == "vip":
-            hint = " (vip object_type may not support S3Common; topn also empty)"
+            # This build refuses ProtoMetrics monitors at vip scope, and the
+            # only alternative - /monitors/topn/ - carries no protocol label
+            # (D-007), so its rows cannot honestly render under the S3
+            # REST-verb columns. Capability notice instead of unrelated
+            # data (FR14); the previous topn-only fallback is gone.
+            DRILL_ERROR = VIP_UNAVAILABLE_NOTICE
+            DRILL_OBJECTS = []
+            return
         detail = f": {last_error}" if last_error else ""
         DRILL_ERROR = (
             f"Could not create any {mode} monitors (object_type="
-            f"'{cfg['object_type']}' may not be supported){hint}{detail}"
+            f"'{cfg['object_type']}' may not be supported){detail}"
         )
         DRILL_OBJECTS = []
         return
@@ -1943,19 +1965,6 @@ def fetch_drill_query(force=False):
     drill_rows = []
     query_errors = 0
 
-    if DRILL_MODE == "vip" and not DRILL_MONITORS:
-        # Topn-only VIP mode (no ProtoMetrics monitors). Preserved unchanged.
-        _fetch_vip_topn()
-        LAST_DRILL_ROWS = _build_vip_rows_from_topn()
-        if openmetrics.is_enabled():
-            openmetrics.export_drill(CLUSTER_NAME, DRILL_MODE, LAST_DRILL_ROWS, sample=LAST_SAMPLE)
-        if not LAST_DRILL_ROWS:
-            DRILL_ERROR = "VIP topn returned no activity"
-        return
-
-    if DRILL_MODE in ("bucket", "tenant") and not DRILL.should_query(
-            force=force, have_data=bool(LAST_DRILL_ROWS)):
-        return
 
     if _is_batch_drill_mode() and DRILL_MONITORS:
         monitor_id, _name = DRILL_MONITORS[0]
@@ -1974,15 +1983,10 @@ def fetch_drill_query(force=False):
             except RuntimeError:
                 query_errors += 1
 
-    # VIP ProtoMetrics often returns zeros; prefer topn activity when idle.
-    if DRILL_MODE == "vip":
-        active = sum(as_float(r.get("total_ops")) or 0 for r in drill_rows)
-        if active <= 0:
-            _fetch_vip_topn()
-            topn_rows = _build_vip_rows_from_topn()
-            if topn_rows:
-                drill_rows = topn_rows
-
+    # A measured all-zero S3Common result is information ("no S3 traffic on
+    # these VIPs") and renders as real zeros. The previous behavior silently
+    # replaced it with /monitors/topn/ rows, which carry no protocol label
+    # (D-007) - unattributable activity dressed in S3 verb columns (FR14).
     LAST_DRILL_ROWS = sorted(
         drill_rows,
         key=lambda r: r["total_ops"] or 0,
@@ -2015,9 +2019,14 @@ def switch_drill_mode(mode):
         if DRILL_MODE:
             fetch_drill_query(force=True)
 
+    # Bucket/tenant render a zero-cost capability notice (FR14), so the
+    # cold-entry "30+ seconds" wording would be false there.
+    instant = (
+        (mode == "bucket" and bucket_attribution_source() is None)
+        or (mode == "tenant" and tenant_attribution_source() is None))
     vast_drill.with_loading_status(
         _set_drill_status, render_screen, mode, _work,
-        first_time=DRILL.begin_load(mode) if DRILL else False)
+        first_time=bool(DRILL) and not instant and DRILL.begin_load(mode))
 
 
 def _render_drill_panel(width):
@@ -2025,6 +2034,22 @@ def _render_drill_panel(width):
     if DRILL_STATUS:
         print(box_top("DRILL-DOWN", width))
         print(box_row(c(DRILL_STATUS, _YELLOW), width))
+        print(box_bottom(width))
+        return
+
+    if DRILL_ERROR and (BUCKET_UNAVAILABLE_MARKER in DRILL_ERROR
+                        or TENANT_UNAVAILABLE_MARKER in DRILL_ERROR
+                        or VIP_UNAVAILABLE_MARKER in DRILL_ERROR):
+        # Capability notice, not an error: S3 telemetry is healthy; this
+        # cluster simply has no protocol-scoped source for this dimension
+        # validated yet (FR14, D-016 pattern).
+        scope = ("BUCKET" if BUCKET_UNAVAILABLE_MARKER in DRILL_ERROR
+                 else "TENANT" if TENANT_UNAVAILABLE_MARKER in DRILL_ERROR
+                 else "VIP")
+        print(box_top(f"{scope} DRILL-DOWN", width))
+        print(box_row(c(DRILL_ERROR, _YELLOW), width))
+        print(box_row(c(SCOPE_UNAVAILABLE_DETAIL, _DIM), width))
+        print(box_row(c("Press x to return to cluster view", _DIM), width))
         print(box_bottom(width))
         return
 

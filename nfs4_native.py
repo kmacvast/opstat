@@ -359,16 +359,17 @@ def parse_host_view(text, protocol="NFS4"):
         if value != value:
             continue
         key = (labels.get("ip", "?"), labels.get("path", "?"),
-               labels.get("tenant", "?"))
+               labels.get("tenant", "?"), labels.get("share", ""))
         grouped.setdefault(key, {})[field] = value
 
     rows = []
-    for (ip, path, tenant), fields in grouped.items():
+    for (ip, path, tenant, share), fields in grouped.items():
         latency_ms = fields.get("latency")
         rows.append({
             "ip": ip,
             "path": path,
             "tenant": tenant,
+            "share": share,
             "iops": fields.get("iops"),
             "read_iops": fields.get("read_iops"),
             "write_iops": fields.get("write_iops"),
@@ -447,11 +448,14 @@ def aggregate_by_path(rows):
         key = (row["path"], row["tenant"])
         agg = grouped.setdefault(key, {
             "path": row["path"], "tenant": row["tenant"], "clients": set(),
+            "shares": set(),
             "iops": 0.0, "read_iops": 0.0, "write_iops": 0.0, "md_iops": 0.0,
             "bw": 0.0, "read_bw": 0.0, "write_bw": 0.0,
             "_lat_weight": 0.0, "_lat_sum": 0.0,
         })
         agg["clients"].add(row["ip"])
+        if row.get("share"):
+            agg["shares"].add(row["share"])
         for field in ("iops", "read_iops", "write_iops", "md_iops",
                       "bw", "read_bw", "write_bw"):
             value = row.get(field)
@@ -466,8 +470,52 @@ def aggregate_by_path(rows):
     out = []
     for agg in grouped.values():
         agg["client_count"] = len(agg.pop("clients"))
+        shares = agg.pop("shares")
+        agg["share"] = ",".join(sorted(shares)) if shares else ""
         weight = agg.pop("_lat_weight")
         total = agg.pop("_lat_sum")
         agg["latency_us"] = (total / weight) if weight else None
         out.append(agg)
     return sorted(out, key=lambda r: (-(r["iops"] or 0.0), r["path"]))
+
+
+def aggregate_by_tenant(rows):
+    """Roll per-host rows up to one row per tenant label.
+
+    The tenant dimension comes from host_view's own ``tenant`` label on rows
+    already filtered to ONE protocol by parse_host_view, so the aggregation
+    inherits the protocol scoping - unlike the monitor API's TenantMetrics,
+    which carries no protocol discriminator (D-016) and therefore cannot
+    answer "which tenants are carrying <protocol> traffic". Latency is
+    IOPS-weighted, as in aggregate_by_path.
+    """
+    grouped = {}
+    for row in rows:
+        agg = grouped.setdefault(row["tenant"], {
+            "tenant": row["tenant"], "clients": set(), "paths": set(),
+            "iops": 0.0, "read_iops": 0.0, "write_iops": 0.0, "md_iops": 0.0,
+            "bw": 0.0, "read_bw": 0.0, "write_bw": 0.0,
+            "_lat_weight": 0.0, "_lat_sum": 0.0,
+        })
+        agg["clients"].add(row["ip"])
+        agg["paths"].add(row["path"])
+        for field in ("iops", "read_iops", "write_iops", "md_iops",
+                      "bw", "read_bw", "write_bw"):
+            value = row.get(field)
+            if value:
+                agg[field] += value
+        weight = row.get("iops") or 0.0
+        latency = row.get("latency_us")
+        if latency is not None and weight > 0:
+            agg["_lat_weight"] += weight
+            agg["_lat_sum"] += latency * weight
+
+    out = []
+    for agg in grouped.values():
+        agg["client_count"] = len(agg.pop("clients"))
+        agg["path_count"] = len(agg.pop("paths"))
+        weight = agg.pop("_lat_weight")
+        total = agg.pop("_lat_sum")
+        agg["latency_us"] = (total / weight) if weight else None
+        out.append(agg)
+    return sorted(out, key=lambda r: (-(r["iops"] or 0.0), r["tenant"]))

@@ -269,8 +269,10 @@ def test_nfs_v41_drill_mode_tracks_and_queries_monitors(vms, monkeypatch):
     nfs_v41 = _init_nfs_v41(vms, monkeypatch)
     nfs_v41.create_headline_monitors()
 
-    nfs_v41.enter_drill_mode("view")
-    assert nfs_v41.DRILL_MODE == "view"
+    # cnode: the one monitor-backed NFSv4.1 drill since FR14 ([v]/[t] are
+    # exporter-backed and create no monitors at all).
+    nfs_v41.enter_drill_mode("cnode")
+    assert nfs_v41.DRILL_MODE == "cnode"
     assert nfs_v41.DRILL_ERROR is None
     assert nfs_v41.DRILL_MONITORS, "drill monitors must be tracked module-wide"
 

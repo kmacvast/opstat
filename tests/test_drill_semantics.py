@@ -164,89 +164,45 @@ def test_view_row_survives_fully_null_newest_bucket():
     assert row["latency_us"] is not None
 
 
-def test_tenant_drill_reports_activity(engine, vms):
-    """Regression: tenants showed '-' / 0.09 ops/s while the cluster was busy."""
-    engine.enter_drill_mode("tenant")
-    assert engine.DRILL_ERROR is None
-    engine.fetch_drill_query()
-    rows = engine.LAST_DRILL_ROWS
-    assert rows
-
-    active = [r for r in rows if (r["total_ops"] or 0) > 0]
-    assert len(active) >= len(_ACTIVE_TENANT_INDEXES) - 1, (
-        f"only {len(active)} tenants showed activity; "
-        f"{len(_ACTIVE_TENANT_INDEXES)} carry load in the mock"
-    )
-    top = max(rows, key=lambda r: r["total_ops"] or 0)
-    assert top["latency_us"] is not None, "tenant latency lost"
-    assert top["bw_gbs"] is not None, "tenant bandwidth lost"
-
-
-def test_drill_row_survives_fully_null_newest_bucket(engine, vms):
-    """A newest bucket with nothing populated must fall through to the newest
-    row that does have data, not blank the object out. (Runs through the
-    tenant drill since the NFSv3 view drill is an honest unavailable state
-    per FR1/D-016; the view-row builder variant is pinned above.)"""
-    vms.state.partial_newest_props = ()   # newest row entirely null
-    engine.enter_drill_mode("tenant")
-    engine.fetch_drill_query()
-    active = [r for r in engine.LAST_DRILL_ROWS if (r["total_ops"] or 0) > 0]
-    assert active, "a fully-null newest bucket blanked every tenant"
-
-
-# ---------------------------------------------------------------------------
-# Ranking correctness: most active, not first listed
-# ---------------------------------------------------------------------------
-# test_view_ranking_picks_the_most_active_views was retired with the
-# misleading NFSv3 view drill (FR1/D-016): the engine no longer ranks views.
-# Activity-ranking correctness stays covered by the tenant test below, the
-# cNode suite, and the SMB/S3 view/bucket suites that still rank the same
-# 429-view mock population through the shared DrillSession.
-
-def test_tenant_ranking_picks_the_most_active_tenants(engine, vms):
-    engine.enter_drill_mode("tenant")
-    assert engine.DRILL_ERROR is None
-    names = [o["name"] for o in engine.DRILL_OBJECTS]
-    expected = [TENANTS[i]["name"] for i in _ACTIVE_TENANT_INDEXES]
-    assert set(names) & set(expected) == set(names[:len(expected)]) or True
-    assert names[0] == expected[0], (
-        f"busiest tenant not ranked first: got {names[0]}, want {expected[0]}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Ranking cost: must not scale with object count
-# ---------------------------------------------------------------------------
-# test_view_drill_entry_is_a_handful_of_calls,
-# test_view_drill_entry_without_topn_stays_bounded and
-# test_ranking_adapts_to_a_cluster_object_id_cap were retired with the
-# misleading NFSv3 view drill (FR1/D-016). Their replacement here is
-# stronger - test_view_drill_entry_costs_zero_api_calls_and_zero_monitors -
-# and the large-population budget/cap/topn-fallback protections remain
-# exercised in tests/test_smb_s3_drill.py (429-view ranking, max_object_ids
-# cap, topn-disabled fallback) and the NVMe rank-chunk suite.
-
-def test_drill_entry_leaves_no_ranking_monitors_behind(engine, vms):
-    engine.enter_drill_mode("tenant")
-    live = vms.live_monitors()
-    drill_ids = {mid for mid, _n in engine.DRILL_MONITORS}
-    headline = {engine.RPC_MONITOR_ID, engine.BW_MONITOR_ID}
-    assert set(live) <= drill_ids | headline, (
-        f"ranking monitors leaked: {set(live) - drill_ids - headline}"
-    )
-
-
-def test_reentering_drill_reuses_the_cached_ranking(engine, vms):
-    engine.enter_drill_mode("tenant")
-    first = [o["name"] for o in engine.DRILL_OBJECTS]
-    engine.exit_drill_mode()
+def test_tenant_drill_is_an_honest_capability_notice(engine, vms):
+    """FR14: TenantMetrics has no protocol discriminator (D-016), so the
+    NFSv3 tenant drill presented all-protocol tenant activity - and a false
+    coverage percentage - under an NFSv3 heading. Like the view drill
+    (FR1/D-016), it now renders a capability notice at zero API cost."""
+    before = set(vms.live_monitors())
     vms.reset_calls()
     engine.enter_drill_mode("tenant")
-    second = [o["name"] for o in engine.DRILL_OBJECTS]
-    calls = sum(vms.counts().values())
-    assert second == first
-    assert calls <= 2, f"re-entry re-ranked from scratch: {vms.counts()}"
+    assert engine.DRILL_MODE is None
+    assert engine.TENANT_UNAVAILABLE_MARKER in (engine.DRILL_ERROR or "")
+    assert sum(vms.counts().values()) == 0, (
+        "the tenant notice must cost zero API calls: %s" % vms.counts())
+    assert set(vms.live_monitors()) == before, "notice entry created monitors"
 
+
+def test_tenant_notice_renders_with_detail_and_footer(engine, vms):
+    import contextlib
+    import io as io_module
+
+    engine.fetch_monitor_query()      # populate rows: the waiting frame
+    engine.enter_drill_mode("tenant")  # would otherwise mask the notice
+    buf = io_module.StringIO()
+    with contextlib.redirect_stdout(buf):
+        engine._render_frame()
+    frame = buf.getvalue()
+    assert engine.TENANT_UNAVAILABLE_MARKER in frame
+    assert engine.TENANT_UNAVAILABLE_DETAIL in frame
+    assert "account for" not in frame, "the false coverage claim is back"
+
+
+# test_tenant_drill_reports_activity, test_tenant_ranking_picks_the_most_
+# active_tenants, test_drill_row_survives_fully_null_newest_bucket (tenant
+# variant), test_drill_entry_leaves_no_ranking_monitors_behind and
+# test_reentering_drill_reuses_the_cached_ranking were retired with the
+# all-protocol NFSv3 tenant drill (FR14): the engine no longer ranks or
+# queries TenantMetrics. The behaviors they guarded remain covered where
+# they still run: newest-complete-row fall-through by the vast_drill unit
+# tests above and test_latest_complete_row_skips_the_filling_bucket;
+# ranking/cache/cleanup by the NVMe rank-chunk suite and the S3 vip path.
 
 # ---------------------------------------------------------------------------
 # cNode drill batching
@@ -279,29 +235,17 @@ def test_cnode_drill_falls_back_to_per_object_monitors(engine, vms):
 # ---------------------------------------------------------------------------
 # Poll cadence
 # ---------------------------------------------------------------------------
-def test_drill_query_is_throttled_between_headline_ticks(engine, vms):
-    """View/tenant metrics advance about once a minute; polling them every
-    5 s returned byte-identical payloads nine times in a row on the real
-    cluster. poll_tick must not re-query the drill on every headline tick."""
-    engine.enter_drill_mode("tenant")
-    engine.fetch_drill_query()
-    vms.reset_calls()
-    for _ in range(4):
-        engine.poll_tick()
-    drill_queries = sum(
-        v for k, v in vms.counts().items() if "query" in k
-    ) - 4  # four headline queries are expected
-    assert drill_queries <= 1, (
-        f"drill re-queried {drill_queries} times across 4 headline ticks"
-    )
-
-
+# test_drill_query_is_throttled_between_headline_ticks was retired with the
+# tenant drill (FR14): NFSv3's one remaining monitor drill (cNode) keeps its
+# deliberate every-tick cadence, so there is no throttle left to pin here.
+# The throttle machinery itself stays pinned by the SMB host_view suite and
+# the NVMe drill suite.
 def test_manual_refresh_forces_a_drill_query(engine, vms):
-    engine.enter_drill_mode("tenant")
+    engine.enter_drill_mode("cnode")
     engine.fetch_drill_query()
     vms.reset_calls()
     engine.manual_refresh()
-    assert sum(vms.counts().values()) >= 2, "space-bar refresh must bypass the throttle"
+    assert sum(vms.counts().values()) >= 2, "space-bar refresh must requery"
 
 
 # ---------------------------------------------------------------------------
@@ -326,72 +270,99 @@ def engine41(vms, monkeypatch):
     vast_common.close_connection()
 
 
-def test_v41_view_and_tenant_use_object_scoped_metric_families(engine41):
-    """NfsMetrics/ProtoMetrics are cluster/cNode families; VMS rejects them at
-    view and tenant scope, so those scopes must ask for ViewMetrics and
-    TenantMetrics instead."""
-    view_props = engine41.build_drill_prop_list("view")
-    tenant_props = engine41.build_drill_prop_list("tenant")
+def test_v41_monitor_props_are_cnode_families_only(engine41):
+    """The ViewMetrics/TenantMetrics prop branches were removed with the
+    monitor view/tenant drills (FR14): every remaining monitor prop belongs
+    to the cNode-scoped NFS families."""
     cnode_props = engine41.build_drill_prop_list("cnode")
-
-    assert {p.split(",")[0] for p in view_props} == {"ViewMetrics"}
-    assert {p.split(",")[0] for p in tenant_props} == {"TenantMetrics"}
     assert {p.split(",")[0] for p in cnode_props} == {"NfsMetrics", "ProtoMetrics"}
+    assert "view" not in engine41._DRILL_CFG, (
+        "the superseded ViewMetrics view config is back (D-006/FR14)")
+    assert "tenant" not in engine41._DRILL_CFG
 
 
-def test_v41_view_drill_ranks_by_activity(engine41, vms):
-    """Regression: the engine took the first eight objects from /views/,
-    which on a 429-view cluster meant eight arbitrary idle views."""
-    engine41.enter_drill_mode("view")
-    assert engine41.DRILL_ERROR is None
-    names = [o["name"] for o in engine41.DRILL_OBJECTS]
-    assert names == _expected_top_views(engine41._MAX_DRILL_OBJECTS)
-    assert names[0] != VIEWS[0]["path"], "still head-slicing /views/"
+def test_v41_view_key_reaches_the_hostview_drill(engine41, vms):
+    """Phase-9 regression (FR14): [v] must land on the exporter-backed
+    host_view drill (D-006). If a future keybinding change routes it back to
+    a monitor drill, the unreachable-ViewMetrics defect returns."""
+    assert engine41._dispatch_key("v") == "refresh"
+    assert engine41.EXPORTER_MODE == "view"
+    assert engine41.DRILL_MODE is None, "[v] created a monitor drill"
+    engine41.exit_exporter_mode()
 
 
-def test_v41_view_drill_entry_is_cheap(engine41, vms):
+def test_v41_tenant_is_exporter_backed_and_scoped(engine41, vms):
+    """[t] rides the proven protocol=NFS4 host_view scrape: zero monitors,
+    tenant rows from NFS4-attributed series only."""
+    import contextlib
+    import io as io_module
+
+    before = set(vms.live_monitors())
     vms.reset_calls()
-    engine41.enter_drill_mode("view")
-    total = sum(vms.counts().values())
+    engine41.enter_exporter_mode("tenant")
+    assert engine41.EXPORTER_MODE == "tenant"
+    scrapes = [p for _t, _m, p, _s in vms.calls() if "host_view" in p]
+    assert len(scrapes) == 1, vms.counts()
+    assert set(vms.live_monitors()) == before, "exporter tenant created monitors"
+
+    buf = io_module.StringIO()
+    with contextlib.redirect_stdout(buf):
+        engine41._render_frame()
+    frame = buf.getvalue()
+    assert "tenant-4" in frame, "the NFS4-attributed tenant is missing"
+    assert "tenant-0" not in frame, "an SMB2-only tenant leaked into NFSv4"
+    assert "tenant-9" not in frame, "a BLOCK-only tenant leaked into NFSv4"
+    assert "protocol=NFS4" in frame, "the panel must name its source/filter"
+    engine41.exit_exporter_mode()
+
+
+def test_v41_tenant_shares_the_hostview_scrape(engine41, vms):
+    """hosts/view/tenant share one collector; switching inside the throttle
+    window must not scrape twice (D-004 cost discipline)."""
+    engine41.enter_exporter_mode("view")
+    vms.reset_calls()
+    engine41.enter_exporter_mode("tenant")
+    scrapes = [p for _t, _m, p, _s in vms.calls() if "host_view" in p]
+    assert not scrapes, "tenant re-scraped inside the throttle window"
+    engine41.exit_exporter_mode()
+
+
+def test_v41_cnode_drill_uses_one_batched_monitor(engine41, vms):
+    engine41.enter_drill_mode("cnode")
     assert engine41.DRILL_ERROR is None
-    assert total <= 6, f"view drill entry cost {total} calls: {vms.counts()}"
-
-
-def test_v41_drill_uses_one_batched_monitor(engine41, vms):
-    for mode in ("view", "tenant", "cnode"):
-        engine41.enter_drill_mode(mode)
-        assert engine41.DRILL_ERROR is None, mode
-        assert len(engine41.DRILL_MONITORS) == 1, f"{mode} not batched"
-        vms.reset_calls()
-        engine41.fetch_drill_query(force=True)
-        assert vms.counts() == {"GET /api/monitors/{id}/query/": 1}, mode
-        assert len(engine41.LAST_DRILL_ROWS) == len(engine41.DRILL_OBJECTS), mode
-        engine41.exit_drill_mode()
-
-
-def test_v41_drill_rows_carry_latency_and_bandwidth(engine41, vms):
-    engine41.enter_drill_mode("view")
+    assert len(engine41.DRILL_MONITORS) == 1, "cnode not batched"
+    vms.reset_calls()
     engine41.fetch_drill_query(force=True)
-    active = [r for r in engine41.LAST_DRILL_ROWS if (r["total_ops"] or 0) > 0]
-    assert active
-    for row in active:
-        assert row["latency_us"] is not None, row["name"]
-        assert row["bw_gbs"] is not None, row["name"]
-    assert not all(r["top_rpc"] == "RD MD" for r in active)
+    assert vms.counts() == {"GET /api/monitors/{id}/query/": 1}
+    assert len(engine41.LAST_DRILL_ROWS) == len(engine41.DRILL_OBJECTS)
+    engine41.exit_drill_mode()
 
 
-def test_v41_drill_query_is_throttled(engine41, vms):
-    engine41.enter_drill_mode("view")
-    engine41.fetch_drill_query(force=True)
+# test_v41_view_drill_ranks_by_activity, test_v41_view_drill_entry_is_cheap,
+# test_v41_drill_rows_carry_latency_and_bandwidth and
+# test_v41_falls_back_to_per_object_monitors were retired with the monitor
+# view/tenant drills (FR14): [v] and [t] are exporter-backed
+# (host_view protocol=NFS4, D-006) and create no monitors at all. The
+# exporter view/hosts panels stay covered by tests/test_nfs4_native.py and
+# the render suites; batching/fallback machinery stays covered by the cNode
+# test above, the NVMe suite, and vast_drill's own tests.
+
+def test_v41_exporter_never_rides_the_refresh_tick(engine41, vms):
+    """D-004: four poll ticks inside the throttle window scrape zero times."""
+    engine41.enter_exporter_mode("tenant")
     vms.reset_calls()
     for _ in range(4):
         engine41.poll_tick()
-    drill_queries = sum(v for k, v in vms.counts().items() if "query" in k) - 4
-    assert drill_queries <= 1
+    scrapes = [p for _t, _m, p, _s in vms.calls() if "host_view" in p]
+    assert not scrapes, "the dashboard tick scraped the exporter"
+    engine41.manual_refresh()
+    scrapes = [p for _t, _m, p, _s in vms.calls() if "host_view" in p]
+    assert len(scrapes) == 1, "space must force exactly one re-scrape"
+    engine41.exit_exporter_mode()
 
 
 def test_v41_manual_refresh_forces_a_drill_query(engine41, vms):
-    engine41.enter_drill_mode("view")
+    engine41.enter_drill_mode("cnode")
     engine41.fetch_drill_query(force=True)
     vms.reset_calls()
     engine41.manual_refresh()
@@ -399,19 +370,10 @@ def test_v41_manual_refresh_forces_a_drill_query(engine41, vms):
 
 
 def test_v41_drill_monitors_are_cleaned_up(engine41, vms):
-    engine41.enter_drill_mode("view")
+    engine41.enter_drill_mode("cnode")
     drill_ids = {mid for mid, _n in engine41.DRILL_MONITORS}
     engine41.exit_drill_mode()
     assert not (drill_ids & set(vms.live_monitors()))
-
-
-def test_v41_falls_back_to_per_object_monitors(engine41, vms):
-    vms.state.max_object_ids = 1
-    engine41.enter_drill_mode("view")
-    assert engine41.DRILL_ERROR is None
-    assert len(engine41.DRILL_MONITORS) == len(engine41.DRILL_OBJECTS)
-    engine41.fetch_drill_query(force=True)
-    assert len(engine41.LAST_DRILL_ROWS) == len(engine41.DRILL_OBJECTS)
 
 
 # ---------------------------------------------------------------------------
@@ -519,21 +481,15 @@ def test_coverage_fraction_refuses_incomparable_scopes():
 
 
 @pytest.mark.parametrize("engine_name", ["nfs_v3", "nfs_v41"])
-def test_drill_coverage_note_never_prints_an_absurd_percentage(engine_name):
+def test_the_false_coverage_note_stays_removed(engine_name):
+    """FR14: "top tenants account for X% of cluster ops/s" divided an
+    all-protocol numerator by a protocol-scoped denominator - a false subset
+    claim printed up to the 1.5x bail-out. The note is gone; this pins its
+    absence so it cannot quietly return."""
     import importlib
 
     module = importlib.import_module(engine_name)
-    module.DRILL_MODE = "tenant"
-    module.LAST_DRILL_ROWS = [{"name": "t", "total_ops": 97000.0}]
-    if engine_name == "nfs_v3":
-        module.LAST_ROWS = [{"label": "READ", "ops_sec": 715.0}]
-    else:
-        module.LAST_ROWS = {"data": [{"ops_sec": 715.0}], "meta": {}}
-    note = module._drill_coverage_note()
-    assert "%" not in note
-    assert "not directly comparable" in note
-    module.DRILL_MODE = None
-    module.LAST_DRILL_ROWS = []
+    assert not hasattr(module, "_drill_coverage_note")
 
 
 @pytest.mark.parametrize("module_name", ["smb", "s3", "nfs_v41"])

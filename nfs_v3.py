@@ -139,14 +139,11 @@ _DRILL_CFG = {
         "name_fields": ("path", "title", "name"),
         "no_aggregation": True,
     },
-    "tenant": {
-        "label": "TENANT",
-        "object_type": "tenant",
-        "endpoint":    "/tenants/",
-        "name_fields": ("name",),
-        "no_aggregation": False,
-    },
 }
+# The TenantMetrics "tenant" config was removed 2026-08-25 (FR14): the family
+# has no protocol discriminator (D-016), so the drill presented all-protocol
+# tenant activity - and a coverage percentage dividing it by NFSv3-only
+# cluster ops - under an NFSv3 heading. See tenant_attribution_source().
 
 _MAX_DRILL_OBJECTS = 8      # rows displayed / permanent monitors after ranking
 _DRILL_PROBE_LIMIT = 32     # smallest rank batch tried before giving up
@@ -163,6 +160,10 @@ VIEW_UNAVAILABLE_MARKER = "Per-view NFSv3 attribution is not available"
 VIEW_UNAVAILABLE_NOTICE = (
     "Per-view NFSv3 attribution is not available from this cluster.")
 VIEW_UNAVAILABLE_DETAIL = "Cluster-level NFSv3 telemetry remains available."
+TENANT_UNAVAILABLE_MARKER = "Per-tenant NFSv3 attribution is not available"
+TENANT_UNAVAILABLE_NOTICE = (
+    "Per-tenant NFSv3 attribution is not available from this cluster.")
+TENANT_UNAVAILABLE_DETAIL = VIEW_UNAVAILABLE_DETAIL
 
 
 # ---------------------------------------------------------------------------
@@ -1263,19 +1264,41 @@ def view_attribution_source():
     return None
 
 
+def tenant_attribution_source():
+    """Decide the per-tenant NFSv3 attribution source for this cluster.
+
+    Same capability shape as view_attribution_source (D-016). TenantMetrics
+    carries no protocol discriminator, so it cannot answer "which tenants
+    are carrying NFSv3 traffic" on a mixed cluster - and the FR14 corrective
+    probe showed host_view does not attribute a controlled first-party NFSv3
+    workload on either validated build, so no exporter rebuild is available
+    either. None means "this cluster cannot answer the per-tenant NFSv3
+    question honestly"; a validated runtime check replaces it if a build
+    that attributes NFS3 appears.
+    """
+    return None
+
+
 def enter_drill_mode(mode):
     global DRILL_MODE, DRILL_OBJECTS, DRILL_MONITORS, DRILL_ERROR, LAST_DRILL_ROWS
 
-    cfg = _DRILL_CFG.get(mode)
-    if not cfg:
-        DRILL_ERROR = f"Unknown drill mode: {mode}"
-        return
-
+    # Capability gates come BEFORE the config lookup: an unavailable scope
+    # is a first-class answer, not an unknown mode.
     if mode == "view" and view_attribution_source() is None:
         # Honest unavailable state (FR1/D-016). Zero API cost on purpose:
         # no view inventory fetch, no rank monitors, no display monitors
         # for a question this cluster cannot answer.
         DRILL_ERROR = VIEW_UNAVAILABLE_NOTICE
+        return
+
+    if mode == "tenant" and tenant_attribution_source() is None:
+        # Same honesty, same zero cost, for tenants (FR14).
+        DRILL_ERROR = TENANT_UNAVAILABLE_NOTICE
+        return
+
+    cfg = _DRILL_CFG.get(mode)
+    if not cfg:
+        DRILL_ERROR = f"Unknown drill mode: {mode}"
         return
 
     try:
@@ -1316,15 +1339,14 @@ def enter_drill_mode(mode):
     )
 
     if not new_monitors:
-        hint = ""
-        if mode == "view":
-            hint = " (view monitors require seconds resolution without aggregation)"
-        elif mode == "tenant":
-            hint = " (tenant scope requires TenantMetrics counters)"
+        # cNode is the only mode that reaches here: view and tenant return
+        # their capability notices above (D-016 / FR14), so the old
+        # ViewMetrics/TenantMetrics hints were unreachable and named
+        # families this engine no longer queries.
         detail = f": {last_error}" if last_error else ""
         DRILL_ERROR = (
             f"Could not create any {mode} monitors (object_type="
-            f"'{cfg['object_type']}' may not be supported){hint}{detail}"
+            f"'{cfg['object_type']}' may not be supported){detail}"
         )
         DRILL_OBJECTS = []
         return
@@ -1407,7 +1429,9 @@ def switch_drill_mode(mode):
 
     # The VIEW capability notice (D-016) returns instantly at zero API cost,
     # so that entry must never claim a 30-second wait even on its first use.
-    instant = mode == "view" and view_attribution_source() is None
+    instant = (
+        (mode == "view" and view_attribution_source() is None)
+        or (mode == "tenant" and tenant_attribution_source() is None))
     vast_drill.with_loading_status(
         _set_drill_status, render_screen, mode, _work,
         first_time=bool(DRILL) and not instant and DRILL.begin_load(mode))
@@ -1769,6 +1793,14 @@ def _render_drill_panel(width):
         print(box_bottom(width))
         return
 
+    if DRILL_ERROR and TENANT_UNAVAILABLE_MARKER in DRILL_ERROR:
+        print(box_top("TENANT DRILL-DOWN", width))
+        print(box_row(c(DRILL_ERROR, _YELLOW), width))
+        print(box_row(c(TENANT_UNAVAILABLE_DETAIL, _DIM), width))
+        print(box_row(c("Press x to return to cluster view", _DIM), width))
+        print(box_bottom(width))
+        return
+
     if DRILL_ERROR and VIEW_UNAVAILABLE_MARKER in DRILL_ERROR:
         # Capability notice, not an error: NFSv3 telemetry is healthy; this
         # cluster simply has no valid per-view attribution source (D-016).
@@ -1821,41 +1853,8 @@ def _render_drill_panel(width):
         print(box_row(row, width))
 
     print(box_sep(width))
-    coverage = _drill_coverage_note()
-    if coverage:
-        print(box_row(coverage, width))
     print(box_row(c("Press x to return to cluster view", _DIM), width))
     print(box_bottom(width))
-
-
-def _drill_coverage_note():
-    """State how much cluster activity these rows actually account for.
-
-    ViewMetrics/TenantMetrics attribute only the operations VMS can tie to a
-    view or tenant, so the drill rows legitimately sum to less than the
-    cluster total (they are also only the top ``_MAX_DRILL_OBJECTS``). Saying
-    so beats letting the gap read as a bug or, worse, scaling the numbers up
-    to match.
-    """
-    if not LAST_DRILL_ROWS or DRILL_MODE not in ("view", "tenant"):
-        return ""
-    shown = sum(as_float(r.get("total_ops")) or 0.0 for r in LAST_DRILL_ROWS)
-    cluster = sum(as_float(r["ops_sec"]) or 0.0 for r in LAST_ROWS)
-    if cluster <= 0:
-        return ""
-    fraction = vast_drill.coverage_fraction(shown, cluster)
-    if fraction is None:
-        return (
-            c(f"Top {len(LAST_DRILL_ROWS)} {DRILL_MODE}s shown; ", _DIM)
-            + c(f"{DRILL_MODE} counters are not directly comparable to the "
-                f"cluster totals above", _DIM)
-        )
-    return (
-        c(f"Top {len(LAST_DRILL_ROWS)} {DRILL_MODE}s account for ", _DIM)
-        + c(f"{shown:,.2f} ops/s ({fraction * 100.0:.1f}%)", _BWHITE)
-        + c(f" of {cluster:,.2f} cluster ops/s - VMS attributes only "
-            f"{DRILL_MODE}-scoped operations to {DRILL_MODE}s", _DIM)
-    )
 
 
 # ---------------------------------------------------------------------------

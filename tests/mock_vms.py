@@ -269,13 +269,25 @@ vast_view_logical_capacity{cluster="mock-cluster",name="v288",path="/view/288",p
          f"# TYPE vast_host_view_{field} gauge\n"
          + "".join(
              f'vast_host_view_{field}{{alias="",bucket="",cluster="mock-cluster",'
-             f'ip="{ip}",path="{path}",protocol="{proto}",share="",'
+             f'ip="{ip}",path="{path}",protocol="{proto}",share="{share}",'
              f'tenant="{tenant}"}} {value}\n'
-             for ip, path, proto, tenant, value in (
-                 ("10.9.0.1", "/view/317", "NFS4", "tenant-4", base * 1.0),
-                 ("10.9.0.2", "/view/288", "NFS4", "tenant-1", base * 0.27),
-                 ("10.9.0.3", "/share/a", "SMB", "tenant-0", base * 0.07),
-                 ("10.9.0.4", "/view/012", "NFS3", "tenant-2", base * 0.5),
+             for ip, path, proto, tenant, share, value in (
+                 # The protocol label vocabulary matches real clusters
+                 # (FR14 probes): SMB traffic is labelled SMB2, never SMB,
+                 # and SMB2 rows carry a share label. The BLOCK and NFS3
+                 # rows reproduce the literal 2026-08-25 lab contamination:
+                 # /kmacs/block and /bgolliher/nfs-source ranked into the
+                 # SMB VIEW drill because ViewMetrics is protocol-blind -
+                 # a protocol-scoped drill must never surface them.
+                 ("10.9.0.1", "/view/317", "NFS4", "tenant-4", "", base * 1.0),
+                 ("10.9.0.2", "/view/288", "NFS4", "tenant-1", "", base * 0.27),
+                 ("10.9.0.3", "/kmacs/smb/opstat", "SMB2", "tenant-0", "opstattest", base * 0.9),
+                 ("10.9.0.7", "/kmacs/smb/opstat", "SMB2", "tenant-0", "opstattest", base * 0.35),
+                 ("10.9.0.8", "/smb/other", "SMB2", "tenant-1", "othershare", base * 0.07),
+                 ("10.9.0.4", "/view/012", "NFS3", "tenant-2", "", base * 0.5),
+                 ("10.9.0.5", "/kmacs/block", "BLOCK", "tenant-9", "", base * 2.0),
+                 ("10.9.0.6", "/bgolliher/nfs-source", "NFS3", "tenant-8", "", base * 1.5),
+                 ("10.9.0.9", "/s3/bucketview", "S3", "tenant-3", "", base * 0.4),
              ))
          for field, base in (
              ("iops", 44.2), ("read_iops", 30.1), ("write_iops", 14.1),

@@ -68,12 +68,29 @@ def _engine(name, vms, monkeypatch):
 
 ENGINES = ["nfs_v3", "nfs_v41", "smb", "s3", "nvme_tcp"]
 # One drill each engine can enter against the mock, and a second one to prove
-# a later queued key still lands.
+# a later queued key still lands. The second key's END STATE differs by
+# engine since FR14: [t] is an honest capability notice on nfs_v3/s3, a
+# host_view exporter mode on nfs_v41/smb, and nvme uses [i] vip. What this
+# suite asserts is unchanged - the queued key must LAND.
 FIRST_DRILL = {"nfs_v3": "c", "nfs_v41": "c", "smb": "c", "s3": "c",
                "nvme_tcp": "c"}
-SECOND_DRILL = {"nfs_v3": ("t", "tenant"), "nfs_v41": ("t", "tenant"),
-                "smb": ("t", "tenant"), "s3": ("t", "tenant"),
-                "nvme_tcp": ("i", "vip")}
+
+
+def _second_landed(module):
+    name = module.__name__
+    if name == "nfs_v3":
+        return module.TENANT_UNAVAILABLE_MARKER in (module.DRILL_ERROR or "")
+    if name == "nfs_v41":
+        return module.EXPORTER_MODE == "tenant"
+    if name == "smb":
+        return module.HV_MODE == "tenant"
+    if name == "s3":
+        return module.TENANT_UNAVAILABLE_MARKER in (module.DRILL_ERROR or "")
+    return module.DRILL_MODE == "vip"
+
+
+SECOND_KEY = {"nfs_v3": "t", "nfs_v41": "t", "smb": "t", "s3": "t",
+              "nvme_tcp": "i"}
 
 
 @pytest.fixture(params=ENGINES)
@@ -83,6 +100,8 @@ def engine(request, vms, monkeypatch):
     module.exit_drill_mode()
     if hasattr(module, "exit_exporter_mode"):
         module.exit_exporter_mode()
+    if hasattr(module, "exit_hostview_mode"):
+        module.exit_hostview_mode()
     module.cleanup()
     module._CLEANED_UP = False
     vast_common.close_connection()
@@ -107,13 +126,13 @@ def test_space_does_not_swallow_queued_exit_and_drill_keys(engine, capsys):
     name = module.__name__
     module._dispatch_key(FIRST_DRILL[name])
     assert module.DRILL_MODE is not None, "fixture drill entry failed"
-    second_key, second_mode = SECOND_DRILL[name]
 
-    _drain(module, " x" + second_key)
+    _drain(module, " x" + SECOND_KEY[name])
     capsys.readouterr()
-    assert module.DRILL_MODE == second_mode, (
-        "%s: queued keys dropped - expected drill %r, got %r"
-        % (name, second_mode, module.DRILL_MODE))
+    assert _second_landed(module), (
+        "%s: queued keys dropped - the trailing %r never landed "
+        "(DRILL_MODE=%r DRILL_ERROR=%r)"
+        % (name, SECOND_KEY[name], module.DRILL_MODE, module.DRILL_ERROR))
 
 
 def test_exit_then_reenter_in_one_buffer(engine, capsys):

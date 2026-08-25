@@ -189,9 +189,11 @@ def _capture_frames(module, monkeypatch):
     return frames
 
 
+# [t] moved to the exporter path with FR14 (host_view protocol=NFS4), so
+# cNode is the one monitor-backed NFSv4.1 drill left; tenant joins the
+# exporter cases below.
 @pytest.mark.parametrize("mode,needle", [
     ("cnode", "Loading the cNODE drill-down"),
-    ("tenant", "Loading the TENANT drill-down"),
 ])
 def test_monitor_drills_paint_the_loading_frame_first(engine, monkeypatch,
                                                      mode, needle):
@@ -218,6 +220,7 @@ def test_monitor_drills_paint_the_loading_frame_first(engine, monkeypatch,
     ("native", "Loading the NFSv4 telemetry view"),
     ("hosts", "Loading the NFSv4 hosts view"),
     ("view", "Loading the VIEW drill-down"),
+    ("tenant", "Loading the TENANT drill-down"),
 ])
 def test_exporter_drills_paint_the_loading_frame_first(engine, monkeypatch,
                                                       mode, needle):

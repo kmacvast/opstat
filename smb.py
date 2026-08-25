@@ -33,6 +33,7 @@ from datetime import datetime
 
 import ipaddress
 
+import nfs4_native
 import openmetrics
 import vast_api_log
 import vast_common
@@ -154,50 +155,17 @@ _DRILL_CFG = {
         "name_fields": ("name", "hostname", "mgmt_ip"),
         "no_aggregation": False,
     },
-    "view": {
-        "label": "VIEW",
-        "object_type": "view",
-        "endpoint": "/views/",
-        "name_fields": ("path", "title", "name"),
-        "no_aggregation": True,
-    },
-    "tenant": {
-        "label": "TENANT",
-        "object_type": "tenant",
-        "endpoint": "/tenants/",
-        "name_fields": ("name",),
-        "no_aggregation": False,
-    },
 }
 
-# View/tenant drill scopes use ViewMetrics/TenantMetrics (SMBCommon is cluster/cnode).
-_VIEW_READ_IOPS = "ViewMetrics,read_iops__rate"
-_VIEW_WRITE_IOPS = "ViewMetrics,write_iops__rate"
-_VIEW_READ_MD = "ViewMetrics,read_md_iops__rate"
-_VIEW_WRITE_MD = "ViewMetrics,write_md_iops__rate"
-_VIEW_READ_LAT = "ViewMetrics,read_latency__avg"
-_VIEW_WRITE_LAT = "ViewMetrics,write_latency__avg"
-_VIEW_READ_BW = "ViewMetrics,read_bw__rate"
-_VIEW_WRITE_BW = "ViewMetrics,write_bw__rate"
-_VIEW_READ_MD_LAT = "ViewMetrics,read_md_latency__avg"
-_VIEW_WRITE_MD_LAT = "ViewMetrics,write_md_latency__avg"
-_VIEW_QOS_FAILURES = "ViewMetrics,qos_failures"
-_VIEW_QOS_WAIT = "ViewMetrics,qos_wait_for_budget_time__rate"
-
-_TENANT_READ_IOPS = "TenantMetrics,read_iops__sum"
-_TENANT_WRITE_IOPS = "TenantMetrics,write_iops__sum"
-_TENANT_READ_MD = "TenantMetrics,read_md_iops__sum"
-_TENANT_WRITE_MD = "TenantMetrics,write_md_iops__sum"
-_TENANT_READ_BW = "TenantMetrics,read_bw__sum"
-_TENANT_WRITE_BW = "TenantMetrics,write_bw__sum"
-_TENANT_READ_LAT = "TenantMetrics,read_latency__sum"
-_TENANT_WRITE_LAT = "TenantMetrics,write_latency__sum"
-_TENANT_READ_CNT = "TenantMetrics,read_iops__num_samples"
-_TENANT_WRITE_CNT = "TenantMetrics,write_iops__num_samples"
-_TENANT_READ_MD_LAT_SUM = "TenantMetrics,read_md_latency__sum"
-_TENANT_WRITE_MD_LAT_SUM = "TenantMetrics,write_md_latency__sum"
-_TENANT_READ_MD_LAT_CNT = "TenantMetrics,read_md_latency__num_samples"
-_TENANT_WRITE_MD_LAT_CNT = "TenantMetrics,write_md_latency__num_samples"
+# View/tenant scopes were served by the monitor API's ViewMetrics and
+# TenantMetrics families until 2026-08-25. Real-VMS evidence removed them:
+# neither family carries a protocol discriminator (D-016), so on a mixed
+# cluster the SMB VIEW drill ranked and displayed other protocols' busiest
+# views - the lab observed /kmacs/block (NVMe) and /bgolliher/nfs-source
+# (NFS) inside "VAST SMB ... | VIEW DRILL". The rebuilt drills scrape
+# /prometheusmetrics/host_view filtered to protocol=SMB2, first-party
+# validated on var203/5.4.6 (FR14: share=opstattest, path=/kmacs/smb/opstat,
+# ~747 IOPS attributed per client with full field coverage).
 
 _MAX_DRILL_OBJECTS = 8
 _DRILL_PROBE_LIMIT = 32
@@ -258,6 +226,10 @@ DRILL_ERROR = None
 DRILL_STATUS = None
 STARTUP_STATUS = None
 DRILL = None
+# host_view-backed drills (protocol=SMB2): mode is "view" or "tenant".
+HOSTVIEW = None
+HV_MODE = None
+HV_STATUS = None
 LAST_TOPN = None
 LAST_SESSION_CONTEXT = None
 _LAST_AUX_FETCH_AT = 0.0
@@ -320,6 +292,11 @@ def init_config(args):
         min_batch=_DRILL_PROBE_LIMIT,
         min_query_interval=_DRILL_MIN_QUERY_INTERVAL,
     )
+
+    global HOSTVIEW, HV_MODE, HV_STATUS
+    HOSTVIEW = nfs4_native.HostViewCollector(
+        vast_common.request_text, protocol="SMB2")
+    HV_MODE = HV_STATUS = None
 
 
 def configure_client_scope(args):
@@ -517,39 +494,13 @@ def build_headline_monitor_props():
 
 
 def build_drill_prop_list(mode):
-    """Scope-aware monitor props for SMB drill-down."""
-    if mode == "view":
-        return [
-            _VIEW_READ_IOPS, _VIEW_WRITE_IOPS,
-            _VIEW_READ_MD, _VIEW_WRITE_MD,
-            _VIEW_READ_LAT, _VIEW_WRITE_LAT,
-            _VIEW_READ_BW, _VIEW_WRITE_BW,
-            _VIEW_READ_MD_LAT, _VIEW_WRITE_MD_LAT,
-            _VIEW_QOS_FAILURES, _VIEW_QOS_WAIT,
-        ]
-    if mode == "tenant":
-        return [
-            _TENANT_READ_IOPS, _TENANT_WRITE_IOPS,
-            _TENANT_READ_MD, _TENANT_WRITE_MD,
-            _TENANT_READ_BW, _TENANT_WRITE_BW,
-            _TENANT_READ_LAT, _TENANT_WRITE_LAT,
-            _TENANT_READ_CNT, _TENANT_WRITE_CNT,
-            _TENANT_READ_MD_LAT_SUM, _TENANT_WRITE_MD_LAT_SUM,
-            _TENANT_READ_MD_LAT_CNT, _TENANT_WRITE_MD_LAT_CNT,
-        ]
+    """Monitor props for the cNode drill - the one monitor-backed drill left.
+
+    View and tenant scope moved to the protocol-filtered host_view scrape
+    (see enter_hostview_mode); their all-protocol monitor families are gone
+    from this engine on purpose.
+    """
     return build_headline_monitor_props()
-
-
-def build_drill_rank_prop_list(mode):
-    """Minimal props for one-shot batch ranking of view/tenant candidates."""
-    if mode == "view":
-        return [_VIEW_READ_IOPS, _VIEW_WRITE_IOPS, _VIEW_READ_MD, _VIEW_WRITE_MD]
-    if mode == "tenant":
-        return [
-            _TENANT_READ_IOPS, _TENANT_WRITE_IOPS,
-            _TENANT_READ_MD, _TENANT_WRITE_MD,
-        ]
-    return build_drill_prop_list(mode)
 
 
 def _is_batch_drill_mode(mode=None):
@@ -1458,7 +1409,8 @@ def _render_insights_panel(snapshot, deltas, width):
         scope_note = " (scoped)" if CLIENT_SCOPED else ""
         print(box_row(
             c("Top Client       ", _DIM) + c(title, _BWHITE)
-            + c(f"  md {format_iops(total_md)} ops/s{scope_note}", _CYAN),
+            + c(f"  md {format_iops(total_md)} ops/s{scope_note}", _CYAN)
+            + c("  all protocols (topn)", _DIM),
             width,
         ))
 
@@ -1466,8 +1418,9 @@ def _render_insights_panel(snapshot, deltas, width):
     if top_views:
         row = top_views[0]
         print(box_row(
-            c("Top Share        ", _DIM) + c(row.get("title", "?"), _BWHITE)
-            + c(f"  md {format_iops(row.get('total'))} ops/s", _GREEN),
+            c("Top View         ", _DIM) + c(row.get("title", "?"), _BWHITE)
+            + c(f"  md {format_iops(row.get('total'))} ops/s", _GREEN)
+            + c("  all protocols (topn)", _DIM),
             width,
         ))
 
@@ -1723,41 +1676,6 @@ def _parse_sample_ts(sample):
         return None
 
 
-def _view_rate_prop_indexes(prop_idx):
-    """Indexes of ViewMetrics rate/latency props used for row selection."""
-    return [
-        prop_idx[p] for p in (
-            _VIEW_READ_IOPS, _VIEW_WRITE_IOPS,
-            _VIEW_READ_MD, _VIEW_WRITE_MD,
-            _VIEW_READ_LAT, _VIEW_WRITE_LAT,
-            _VIEW_READ_BW, _VIEW_WRITE_BW,
-            _VIEW_READ_MD_LAT, _VIEW_WRITE_MD_LAT,
-        )
-        if p in prop_idx
-    ]
-
-
-def _view_values_from_result(result):
-    """Pick the newest ViewMetrics row with non-null rates.
-
-    View monitors with no_aggregation often return duplicate timestamps per
-    object_id: a padding row with null metrics followed by the real sample.
-    """
-    prop_list, data, prop_idx = _result_parts(result)
-    if not data:
-        return {}, prop_idx, "-"
-    rate_idxs = _view_rate_prop_indexes(prop_idx)
-    # Prefer the newest row with the *most* populated rates, not merely the
-    # first with any: on a real cluster the newest bucket often has exactly
-    # one rate filled in, which loses latency, bandwidth and the workload mix.
-    chosen = vast_common.latest_complete_row(data, rate_idxs)
-    if chosen is None:
-        return {}, prop_idx, "-"
-    values = {name: chosen[idx] for name, idx in prop_idx.items() if idx < len(chosen)}
-    sample = chosen[0] if chosen else "-"
-    return values, prop_idx, sample
-
-
 def _values_from_result(result):
     """Values from the newest usable sample row (see _latest_row)."""
     _prop_list, data, prop_idx = _result_parts(result)
@@ -1835,100 +1753,8 @@ def _build_cnode_drill_row(result, obj_name):
     }
 
 
-def _build_view_drill_row(result, obj_name):
-    values, _prop_idx, _sample = _view_values_from_result(result)
-    read_ops = as_float(values.get(_VIEW_READ_IOPS)) or 0.0
-    write_ops = as_float(values.get(_VIEW_WRITE_IOPS)) or 0.0
-    read_md = as_float(values.get(_VIEW_READ_MD)) or 0.0
-    write_md = as_float(values.get(_VIEW_WRITE_MD)) or 0.0
-    total_ops = read_ops + write_ops + read_md + write_md
-    latency = _weighted_us([
-        (read_ops, as_float(values.get(_VIEW_READ_LAT))),
-        (write_ops, as_float(values.get(_VIEW_WRITE_LAT))),
-        (read_md, as_float(values.get(_VIEW_READ_MD_LAT))),
-        (write_md, as_float(values.get(_VIEW_WRITE_MD_LAT))),
-    ])
-    read_bw = raw_bw_to_gb_sec(values.get(_VIEW_READ_BW)) or 0.0
-    write_bw = raw_bw_to_gb_sec(values.get(_VIEW_WRITE_BW)) or 0.0
-    top_rpc, top_pct = _drill_top_op([
-        ("READ", read_ops), ("WRITE", write_ops),
-        ("RD MD", read_md), ("WR MD", write_md),
-    ])
-    return {
-        "name": obj_name,
-        "total_ops": total_ops if total_ops > 0 else None,
-        "latency_us": latency,
-        "bw_gbs": (read_bw + write_bw) if (read_bw + write_bw) > 0 else None,
-        "top_rpc": top_rpc,
-        "top_rpc_pct": top_pct,
-    }
-
-
-def _build_tenant_drill_row(result, obj_name):
-    read_ops = _delta_rate_from_samples(result, _TENANT_READ_IOPS) or 0.0
-    write_ops = _delta_rate_from_samples(result, _TENANT_WRITE_IOPS) or 0.0
-    read_md = _delta_rate_from_samples(result, _TENANT_READ_MD) or 0.0
-    write_md = _delta_rate_from_samples(result, _TENANT_WRITE_MD) or 0.0
-    total_ops = read_ops + write_ops + read_md + write_md
-    read_lat = _avg_from_sum_count_deltas(result, _TENANT_READ_LAT, _TENANT_READ_CNT)
-    write_lat = _avg_from_sum_count_deltas(result, _TENANT_WRITE_LAT, _TENANT_WRITE_CNT)
-    read_md_lat = _avg_from_sum_count_deltas(
-        result, _TENANT_READ_MD_LAT_SUM, _TENANT_READ_MD_LAT_CNT,
-    )
-    write_md_lat = _avg_from_sum_count_deltas(
-        result, _TENANT_WRITE_MD_LAT_SUM, _TENANT_WRITE_MD_LAT_CNT,
-    )
-    latency = _weighted_us([
-        (read_ops, read_lat), (write_ops, write_lat),
-        (read_md, read_md_lat), (write_md, write_md_lat),
-    ])
-    read_bw_gbs = raw_bw_to_gb_sec(_delta_rate_from_samples(result, _TENANT_READ_BW)) or 0.0
-    write_bw_gbs = raw_bw_to_gb_sec(_delta_rate_from_samples(result, _TENANT_WRITE_BW)) or 0.0
-    top_rpc, top_pct = _drill_top_op([
-        ("READ", read_ops), ("WRITE", write_ops),
-        ("RD MD", read_md), ("WR MD", write_md),
-    ])
-    return {
-        "name": obj_name,
-        "total_ops": total_ops if total_ops > 0 else None,
-        "latency_us": latency,
-        "bw_gbs": (read_bw_gbs + write_bw_gbs) if (read_bw_gbs + write_bw_gbs) > 0 else None,
-        "top_rpc": top_rpc,
-        "top_rpc_pct": top_pct,
-    }
-
-
 def _build_drill_row(mode, result, obj_name):
-    if mode == "view":
-        return _build_view_drill_row(result, obj_name)
-    if mode == "tenant":
-        return _build_tenant_drill_row(result, obj_name)
     return _build_cnode_drill_row(result, obj_name)
-
-
-def _drill_score(mode, sliced_result):
-    """Activity score for one object during ranking."""
-    return as_float(_build_drill_row(mode, sliced_result, "").get("total_ops")) or 0.0
-
-
-def _rank_drill_candidates(mode, objects, cfg):
-    """Return the most active ``_MAX_DRILL_OBJECTS`` view/tenant candidates.
-
-    The previous chunked serial scan cost one create/query/delete monitor per
-    32 objects; 145 views measured 18 API calls and ~100 s of "stand by" on
-    the real cluster. vast_drill tries a single server-side topn request, then
-    the fewest batched rank monitors the cluster accepts, and caches the result
-    so re-entering the drill inside the cache window is free.
-    """
-    return DRILL.rank(
-        mode, objects,
-        object_type=cfg["object_type"],
-        rank_props=build_drill_rank_prop_list(mode),
-        score_fn=lambda sliced: _drill_score(mode, sliced),
-        time_frame=API_TIME_FRAME,
-        name_of=lambda obj: _obj_name(obj, cfg["name_fields"]),
-        no_aggregation=cfg.get("no_aggregation", False),
-    )
 
 
 def enter_drill_mode(mode):
@@ -1951,14 +1777,11 @@ def enter_drill_mode(mode):
         return
 
     all_valid = [o for o in objects if "id" in o]
-    if mode in ("view", "tenant"):
-        DRILL_OBJECTS = _rank_drill_candidates(mode, all_valid, cfg)
-    else:
-        selected = all_valid[:_MAX_DRILL_OBJECTS]
-        DRILL_OBJECTS = [
-            {"id": o["id"], "name": _obj_name(o, cfg["name_fields"])}
-            for o in selected
-        ]
+    selected = all_valid[:_MAX_DRILL_OBJECTS]
+    DRILL_OBJECTS = [
+        {"id": o["id"], "name": _obj_name(o, cfg["name_fields"])}
+        for o in selected
+    ]
 
     if not DRILL_OBJECTS:
         DRILL_ERROR = f"No valid {mode} objects available for drill-down"
@@ -1967,42 +1790,27 @@ def enter_drill_mode(mode):
     _cleanup_drill_monitors()
     prop_list = build_drill_prop_list(mode)
 
-    if mode in ("view", "tenant"):
-        # Batched into one monitor where the cluster allows it, with automatic
-        # fallback to per-object monitors when the batch is refused.
-        new_monitors, last_error = DRILL.create_monitors(
-            mode, DRILL_OBJECTS,
-            object_type=cfg["object_type"],
-            props=prop_list,
-            no_aggregation=cfg.get("no_aggregation", False),
-        )
-    else:
-        # cnode: per-object monitors, unchanged from the pre-port behavior.
-        new_monitors = []
-        last_error = None
-        for obj in DRILL_OBJECTS:
-            try:
-                monitor_id = _create_monitor_raw(
-                    f"{mode}_{obj['id']}",
-                    prop_list,
-                    cfg["object_type"],
-                    [obj["id"]],
-                    no_aggregation=cfg.get("no_aggregation", False),
-                )
-                new_monitors.append((monitor_id, obj["name"]))
-            except RuntimeError as e:
-                last_error = str(e)
+    # cnode: per-object monitors, unchanged from the pre-port behavior.
+    new_monitors = []
+    last_error = None
+    for obj in DRILL_OBJECTS:
+        try:
+            monitor_id = _create_monitor_raw(
+                f"{mode}_{obj['id']}",
+                prop_list,
+                cfg["object_type"],
+                [obj["id"]],
+                no_aggregation=cfg.get("no_aggregation", False),
+            )
+            new_monitors.append((monitor_id, obj["name"]))
+        except RuntimeError as e:
+            last_error = str(e)
 
     if not new_monitors:
-        hint = ""
-        if mode == "view":
-            hint = " (view monitors require seconds resolution without aggregation)"
-        elif mode == "tenant":
-            hint = " (tenant scope requires TenantMetrics counters)"
         detail = f": {last_error}" if last_error else ""
         DRILL_ERROR = (
             f"Could not create any {mode} monitors (object_type="
-            f"'{cfg['object_type']}' may not be supported){hint}{detail}"
+            f"'{cfg['object_type']}' may not be supported){detail}"
         )
         DRILL_OBJECTS = []
         return
@@ -2024,17 +1832,9 @@ def exit_drill_mode():
 
 
 def fetch_drill_query(force=False):
-    """Re-query the active drill monitors, throttled for view/tenant unless *force*.
-
-    View and tenant metric families publish a new sample ~1/min, so a 5 s
-    dashboard tick re-fetched identical payloads; the space bar passes
-    force=True. cNode keeps its pre-port every-tick cadence.
-    """
+    """Re-query the active cNode drill monitors (pre-port every-tick cadence)."""
     global LAST_DRILL_ROWS, DRILL_ERROR
     if not DRILL_MODE:
-        return
-    if DRILL_MODE in ("view", "tenant") and not DRILL.should_query(
-            force=force, have_data=bool(LAST_DRILL_ROWS)):
         return
     drill_rows = []
     query_errors = 0
@@ -2075,12 +1875,151 @@ def _set_drill_status(text):
     DRILL_STATUS = text
 
 
+# ---------------------------------------------------------------------------
+# host_view-backed VIEW and TENANT drills (protocol=SMB2)
+# ---------------------------------------------------------------------------
+def _set_hv_status(text):
+    global HV_STATUS
+    HV_STATUS = text
+
+
+def enter_hostview_mode(mode):
+    """Switch to a host_view-backed drill, scraping synchronously.
+
+    One ~5 KB GET of /prometheusmetrics/host_view, filtered to protocol=SMB2
+    at parse time - no monitors, no cleanup, nothing on the 5 s refresh path
+    (D-004/D-005). The scrape can cost seconds against a real VMS, so a
+    status frame is painted first; the wording stays plain because exporter
+    scrapes measure far under the cold monitor-entry warning threshold.
+    """
+    global HV_MODE
+    exit_drill_mode()
+    HV_MODE = mode
+    # Not force=True: an empty collector always scrapes (scrapes == 0), but
+    # switching between the view and tenant drills inside the throttle
+    # window reuses the sample instead of paying for it twice. Space forces.
+    vast_drill.with_loading_status(
+        _set_hv_status, render_screen, mode, HOSTVIEW.scrape)
+
+
+def exit_hostview_mode():
+    global HV_MODE, HV_STATUS
+    HV_MODE = HV_STATUS = None
+
+
+def refresh_hostview(force=False):
+    """Re-scrape the active host_view drill, subject to its own throttle."""
+    if HV_MODE:
+        HOSTVIEW.scrape(force=force)
+
+
+def _render_hostview_panel(width):
+    if HV_STATUS:
+        print(box_top("DRILL-DOWN", width))
+        print(box_row(c(HV_STATUS, _YELLOW), width))
+        print(box_bottom(width))
+        return
+
+    label = "SMB VIEWS" if HV_MODE == "view" else "SMB TENANTS"
+    if HOSTVIEW.error and not HOSTVIEW.rows:
+        print(box_top(label, width))
+        print(box_row(c(f"Scrape failed: {HOSTVIEW.error[:width - 20]}", _BRED),
+                      width))
+        print(box_row(c("Press x to return to the cluster view.", _DIM), width))
+        print(box_bottom(width))
+        return
+
+    print(box_top(f"{label} - (host_view, protocol=SMB2)", width))
+    age = (time.monotonic() - HOSTVIEW.last_scrape_at
+           if HOSTVIEW.last_scrape_at else None)
+    print(box_row(c(f"source {HOSTVIEW.endpoint}   "
+                    f"{HOSTVIEW.last_bytes / 1024:.0f} KB   "
+                    f"{HOSTVIEW.last_elapsed * 1000:.0f} ms"
+                    + (f"   {age:.0f}s ago" if age is not None else "")
+                    + f"   refresh {int(HOSTVIEW.min_interval)}s", _DIM), width))
+    print(box_sep(width))
+    if HV_MODE == "view":
+        _render_hostview_view_rows(width)
+    else:
+        _render_hostview_tenant_rows(width)
+    print(box_row(c("Per-protocol exporter attribution: only traffic the "
+                    "cluster labels SMB2 appears here.", _DIM), width))
+    print(box_bottom(width))
+
+
+def _render_hostview_view_rows(width):
+    print(box_row(join_columns([
+        c(pad_display("View / path", 24, "<"), _BOLD),
+        c(pad_display("Share", 11, "<"), _BOLD),
+        c(pad_display("Tenant", 10, "<"), _BOLD),
+        c(pad_display("Clients", 7, ">"), _BOLD),
+        c(pad_display("IOPS", 10, ">"), _BOLD),
+        c(pad_display("Read/s", 9, ">"), _BOLD),
+        c(pad_display("Write/s", 9, ">"), _BOLD),
+        c(pad_display("MB/s", 9, ">"), _BOLD),
+        c(pad_display(f"Avg {_MUS}", 10, ">"), _BOLD),
+    ], " "), width))
+    print(box_sep(width))
+    rows = nfs4_native.aggregate_by_path(HOSTVIEW.rows)
+    if not rows:
+        print(box_row(c("No SMB2 view series reported by the exporter - no "
+                        "view is carrying SMB traffic right now.", _DIM),
+                      width))
+        return
+    for row in rows:
+        bw_text, _ = format_throughput_mbs(raw_bw_to_mb_sec(row["bw"]))
+        print(box_row(join_columns([
+            c(pad_display(str(row["path"])[:24], 24, "<"), _BCYAN),
+            c(pad_display(str(row["share"])[:11], 11, "<"), _BWHITE),
+            c(pad_display(str(row["tenant"])[:10], 10, "<"), _DIM),
+            c(pad_display(str(row["client_count"]), 7, ">"), _BWHITE),
+            c(format_fixed_number(row["iops"], 10, 2), _GREEN),
+            c(format_fixed_number(row["read_iops"], 9, 1), _CYAN),
+            c(format_fixed_number(row["write_iops"], 9, 1), _YELLOW),
+            c(pad_display(bw_text if row["bw"] else "-", 9, ">"), _CYAN),
+            c(format_fixed_number(row["latency_us"], 10, 1), _BGREEN),
+        ], " "), width))
+
+
+def _render_hostview_tenant_rows(width):
+    print(box_row(join_columns([
+        c(pad_display("Tenant", 20, "<"), _BOLD),
+        c(pad_display("Views", 6, ">"), _BOLD),
+        c(pad_display("Clients", 7, ">"), _BOLD),
+        c(pad_display("IOPS", 11, ">"), _BOLD),
+        c(pad_display("Read/s", 10, ">"), _BOLD),
+        c(pad_display("Write/s", 10, ">"), _BOLD),
+        c(pad_display("MB/s", 10, ">"), _BOLD),
+        c(pad_display(f"Avg {_MUS}", 10, ">"), _BOLD),
+    ], " "), width))
+    print(box_sep(width))
+    rows = nfs4_native.aggregate_by_tenant(HOSTVIEW.rows)
+    if not rows:
+        print(box_row(c("No SMB2 tenant series reported by the exporter - no "
+                        "tenant is carrying SMB traffic right now.", _DIM),
+                      width))
+        return
+    for row in rows:
+        bw_text, _ = format_throughput_mbs(raw_bw_to_mb_sec(row["bw"]))
+        print(box_row(join_columns([
+            c(pad_display(str(row["tenant"])[:20], 20, "<"), _BCYAN),
+            c(pad_display(str(row["path_count"]), 6, ">"), _BWHITE),
+            c(pad_display(str(row["client_count"]), 7, ">"), _BWHITE),
+            c(format_fixed_number(row["iops"], 11, 2), _GREEN),
+            c(format_fixed_number(row["read_iops"], 10, 1), _CYAN),
+            c(format_fixed_number(row["write_iops"], 10, 1), _YELLOW),
+            c(pad_display(bw_text if row["bw"] else "-", 10, ">"), _CYAN),
+            c(format_fixed_number(row["latency_us"], 10, 1), _BGREEN),
+        ], " "), width))
+
+
 def switch_drill_mode(mode):
     """Enter drill mode behind the shared loading interstitial.
 
-    The stand-by frame is painted before the blocking ranking/monitor work via
+    The stand-by frame is painted before the blocking monitor work via
     vast_drill.with_loading_status, and cleared afterwards even on error.
     """
+    exit_hostview_mode()
     exit_drill_mode()
 
     def _work():
@@ -2192,17 +2131,25 @@ def _export_openmetrics():
 
 
 def poll_tick():
-    """One refresh poll: drill view when active, else the headline monitors."""
+    """One refresh poll: drill view when active, else the headline monitors.
+
+    The host_view drills refresh on their own far slower cadence; the 5 s
+    dashboard tick never scrapes /prometheusmetrics/*.
+    """
     if DRILL_MODE:
         fetch_drill_query()
+    elif HV_MODE:
+        refresh_hostview()
     else:
         fetch_monitor_query()
 
 
 def manual_refresh():
-    """Space-bar refresh: bypass the drill throttle, or force auxiliary monitors."""
+    """Space-bar refresh: bypass the drill/scrape throttle, or force auxiliaries."""
     if DRILL_MODE:
         fetch_drill_query(force=True)
+    elif HV_MODE:
+        refresh_hostview(force=True)
     else:
         fetch_monitor_query(force_aux=True)
 
@@ -2241,6 +2188,8 @@ def _render_frame():
         title += c(f"   | clients {client_note}", _BYELLOW)
     if DRILL_MODE:
         title += c(f"   | {DRILL_MODE.upper()} DRILL", _BYELLOW)
+    elif HV_MODE:
+        title += c(f"   | {HV_MODE.upper()} DRILL", _BYELLOW)
     if CSV_FILE:
         title += c(f"   csv:{CSV_FILE}", _DIM)
     # Header lines sit outside the box borders, so they must be truncated
@@ -2249,8 +2198,12 @@ def _render_frame():
     print(truncate_display(title, width))
     frame_note = f"sample-average {API_TIME_FRAME}" if SAMPLE_AVERAGE_MODE else f"frame {API_TIME_FRAME}"
     os_label = format_os_release(CLUSTER_OS)
+    # The source token must name what the ACTIVE panel renders: the host_view
+    # drills are exporter data, and claiming "source SMBCommon" above them
+    # would be a provenance lie (FR14).
+    frame_source = "host_view/SMB2" if HV_MODE else METRICS_SOURCE
     print(truncate_display(c(
-        f"  sample {LAST_SAMPLE}   {frame_note}   source {METRICS_SOURCE}"
+        f"  sample {LAST_SAMPLE}   {frame_note}   source {frame_source}"
         + (f"   {os_label}" if os_label else ""),
         _DIM,
     ), width))
@@ -2260,6 +2213,8 @@ def _render_frame():
         print(box_top("INITIALIZING", width))
         print(box_row(c(STARTUP_STATUS, _YELLOW), width))
         print(box_bottom(width))
+    elif HV_MODE or HV_STATUS:
+        _render_hostview_panel(width)
     elif DRILL_MODE or DRILL_ERROR or DRILL_STATUS:
         _render_drill_panel(width)
     else:
@@ -2536,11 +2491,16 @@ def _dispatch_key(key):
     if key == " ":
         vast_common.guarded_poll(manual_refresh, render_screen)
         return "rendered"
-    if key in ("c", "v", "t"):
-        switch_drill_mode({"c": "cnode", "v": "view", "t": "tenant"}[key])
+    if key == "c":
+        exit_hostview_mode()
+        switch_drill_mode("cnode")
+        return "refresh"
+    if key in ("v", "t"):
+        enter_hostview_mode({"v": "view", "t": "tenant"}[key])
         return "refresh"
     if key == "x":
         exit_drill_mode()
+        exit_hostview_mode()
         return "refresh"
     return None
 

@@ -192,21 +192,14 @@ _DRILL_CFG = {
         "no_aggregation": False,
         "ranked": False,
     },
-    "view": {
-        "object_type": "view",
-        "endpoint": "/views/",
-        "name_fields": ("path", "title", "name"),
-        "no_aggregation": vast_drill.VIEW_NO_AGGREGATION,
-        "ranked": True,
-    },
-    "tenant": {
-        "object_type": "tenant",
-        "endpoint": "/tenants/",
-        "name_fields": ("name",),
-        "no_aggregation": vast_drill.TENANT_NO_AGGREGATION,
-        "ranked": True,
-    },
 }
+# The ViewMetrics "view" and TenantMetrics "tenant" monitor-drill configs
+# were removed 2026-08-25 (FR14): neither family carries a protocol
+# discriminator (D-016), so both presented all-protocol activity under an
+# NFSv4.1 heading. The view config had already been superseded by the
+# host_view exporter drill (D-006) but stayed wired and key-unreachable -
+# one keybinding away from recreating the defect. [v] and [t] are
+# exporter-backed now; see enter_exporter_mode.
 _MAX_DRILL_OBJECTS = 8
 _DRILL_PROBE_LIMIT = 32
 _DRILL_MIN_QUERY_INTERVAL = 15.0
@@ -605,16 +598,11 @@ def probe_prop_support(props, chunk=40):
 def build_drill_prop_list(mode="cnode"):
     """Scope-aware drill props.
 
-    NFS4Common/NfsMetrics/NFSCommon are cluster- and cNode-scoped families; a
-    monitor requesting them with object_type=view or =tenant is rejected by
-    current VMS builds, so view and tenant scopes use ViewMetrics and
-    TenantMetrics instead (the same families the NFSv3 engine uses, since
-    these are object-scope metrics rather than NFS-version ones).
+    cNode is the only monitor-backed drill: NFS4Common/NfsMetrics/NFSCommon
+    are cluster- and cNode-scoped families. View and tenant scope come from
+    the protocol-filtered host_view scrape instead - the monitor API's
+    ViewMetrics/TenantMetrics have no protocol discriminator (D-016, FR14).
     """
-    if mode == "view":
-        return vast_drill.view_display_props()
-    if mode == "tenant":
-        return vast_drill.tenant_display_props()
     return (
         build_data_monitor_props()
         + build_supplement_monitor_props()
@@ -1290,37 +1278,6 @@ def fetch_drill_query(force=False):
         )
 
 
-def _drill_coverage_note():
-    """State how much cluster activity the shown objects actually account for.
-
-    ViewMetrics/TenantMetrics attribute only the operations VMS can tie to a
-    view or tenant, so drill rows legitimately sum to less than the cluster
-    total (and these are only the busiest few). Saying so beats letting the
-    gap read as a bug.
-    """
-    if not LAST_DRILL_ROWS or DRILL_MODE not in ("view", "tenant"):
-        return ""
-    shown = sum(as_float(r.get("total_ops")) or 0.0 for r in LAST_DRILL_ROWS)
-    data = LAST_ROWS.get("data") or []
-    cluster = sum(as_float(r.get("ops_sec")) or 0.0 for r in data)
-    cluster += as_float((LAST_ROWS.get("meta") or {}).get("md_iops")) or 0.0
-    if cluster <= 0:
-        return ""
-    fraction = vast_drill.coverage_fraction(shown, cluster)
-    if fraction is None:
-        return (
-            c(f"Top {len(LAST_DRILL_ROWS)} {DRILL_MODE}s shown; ", _DIM)
-            + c(f"{DRILL_MODE} counters are not directly comparable to the "
-                f"cluster totals above", _DIM)
-        )
-    return (
-        c(f"Top {len(LAST_DRILL_ROWS)} {DRILL_MODE}s account for ", _DIM)
-        + c(f"{shown:,.2f} ops/s ({fraction * 100.0:.1f}%)", _BWHITE)
-        + c(f" of {cluster:,.2f} cluster ops/s - VMS attributes only "
-            f"{DRILL_MODE}-scoped operations to {DRILL_MODE}s", _DIM)
-    )
-
-
 def _fmt_rate(value):
     """Rates render as a real number including zero - a genuine zero is
     information (no session churn), not missing data."""
@@ -1609,9 +1566,68 @@ def _render_view_panel(width):
     print(box_bottom(width))
 
 
+def _render_tenant_panel(width):
+    """Per-tenant NFSv4 attribution, aggregated from host_view's own tenant
+    label on rows already filtered to protocol=NFS4.
+
+    Replaces the TenantMetrics monitor drill, which carries no protocol
+    discriminator (D-016) and therefore showed all-protocol tenant activity
+    under this engine's heading (FR14).
+    """
+    if HOSTVIEW.error and not HOSTVIEW.rows:
+        print(box_top("NFSv4 TENANTS", width))
+        print(box_row(c(f"Scrape failed: {HOSTVIEW.error[:width - 20]}", _BRED),
+                      width))
+        print(box_row(c("Press x to return to the cluster view.", _DIM), width))
+        print(box_bottom(width))
+        return
+
+    rows = nfs4_native.aggregate_by_tenant(HOSTVIEW.rows)
+    print(box_top("NFSv4 TENANTS - per tenant (host_view, protocol=NFS4)", width))
+    age = (time.monotonic() - HOSTVIEW.last_scrape_at
+           if HOSTVIEW.last_scrape_at else None)
+    print(box_row(c(f"source {HOSTVIEW.endpoint}   "
+                    f"{HOSTVIEW.last_bytes / 1024:.0f} KB   "
+                    f"{HOSTVIEW.last_elapsed * 1000:.0f} ms"
+                    + (f"   {age:.0f}s ago" if age is not None else "")
+                    + f"   refresh {int(HOSTVIEW.min_interval)}s", _DIM), width))
+    print(box_sep(width))
+    print(box_row(join_columns([
+        c(pad_display("Tenant", 22, "<"), _BOLD),
+        c(pad_display("Views", 6, ">"), _BOLD),
+        c(pad_display("Hosts", 7, ">"), _BOLD),
+        c(pad_display("IOPS", 11, ">"), _BOLD),
+        c(pad_display("Read/s", 10, ">"), _BOLD),
+        c(pad_display("Write/s", 10, ">"), _BOLD),
+        c(pad_display("BW", 12, ">"), _BOLD),
+        c(pad_display(f"Avg {_MUS}", 11, ">"), _BOLD),
+    ], " "), width))
+    print(box_sep(width))
+    if not rows:
+        print(box_row(c("No NFS4 tenant series reported by the exporter - no "
+                        "tenant is carrying NFSv4 traffic right now.", _DIM),
+                      width))
+    for row in rows:
+        bw_text, _ = format_throughput_mbs(raw_bw_to_mb_sec(row["bw"]))
+        print(box_row(join_columns([
+            c(pad_display(str(row["tenant"])[:22], 22, "<"), _BCYAN),
+            c(pad_display(str(row["path_count"]), 6, ">"), _BWHITE),
+            c(pad_display(str(row["client_count"]), 7, ">"), _BWHITE),
+            c(pad_display(_fmt_rate(row["iops"]), 11, ">"), _GREEN),
+            c(pad_display(_fmt_rate(row["read_iops"]), 10, ">"), _CYAN),
+            c(pad_display(_fmt_rate(row["write_iops"]), 10, ">"), _YELLOW),
+            c(pad_display(bw_text if row["bw"] else "-", 12, ">"), _CYAN),
+            c(pad_display(_fmt_us(row["latency_us"]), 11, ">"), _BGREEN),
+        ], " "), width))
+    print(box_row(c("Aggregated from per-host exporter series; only traffic "
+                    "the cluster labels NFS4 appears here.", _DIM), width))
+    print(box_bottom(width))
+
+
 def _render_exporter_panels(width):
     if EXPORTER_STATUS:
-        title = {"hosts": "NFSv4 HOSTS", "view": "NFSv4 VIEWS"}.get(
+        title = {"hosts": "NFSv4 HOSTS", "view": "NFSv4 VIEWS",
+                 "tenant": "NFSv4 TENANTS"}.get(
             EXPORTER_MODE, "NATIVE NFSv4 TELEMETRY")
         print(box_top(title, width))
         print(box_row(c(EXPORTER_STATUS, _YELLOW), width))
@@ -1621,6 +1637,8 @@ def _render_exporter_panels(width):
         _render_hosts_panel(width)
     elif EXPORTER_MODE == "view":
         _render_view_panel(width)
+    elif EXPORTER_MODE == "tenant":
+        _render_tenant_panel(width)
     else:
         _render_native_panels(width)
 
@@ -1663,9 +1681,6 @@ def _render_drill_panel(width):
         ], " ")
         print(box_row(line, width))
     print(box_sep(width))
-    coverage = _drill_coverage_note()
-    if coverage:
-        print(box_row(coverage, width))
     print(box_row(c("Press x to return to cluster view", _DIM), width))
     print(box_bottom(width))
 
@@ -1783,7 +1798,7 @@ def enter_exporter_mode(mode):
     global EXPORTER_MODE
     exit_drill_mode()
     EXPORTER_MODE = mode
-    collector = HOSTVIEW if mode in ("hosts", "view") else NFS4
+    collector = HOSTVIEW if mode in ("hosts", "view", "tenant") else NFS4
     # Not force=True: an empty collector always scrapes (scrapes == 0), but
     # switching between the two host_view-backed drills inside the throttle
     # window reuses the sample instead of paying for it twice. Space forces.
@@ -1798,7 +1813,7 @@ def exit_exporter_mode():
 
 def refresh_exporter(force=False):
     """Re-scrape the active exporter drill, subject to its own throttle."""
-    if EXPORTER_MODE in ("hosts", "view"):
+    if EXPORTER_MODE in ("hosts", "view", "tenant"):
         HOSTVIEW.scrape(force=force)
     elif EXPORTER_MODE == "native":
         NFS4.scrape(force=force)
@@ -2185,8 +2200,8 @@ def _render_frame():
     if DELEG_PROMPT is not None or DELEG_STATUS or DELEG_RESULT:
         title += c("   | DELEGATION", _BYELLOW)
     elif EXPORTER_MODE:
-        tag = {"hosts": "NFSv4 HOSTS", "view": "NFSv4 VIEWS"}.get(
-            EXPORTER_MODE, "NATIVE NFSv4")
+        tag = {"hosts": "NFSv4 HOSTS", "view": "NFSv4 VIEWS",
+               "tenant": "NFSv4 TENANTS"}.get(EXPORTER_MODE, "NATIVE NFSv4")
         title += c(f"   | {tag}", _BYELLOW)
     elif DRILL_MODE:
         title += c(f"   | {DRILL_MODE.upper()} DRILL", _BYELLOW)
@@ -2404,8 +2419,27 @@ def discover_metrics():
     emit()
 
     # -- 5. object-scope support -------------------------------------------
+    # Discovery keeps probing view/tenant scope support even though the
+    # production drills no longer display those families (FR14): whether a
+    # scope is queryable, and with which family, is exactly the read-only
+    # capability question discovery exists to answer.
+    discovery_scopes = dict(_DRILL_CFG)
+    discovery_scopes.update({
+        "view": {
+            "object_type": "view", "endpoint": "/views/",
+            "name_fields": ("path", "title", "name"),
+            "no_aggregation": vast_drill.VIEW_NO_AGGREGATION,
+            "props": vast_drill.view_display_props(),
+        },
+        "tenant": {
+            "object_type": "tenant", "endpoint": "/tenants/",
+            "name_fields": ("name",),
+            "no_aggregation": vast_drill.TENANT_NO_AGGREGATION,
+            "props": vast_drill.tenant_display_props(),
+        },
+    })
     emit("[ 5. Object scopes ]")
-    for mode, cfg in _DRILL_CFG.items():
+    for mode, cfg in discovery_scopes.items():
         try:
             objects = normalize_list_response(api_request("GET", cfg["endpoint"]))
             count = len(objects)
@@ -2418,7 +2452,8 @@ def discover_metrics():
             monitor_id = None
             try:
                 monitor_id = _create_monitor_raw(
-                    f"discover_{mode}", build_drill_prop_list(mode),
+                    f"discover_{mode}",
+                    cfg.get("props") or build_drill_prop_list(mode),
                     cfg["object_type"], probe_ids,
                     no_aggregation=cfg.get("no_aggregation", False),
                 )
@@ -2481,7 +2516,7 @@ def discover_metrics():
             lines.append(f"        NOT QUERYABLE: {prop}")
         for prop, kind, oid in _classify_props(ok[:48], "cluster"):
             lines.append(f"        {prop} :: cluster :: {kind} :: object_id={oid}")
-        for scope, cfg in _DRILL_CFG.items():
+        for scope, cfg in discovery_scopes.items():
             supported = _scope_supports(ok[:24], cfg)
             emit(f"     queryable at {scope} scope: {supported}")
     emit()
@@ -3152,13 +3187,14 @@ def _dispatch_key(key):
     if key in ("o", "l", "n"):
         SORT_MODE = {"o": "ops", "l": "latency", "n": "default"}[key]
         return "refresh"
-    if key in ("c", "t"):
+    if key == "c":
         DELEG_RESULT = None      # navigating away dismisses the lookup result
-        switch_drill_mode({"c": "cnode", "t": "tenant"}[key])
+        switch_drill_mode("cnode")
         return "refresh"
-    if key in ("v", "4", "h"):
+    if key in ("v", "t", "4", "h"):
         DELEG_RESULT = None
-        enter_exporter_mode({"v": "view", "4": "native", "h": "hosts"}[key])
+        enter_exporter_mode(
+            {"v": "view", "t": "tenant", "4": "native", "h": "hosts"}[key])
         return "refresh"
     if key == "x":
         DELEG_RESULT = None

@@ -287,15 +287,11 @@ def test_vip_topn_ignores_latency_as_ops():
     # Must not pick latency write=68046 as PUT ops.
     assert row["write"] < 100
 
-    drill = {r["name"]: r for r in s3._build_vip_rows_from_topn()}
-    d = drill["172.200.202.1"]
-    assert d["get_ops"] == pytest.approx(5.04)
-    assert d["put_ops"] == pytest.approx(0.75)
-    assert d["list_ops"] == pytest.approx(1.5)
-    assert d["delete_ops"] == pytest.approx(0.5)
-    assert d["bw_mbs"] == pytest.approx(4.94)
-    assert d["latency_us"] == pytest.approx(14933.0)
-    assert d["top_rpc"] == "GET"
+    # _build_vip_rows_from_topn was removed with the topn display paths
+    # (FR14): topn carries no protocol label (D-007), so its rows are never
+    # rendered as S3 data. The activity-row assertions above still pin the
+    # original defect (latency write=68046 must not read as PUT ops) on the
+    # ranking path, which is all that remains of topn.
 
 
 def test_create_headline_monitor_falls_back_to_legacy(monkeypatch):
