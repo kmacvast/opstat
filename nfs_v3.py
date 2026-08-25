@@ -10,7 +10,6 @@
 #              interactive sorting, drill-down by cNode/view/tenant,
 #              CSV export, and runtime historical statistics.
 #
-# Version:     0.1.1
 # Date:        2026-06-17
 # Author:      JMo
 # Revised:     KMac
@@ -55,6 +54,7 @@ import openmetrics
 import vast_api_log
 import vast_common
 import vast_drill
+from opstat_version import VERSION
 from tui_layout import (
     display_width, join_columns, pad_display, format_fixed_number,
     format_scaled_metric, truncate_display, c, set_color, set_unicode, glyph_set,
@@ -80,8 +80,6 @@ _NFS_DRILL_LAT = 10
 _NFS_DRILL_BW = 9
 _NFS_DRILL_RPC = 12
 _NFS_DRILL_TOP_PCT = 6
-
-VERSION = "0.1.2"
 
 DEFAULT_PORT = 443
 DEFAULT_USER = "admin"

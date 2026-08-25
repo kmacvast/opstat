@@ -7,7 +7,6 @@
 #              metadata proxy panels when native stateful/session counters are
 #              unexported by the time-series engine.
 #
-# Version:     0.1.1
 # Author:      KMac
 #
 # Usage:
@@ -37,6 +36,7 @@ import vast_api_log
 import vast_common
 import vast_discovery
 import vast_drill
+from opstat_version import VERSION
 from tui_layout import (
     display_width, join_columns, pad_display, format_fixed_number,
     format_scaled_metric, truncate_display, c, set_color, set_unicode, glyph_set,
@@ -45,8 +45,6 @@ from tui_layout import (
     _RST, _BOLD, _DIM, _GREEN, _YELLOW, _CYAN,
     _BRED, _BGREEN, _BYELLOW, _BCYAN, _BWHITE,
 )
-
-VERSION = "0.1.2"
 
 DEFAULT_PORT = 443
 DEFAULT_USER = "admin"

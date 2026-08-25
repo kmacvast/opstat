@@ -6,7 +6,6 @@
 #              S3Common ProtoMetrics (with legacy S3 fallback) and optional
 #              S3Metrics per-opcode counters/histograms when exported.
 #
-# Version:     0.1.2
 # Author:      KMac
 #
 # Usage:
@@ -41,6 +40,7 @@ import openmetrics
 import vast_api_log
 import vast_common
 import vast_drill
+from opstat_version import VERSION
 from tui_layout import (
     display_width, format_fixed_number, format_scaled_metric, join_columns,
     pad_display, truncate_display, c, set_color, set_unicode, glyph_set,
@@ -49,8 +49,6 @@ from tui_layout import (
     _RST, _BOLD, _DIM, _GREEN, _YELLOW, _CYAN,
     _BRED, _BGREEN, _BYELLOW, _BCYAN, _BWHITE,
 )
-
-VERSION = "0.1.2"
 
 DEFAULT_PORT = 443
 DEFAULT_USER = "admin"

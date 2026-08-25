@@ -24,6 +24,7 @@ DIST = ROOT / "dist"
 BUILD = ROOT / "build"
 
 HIDDEN_IMPORTS = [
+    "opstat_version",
     "nfs_v3",
     "nfs_v41",
     "nvme_tcp",

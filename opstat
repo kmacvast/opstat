@@ -8,7 +8,6 @@
 #              object storage statistics.
 #
 # Author: KMac kmac@vastdata.com
-# Version: 0.1.2
 ################################################################################
 
 import argparse
@@ -27,7 +26,7 @@ import s3
 import smb
 import wizard
 
-VERSION = "0.1.2"
+from opstat_version import VERSION
 
 DEFAULT_PORT = 443
 DEFAULT_USER = "admin"

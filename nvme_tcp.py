@@ -6,7 +6,6 @@
 #              VMS BlockMetrics and ProtoMetrics (BlockCommon) counters and
 #              displays live I/O, reclamation, and fabric/admin telemetry.
 #
-# Version:     0.1.1
 # Author:      KMac
 ################################################################################
 
@@ -24,6 +23,7 @@ import openmetrics
 import vast_api_log
 import vast_common
 import vast_drill
+from opstat_version import VERSION
 from tui_layout import (
     display_width, join_columns, pad_display, format_fixed_number,
     format_scaled_metric, truncate_display, c, set_color, set_unicode, glyph_set,
@@ -37,8 +37,6 @@ from tui_layout import (
 _COL_SEP = "  "
 _OPS_W = {"proc": 22, "iops": 14, "throughput": 14, "size": 12, "latency": 14}
 _PATH_W = {"name": 36, "iops": 12, "throughput": 14, "latency": 14}
-
-VERSION = "0.1.2"
 
 DEFAULT_PORT = 443
 DEFAULT_USER = "admin"
