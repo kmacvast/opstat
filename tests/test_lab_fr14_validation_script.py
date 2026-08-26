@@ -213,6 +213,131 @@ def _run_gate(tmp_path, before, after, require, mount="/mnt/fr14-test"):
     return proc.returncode, proc.stdout.decode()
 
 
+# The literal mount lines captured on the lab host (2026-08-26). The CIFS
+# section really is a bare device line: /proc/self/mountstats carries no
+# counters at all for a CIFS mount, which is why Stats is the only
+# client-side source and why misclassifying the mount was fatal.
+LAB_CIFS_DEVICE = "//172.200.203.6/opstattest"
+LAB_MOUNTSTATS = (
+    "device //172.200.203.6/opstattest mounted on /mnt/smbtest with fstype cifs\n"
+    "device 172.200.204.6:/kmacs mounted on /mnt/var204-nfs3 with fstype nfs statvers=1.1\n"
+    "\tage:\t16656\n"
+    "\tREAD:\n\t\t%d 0 0\n\tWRITE:\n\t\t%d 0 0\n"
+)
+
+
+def _cifs_stats(smbs, reads, writes, share=LAB_CIFS_DEVICE):
+    """A /proc/fs/cifs/Stats capture in the documented shape."""
+    return (
+        "Resources in use\nCIFS Session: 1\n"
+        "Share (unique mount targets): 2\n"
+        "Total vfs operations: %d maximum at one time: 2\n\n"
+        "1) %s\n"
+        "SMBs: %d\n"
+        "Reads:  %d Bytes: 4096\n"
+        "Writes: %d Bytes: 8192\n"
+        "Flushes: 0\n\n"
+        "2) \\\\other.host\\othershare\n"
+        "SMBs: 999999\n"
+        "Reads:  111111 Bytes: 1\n"
+        "Writes: 222222 Bytes: 1\n"
+        % (smbs, share.replace("/", "\\"), smbs, reads, writes)
+    )
+
+
+def _run_cifs_gate(tmp_path, before, after, require, mount="/mnt/smbtest"):
+    logs = tmp_path / "logs"
+    logs.mkdir(exist_ok=True)
+    # Both captures name the CIFS mount; NFS counters are present for the
+    # OTHER mount, so a classifier that ignores fstype has something to
+    # wrongly latch onto.
+    (logs / "mountstats-window-start.txt").write_text(LAB_MOUNTSTATS % (100, 50))
+    (logs / "mountstats-after.txt").write_text(LAB_MOUNTSTATS % (999, 999))
+    (logs / "cifs-window-start.txt").write_text(_cifs_stats(*before))
+    (logs / "cifs-window-end.txt").write_text(_cifs_stats(*after))
+    proc = subprocess.run(
+        [sys.executable, "-c", _workload_gate_source(), str(tmp_path), mount, require],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120)
+    return proc.returncode, proc.stdout.decode()
+
+
+def test_cifs_mount_is_never_classified_as_nfs(tmp_path):
+    """The shipped gate decided NFS from the "mounted on <mnt>" marker alone.
+
+    A CIFS mount has that marker too, so /mnt/smbtest was parsed as NFS,
+    found no per-op counters, totalled zero and reported "ZERO NFS client
+    I/O" - never reaching the CIFS statistics at all. Observed on var203,
+    2026-08-26.
+    """
+    rc, out = _run_cifs_gate(tmp_path, (100, 10, 5), (400, 40, 25), "1")
+    assert "ZERO NFS client I/O" not in out, out
+    assert "NFS client I/O through /mnt/smbtest" not in out, (
+        "a CIFS mount was measured as NFS: %s" % out)
+    assert "CIFS" in out, out
+
+
+def test_cifs_traffic_passes_and_is_scoped_to_this_share(tmp_path):
+    rc, out = _run_cifs_gate(tmp_path, (100, 10, 5), (400, 40, 25), "1")
+    assert rc == 0, out
+    assert "PASS" in out and "CIFS client I/O through /mnt/smbtest" in out, out
+    total = re.search(r"during the window: (\d+) operations", out)
+    assert total, out
+    # 300 SMBs + 30 reads + 20 writes, from THIS share's section only. The
+    # global "Total vfs operations" is correctly excluded by scoping, and the
+    # busy second share (999999 SMBs, unchanged) contributes nothing.
+    assert int(total.group(1)) == 350, (
+        "counters were not scoped to this share: %s" % out)
+    assert "999999" not in out, "the other share's counters leaked in"
+
+
+def test_idle_cifs_mount_fails_when_traffic_is_required(tmp_path):
+    rc, out = _run_cifs_gate(tmp_path, (100, 10, 5), (100, 10, 5), "1")
+    assert rc != 0, out
+    assert "ZERO CIFS client I/O" in out, out
+
+
+def test_idle_cifs_mount_accepted_only_when_explicitly_requested(tmp_path):
+    rc, out = _run_cifs_gate(tmp_path, (100, 10, 5), (100, 10, 5), "0")
+    assert rc == 0
+    assert "ACCEPTED" in out and "ZERO CIFS" in out, out
+
+
+def test_cifs_without_usable_stats_fails_closed(tmp_path):
+    """If /proc/fs/cifs/Stats is unavailable the run is inconclusive - it must
+    not silently pass, and must not claim to have measured NFS."""
+    logs = tmp_path / "logs"
+    logs.mkdir(exist_ok=True)
+    (logs / "mountstats-window-start.txt").write_text(LAB_MOUNTSTATS % (100, 50))
+    (logs / "mountstats-after.txt").write_text(LAB_MOUNTSTATS % (999, 999))
+    (logs / "cifs-window-start.txt").write_text("")
+    (logs / "cifs-window-end.txt").write_text("")
+    proc = subprocess.run(
+        [sys.executable, "-c", _workload_gate_source(), str(tmp_path),
+         "/mnt/smbtest", "1"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120)
+    out = proc.stdout.decode()
+    assert proc.returncode != 0, out
+    assert "INCONCLUSIVE" in out and "fstype cifs" in out, out
+    assert "ZERO NFS" not in out
+
+
+def test_nfs_mount_still_measured_from_mountstats(tmp_path):
+    """The NFS path must keep working now that dispatch is fstype-driven."""
+    logs = tmp_path / "logs"
+    logs.mkdir(exist_ok=True)
+    (logs / "mountstats-window-start.txt").write_text(LAB_MOUNTSTATS % (100, 50))
+    (logs / "mountstats-after.txt").write_text(LAB_MOUNTSTATS % (67146, 30027))
+    (logs / "cifs-window-start.txt").write_text("")
+    (logs / "cifs-window-end.txt").write_text("")
+    proc = subprocess.run(
+        [sys.executable, "-c", _workload_gate_source(), str(tmp_path),
+         "/mnt/var204-nfs3", "1"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120)
+    out = proc.stdout.decode()
+    assert proc.returncode == 0, out
+    assert "NFS client I/O through /mnt/var204-nfs3" in out, out
+
+
 def test_absent_counters_fail_closed_when_traffic_is_required(tmp_path):
     """The shipped gate exited 0 here, so a run with no measurable client
     I/O at all was accepted as proof of work."""

@@ -229,71 +229,152 @@ if [ -n "$WORKLOAD_MOUNT" ]; then
 import io, os, re, sys
 run, mnt, require = sys.argv[1], sys.argv[2], sys.argv[3] != "0"
 
+LOGS = os.path.join(run, "logs")
+_DEVICE = re.compile(r"^device (\S+) mounted on (\S+) with fstype (\S+)")
+# Monotonic per-share counters in /proc/fs/cifs/Stats. Deliberately counters,
+# not byte totals, so the number reported is comparable to the NFS op count.
+_CIFS_OPS = ("SMBs", "Reads", "Writes", "Flushes", "Opens", "Closes",
+             "Deletes", "Renames", "Locks", "HardLinks", "Symlinks",
+             "Mkdirs", "Rmdirs", "Total vfs operations")
 
-def nfs_ops(path):
-    """Per-op counters for exactly one NFS mount, or None if not NFS."""
+
+def mount_identity(path, mount_point):
+    """(fstype, device) for exactly this mount point.
+
+    The fstype token on the device line is the ONLY unambiguous
+    discriminator. A previous version inferred "NFS" from the presence of
+    the "mounted on <mnt>" marker alone - which a CIFS mount also has - so
+    /mnt/smbtest was parsed as NFS, found no per-op counters, and reported
+    "ZERO NFS client I/O" instead of ever consulting the CIFS statistics.
+    """
     try:
-        txt = io.open(path).read()
+        text = io.open(path).read()
+    except IOError:
+        return None, None
+    for line in text.splitlines():
+        m = _DEVICE.match(line)
+        if m and m.group(2) == mount_point:
+            return m.group(3).lower(), m.group(1)
+    return None, None
+
+
+def nfs_ops(path, mount_point):
+    """Per-op counters for one NFS mount. Only ever called for fstype nfs*."""
+    try:
+        text = io.open(path).read()
     except IOError:
         return None
-    marker = "mounted on %s" % mnt
-    if marker not in txt:
+    marker = "mounted on %s with fstype" % mount_point
+    if marker not in text:
         return None
-    sec = txt.split(marker)[1].split("device")[0]
+    section = text.split(marker, 1)[1].split("\ndevice ", 1)[0]
     out = {}
     for op in ("READ", "WRITE", "GETATTR", "SETATTR", "LOOKUP", "CREATE",
                "REMOVE", "MKDIR", "ACCESS", "COMMIT"):
-        m = re.search(op + r":\s*\n?\s*([0-9]+)", sec)
+        m = re.search(r"\b" + op + r":\s*\n?\s*([0-9]+)", section)
         if m:
             out[op] = int(m.group(1))
-    return out
+    return out or None
 
 
-def cifs_total(path):
+def _cifs_share_key(device):
+    r"""//host/share -> \\host\share, as /proc/fs/cifs/Stats spells it."""
+    return (device or "").replace("/", "\\")
+
+
+def cifs_ops(path, device):
+    """Counters for one CIFS share from a /proc/fs/cifs/Stats capture.
+
+    Scoped to the share when its section can be found, so a second mount to
+    another server cannot be mistaken for traffic on this one.
+    """
     try:
-        txt = io.open(path).read()
+        text = io.open(path).read()
     except IOError:
         return None
-    nums = [int(n) for n in re.findall(r"(?:Reads|Writes):\s*(\d+)", txt)]
-    smbs = [int(n) for n in re.findall(r"SMBs:\s*(\d+)", txt)]
-    if not nums and not smbs:
+    if not text.strip():
         return None
-    return sum(nums) + sum(smbs)
+    want = _cifs_share_key(device).lower()
+    section, current, matched = [], [], False
+    for line in text.splitlines():
+        header = re.match(r"^\s*\d+\)\s+(\S+)", line)
+        if header:
+            if matched:
+                break
+            current = []
+            matched = want and header.group(1).lower() == want
+            continue
+        (section if matched else current).append(line)
+    body = "\n".join(section) if matched else text
+    out = {}
+    for name in _CIFS_OPS:
+        total = 0
+        found = False
+        for m in re.finditer(re.escape(name) + r":\s*(\d+)", body):
+            total += int(m.group(1))
+            found = True
+        if found:
+            out[name] = total
+    return out or None
 
 
-before = nfs_ops(os.path.join(run, "logs", "mountstats-window-start.txt"))
-after = nfs_ops(os.path.join(run, "logs", "mountstats-after.txt"))
-total, kind = None, None
-if before is not None and after is not None:
-    kind, total = "NFS", 0
-    for k in sorted(before):
-        d = after.get(k, before[k]) - before[k]
+def delta(before, after):
+    """Summed non-negative deltas; a counter reset must not read as work."""
+    total = 0
+    for key in sorted(before):
+        d = after.get(key, before[key]) - before[key]
+        if d < 0:
+            d = 0
         total += d
-        print("  %-8s delta %10d" % (k, d))
+        print("  %-22s delta %10d" % (key, d))
+    return total
+
+
+fstype, device = mount_identity(
+    os.path.join(LOGS, "mountstats-window-start.txt"), mnt)
+kind, total = None, None
+
+if fstype in ("nfs", "nfs4"):
+    before = nfs_ops(os.path.join(LOGS, "mountstats-window-start.txt"), mnt)
+    after = nfs_ops(os.path.join(LOGS, "mountstats-after.txt"), mnt)
+    if before is not None and after is not None:
+        kind, total = "NFS", delta(before, after)
+elif fstype in ("cifs", "smb3", "smb2"):
+    before = cifs_ops(os.path.join(LOGS, "cifs-window-start.txt"), device)
+    after = cifs_ops(os.path.join(LOGS, "cifs-window-end.txt"), device)
+    if before is not None and after is not None:
+        kind, total = "CIFS", delta(before, after)
+    else:
+        print("  no usable /proc/fs/cifs/Stats counters for %s" % (device or mnt))
+        print("  (the CIFS section of mountstats carries no counters at all,")
+        print("   so Stats is the only client-side source for an SMB mount)")
+elif fstype is None:
+    print("  %s is not present in the mountstats capture" % mnt)
 else:
-    b = cifs_total(os.path.join(run, "logs", "cifs-window-start.txt"))
-    a = cifs_total(os.path.join(run, "logs", "cifs-window-end.txt"))
-    if b is not None and a is not None:
-        kind, total = "CIFS", a - b
-        print("  CIFS SMB/read/write counter delta: %d" % total)
+    print("  %s is fstype '%s' - not a network mount this gate can measure"
+          % (mnt, fstype))
 
 if total is None:
     tag = "FAIL    " if require else "ACCEPTED"
-    print("%s: INCONCLUSIVE - no client-side counters for %s." % (tag, mnt))
+    print("%s: INCONCLUSIVE - no client-side counters for %s%s."
+          % (tag, mnt, " (fstype %s)" % fstype if fstype else ""))
     if require:
-        print("          Absence of counters is not evidence of work. Check")
+        print("          Absence of counters is not evidence of work. Confirm")
         print("          the mount is present and of the expected type, or")
-        print("          set OPSTAT_FR14_REQUIRE_TRAFFIC=0 to accept")
-        print("          cluster-side attribution as the only evidence.")
+        print("          set OPSTAT_FR14_REQUIRE_TRAFFIC=0 to accept the")
+        print("          validator's cluster-side attribution as the only")
+        print("          workload evidence for this run.")
     else:
         print("          OPSTAT_FR14_REQUIRE_TRAFFIC=0 was set, so the")
         print("          validator's cluster-side 'live_traffic' checks are")
         print("          the ONLY workload evidence for this run.")
     sys.exit(5 if require else 0)
+
 if total > 0:
     print("PASS    : %s client I/O through %s during the window: %d operations"
           % (kind, mnt, total))
     sys.exit(0)
+
 tag = "FAIL    " if require else "ACCEPTED"
 print("%s: ZERO %s client I/O through %s during the validation window."
       % (tag, kind, mnt))
@@ -308,6 +389,7 @@ else:
     print("          is accepted ON PURPOSE. It validates idle behaviour")
     print("          ONLY - it is NOT evidence about behaviour under load.")
 sys.exit(4 if require else 0)
+
 WORKEOF
   WORK_RC=${PIPESTATUS[0]}
   if [ "$WORK_RC" -eq 0 ]; then
