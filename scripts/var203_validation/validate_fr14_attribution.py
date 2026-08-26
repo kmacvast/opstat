@@ -49,6 +49,13 @@ import vast_common                                          # noqa: E402
 SUMMARY = []
 _ANSI = re.compile(r"\033\[[0-9;?]*[A-Za-z]")
 
+# A contamination check over an EMPTY drill is vacuous: "no foreign object
+# appears" is trivially true when nothing appears at all. So an engine whose
+# validation depends on live traffic must prove the cluster attributed some
+# to that protocol during the window, or the run is not evidence. Set
+# OPSTAT_FR14_REQUIRE_TRAFFIC=0 only for a deliberate idle-behaviour run.
+REQUIRE_TRAFFIC = os.environ.get("OPSTAT_FR14_REQUIRE_TRAFFIC", "1") != "0"
+
 
 def log(msg):
     print(msg, flush=True)
@@ -155,6 +162,29 @@ def foreign_sets(protocol):
             mine_paths, mine_tenants)
 
 
+def attributed_iops(protocol):
+    """Total IOPS the cluster attributes to *protocol* right now."""
+    rows = nfs4_native.parse_host_view(
+        vast_common.request_text("GET", nfs4_native.HOST_VIEW_ENDPOINT),
+        protocol)
+    return sum(r.get("iops") or 0.0 for r in rows)
+
+
+def require_live_traffic(tag, protocol):
+    """Hard gate: without attributed traffic the contamination checks below
+    cannot distinguish a correct drill from an empty one."""
+    total = attributed_iops(protocol)
+    ok = total > 0 or not REQUIRE_TRAFFIC
+    verdict("%s.live_traffic" % tag, ok,
+            "%s attributed %.2f IOPS during the window%s"
+            % (protocol, total,
+               "" if total > 0 else
+               " - the contamination checks would be VACUOUS; drive load "
+               "through this cluster, or set "
+               "OPSTAT_FR14_REQUIRE_TRAFFIC=0 to accept an idle run"))
+    return total > 0
+
+
 def assert_no_foreign(tag, frame, foreign, mine, kind):
     """No other protocol's object may appear; at least one of ours should."""
     leaked = sorted(f for f in foreign if f and f in frame)
@@ -163,10 +193,14 @@ def assert_no_foreign(tag, frame, foreign, mine, kind):
             else "checked %d foreign %s from the live exposition"
                  % (len(foreign), kind))
     shown = sorted(m for m in mine if m and m in frame)
-    verdict("%s.own_%s_present" % (tag, kind), bool(shown) or not mine,
+    # `or not mine` is an escape hatch ONLY for an explicitly-accepted idle
+    # run. With traffic required, an empty drill is a failure, not a pass:
+    # otherwise a run with no traffic satisfies every assertion above.
+    lenient = (not mine) and not REQUIRE_TRAFFIC
+    verdict("%s.own_%s_present" % (tag, kind), bool(shown) or lenient,
             "shown=%s" % (shown[:5],) if shown
-            else "no %s carried %s traffic during the window (idle window)"
-                 % (kind, tag))
+            else "NO %s carried this protocol's traffic - the 'no foreign %s' "
+                 "check above is vacuous" % (kind, kind))
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +217,7 @@ def validate_smb(vms, port):
     verdict("smb.cluster_telemetry", bool(smb.LAST_ROWS),
             "headline rows populated")
 
+    require_live_traffic("smb", "SMB2")
     foreign_p, foreign_t, mine_p, mine_t = foreign_sets("SMB2")
     log("  live exposition: %d SMB2 paths, %d foreign paths"
         % (len(mine_p), len(foreign_p)))
@@ -221,6 +256,16 @@ def validate_nfs_v3(vms, port):
     nfs_v3.fetch_monitor_query()
     verdict("nfs_v3.cluster_telemetry", bool(nfs_v3.LAST_ROWS),
             "cluster-level NFSv3 telemetry still available")
+    # "Cluster-level NFSv3 telemetry remains available" is the promise the
+    # capability notice makes. Rows full of zeros do not demonstrate it, so
+    # require the cluster to be reporting real NFSv3 work. host_view cannot
+    # supply this proof - not attributing NFS3 is the FR14 finding - so the
+    # headline path is the evidence.
+    ops = sum(float(r.get("ops_sec") or 0.0) for r in (nfs_v3.LAST_ROWS or []))
+    verdict("nfs_v3.live_traffic", ops > 0 or not REQUIRE_TRAFFIC,
+            "cluster NFSv3 headline total %.2f ops/s%s" % (ops,
+            "" if ops > 0 else " - no NFSv3 workload reached THIS cluster; "
+            "the 'cluster telemetry still available' claim is unproven"))
 
     for mode, marker in (("view", nfs_v3.VIEW_UNAVAILABLE_MARKER),
                          ("tenant", nfs_v3.TENANT_UNAVAILABLE_MARKER)):
@@ -245,6 +290,7 @@ def validate_nfs_v41(vms, port):
     nfs_v41.fetch_monitor_query()
     verdict("nfs_v41.cluster_telemetry", bool(nfs_v41.LAST_ROWS))
 
+    require_live_traffic("nfs_v41", "NFS4")
     foreign_p, foreign_t, mine_p, mine_t = foreign_sets("NFS4")
     log("  live exposition: %d NFS4 paths, %d foreign paths"
         % (len(mine_p), len(foreign_p)))

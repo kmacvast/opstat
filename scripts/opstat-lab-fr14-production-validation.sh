@@ -78,10 +78,15 @@ section "3. credentials and load generator"
 if [ -n "${VAST_TOKEN:-}" ]; then pass "credential: VAST_TOKEN present"
 elif [ -n "${VAST_PASSWORD:-}" ]; then pass "credential: VAST_PASSWORD present"
 else err "no VAST_TOKEN/VAST_PASSWORD in environment - aborting before any cluster contact"; exit 1; fi
+# PRESENCE ONLY - NOT workload proof. A service can be active and driving a
+# DIFFERENT cluster (the lab's nfs3-loadgen targets 172.200.202.x). The real
+# gates are section 6 (client I/O through this mount) and the validator's own
+# per-protocol attribution check.
 state=$(systemctl is-active "$LOADGEN.service" 2>&1)
-if [ "$state" = "active" ]; then pass "$LOADGEN active"; else
-  err "$LOADGEN is $state - attribution must be validated against LIVE load; aborting"
-  exit 1
+if [ "$state" = "active" ]; then
+  pass "$LOADGEN is active (prerequisite only - not proof of traffic to $VMS)"
+else
+  warn "$LOADGEN is $state - not fatal by itself; the workload gates below decide"
 fi
 systemctl status "$LOADGEN.service" --no-pager -l > "$RUN/logs/loadgen-status.txt" 2>&1
 
@@ -160,8 +165,29 @@ PYEOF
   || err "TARGET MISMATCH: $WORKLOAD_IP is not owned by $VMS - this run is NOT evidence"
 [ "$OWNER_RC" -eq 0 ] || exit 1
 
-# ------------------------------ 6. production-path validation, in-process
-section "6. FR14 attribution validation (production engines)"
+# ------------- 6. client-side workload proof through the EXACT mount --------
+# Ownership (3b/5) proves the mount points at this cluster. It does NOT prove
+# any I/O flowed. This measures it, over a window that brackets the
+# validation, on the specific mount named for this run. Bypass with
+# OPSTAT_FR14_REQUIRE_TRAFFIC=0 for a deliberate idle-behaviour run.
+section "6. client-side workload proof"
+REQUIRE_TRAFFIC="${OPSTAT_FR14_REQUIRE_TRAFFIC:-1}"
+WORKLOAD_MOUNT=""
+case "$LOADGEN" in
+  nfs3-loadgen|nfs41-loadgen) WORKLOAD_MOUNT="$NFS3_MOUNT" ;;
+  smb-loadgen)                WORKLOAD_MOUNT="$SMB_MOUNT" ;;
+esac
+if [ -n "$WORKLOAD_MOUNT" ]; then
+  say "measuring client I/O through $WORKLOAD_MOUNT across the validation window"
+  cat /proc/self/mountstats > "$RUN/logs/mountstats-window-start.txt" 2>/dev/null
+  cat /proc/fs/cifs/Stats  > "$RUN/logs/cifs-window-start.txt" 2>/dev/null || \
+    : > "$RUN/logs/cifs-window-start.txt"
+else
+  warn "no client mount associated with '$LOADGEN' - client-side proof skipped"
+fi
+
+# ------------------------------ 7. production-path validation, in-process
+section "7. FR14 attribution validation (production engines)"
 echo "command: OPSTAT_VMS=$VMS OPSTAT_FR14_ENGINES=$ENGINES python3 scripts/var203_validation/validate_fr14_attribution.py" \
   | tee "$RUN/logs/exact-command.txt"
 python3 scripts/var203_validation/validate_fr14_attribution.py \
@@ -176,8 +202,99 @@ grep '^CHECK:.* FAIL' "$RUN/validate-output.txt" > "$RUN/logs/failed-checks.txt"
   : > "$RUN/logs/failed-checks.txt"
 
 # ------------------------------------------ 7. post-run captures + policy
-section "7. post-run capture and /tmp policy check"
+section "8. post-run capture, workload delta and /tmp policy check"
 cat /proc/self/mountstats > "$RUN/logs/mountstats-after.txt" 2>/dev/null
+cat /proc/fs/cifs/Stats  > "$RUN/logs/cifs-window-end.txt" 2>/dev/null || \
+  : > "$RUN/logs/cifs-window-end.txt"
+
+# ---- the gate: did real client I/O flow through THIS mount in the window? --
+# Mount ownership proves where the mount points. This proves work actually
+# went through it while the validation ran. Without it, an idle mount on the
+# right cluster reads exactly like a busy one.
+if [ -n "$WORKLOAD_MOUNT" ]; then
+  python3 - "$RUN" "$WORKLOAD_MOUNT" "$REQUIRE_TRAFFIC" <<'WORKEOF' | tee "$RUN/workload-proof.txt"
+import io, os, re, sys
+run, mnt, require = sys.argv[1], sys.argv[2], sys.argv[3] != "0"
+
+
+def nfs_ops(path):
+    """Per-op counters for exactly one NFS mount, or None if not NFS."""
+    try:
+        txt = io.open(path).read()
+    except IOError:
+        return None
+    marker = "mounted on %s" % mnt
+    if marker not in txt:
+        return None
+    sec = txt.split(marker)[1].split("device")[0]
+    out = {}
+    for op in ("READ", "WRITE", "GETATTR", "SETATTR", "LOOKUP", "CREATE",
+               "REMOVE", "MKDIR", "ACCESS", "COMMIT"):
+        m = re.search(op + r":\s*\n?\s*([0-9]+)", sec)
+        if m:
+            out[op] = int(m.group(1))
+    return out
+
+
+def cifs_total(path):
+    try:
+        txt = io.open(path).read()
+    except IOError:
+        return None
+    nums = [int(n) for n in re.findall(r"(?:Reads|Writes):\s*(\d+)", txt)]
+    smbs = [int(n) for n in re.findall(r"SMBs:\s*(\d+)", txt)]
+    if not nums and not smbs:
+        return None
+    return sum(nums) + sum(smbs)
+
+
+before = nfs_ops(os.path.join(run, "logs", "mountstats-window-start.txt"))
+after = nfs_ops(os.path.join(run, "logs", "mountstats-after.txt"))
+total, kind = None, None
+if before is not None and after is not None:
+    kind, total = "NFS", 0
+    for k in sorted(before):
+        d = after.get(k, before[k]) - before[k]
+        total += d
+        print("  %-8s delta %10d" % (k, d))
+else:
+    b = cifs_total(os.path.join(run, "logs", "cifs-window-start.txt"))
+    a = cifs_total(os.path.join(run, "logs", "cifs-window-end.txt"))
+    if b is not None and a is not None:
+        kind, total = "CIFS", a - b
+        print("  CIFS SMB/read/write counter delta: %d" % total)
+
+if total is None:
+    print("INCONCLUSIVE: no client-side counters for %s. The validator's "
+          "cluster-side 'live_traffic' checks are then the ONLY workload "
+          "evidence for this run." % mnt)
+    sys.exit(0)
+if total > 0:
+    print("PASS    : %s client I/O through %s during the window: %d operations"
+          % (kind, mnt, total))
+    sys.exit(0)
+tag = "FAIL    " if require else "ACCEPTED"
+print("%s: ZERO %s client I/O through %s during the validation window."
+      % (tag, kind, mnt))
+if require:
+    print("          The mount is idle, so this run proves nothing about")
+    print("          protocol behaviour under load. Drive a workload through")
+    print("          %s and re-run, or set" % mnt)
+    print("          OPSTAT_FR14_REQUIRE_TRAFFIC=0 to validate idle")
+    print("          behaviour deliberately.")
+else:
+    print("          OPSTAT_FR14_REQUIRE_TRAFFIC=0 was set, so this idle run")
+    print("          is accepted ON PURPOSE. It validates idle behaviour")
+    print("          ONLY - it is NOT evidence about behaviour under load.")
+sys.exit(4 if require else 0)
+WORKEOF
+  WORK_RC=${PIPESTATUS[0]}
+  if [ "$WORK_RC" -eq 0 ]; then
+    pass "client-side workload proof accepted"
+  else
+    err "NO CLIENT WORKLOAD through $WORKLOAD_MOUNT - this run is not evidence"
+  fi
+fi
 ls -1 /tmp/opstat-* > "$RUN/logs/tmp-after.txt" 2>/dev/null || : > "$RUN/logs/tmp-after.txt"
 NEW_TMP=$(comm -13 "$RUN/logs/tmp-before.txt" "$RUN/logs/tmp-after.txt")
 if [ -n "$NEW_TMP" ]; then
@@ -199,7 +316,7 @@ if [ -n "$API_IN_TREE" ]; then
 fi
 
 # --------------------------------------------- 8. final git state + manifest
-section "8. manifest"
+section "9. manifest"
 { git log --oneline -3; git status --short; } > "$RUN/git-final-state.txt"
 {
   echo "opstat FR14 production validation - $DTS"
@@ -222,7 +339,7 @@ section "8. manifest"
 cat "$RUN/MANIFEST.txt"
 
 # --------------------------------------- 9. package, verify, hand back
-section "9. package"
+section "10. package"
 ( cd "$(dirname "$RUN")" && zip -qr "$ZIP" "$(basename "$RUN")" )
 if unzip -tq "$ZIP" >/dev/null 2>&1; then pass "ZIP integrity verified"; else err "ZIP failed integrity check"; fi
 echo; unzip -l "$ZIP" | tail -8
