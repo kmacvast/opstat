@@ -19,10 +19,13 @@ belongs in [AGENTS.md](../../AGENTS.md).
 - Every record states what would justify reopening it. If that condition
   occurs, reopening is expected, not forbidden.
 
-All records below were established during the `refactor/tui-performance` effort
+D-001 to D-013 were established during the `refactor/tui-performance` effort
 against a real cluster running **VAST OS 5.5.0.1** (3 cNodes, 429 views, 38–39
-tenants), and recorded on 2026-08-13. Where a finding is version-specific, the
-record says so.
+tenants), and recorded on 2026-08-13. D-014 onward were recorded later, some
+against **VAST OS 5.4.6.0** (var203) as well as 5.5.0.1 (var204); each states
+its own cluster and date. Where a finding is version-specific, the record says
+so — and D-016 is the standing reminder that a capability must be decided from
+demonstrated telemetry behaviour, never from a version string.
 
 ## Index
 
@@ -41,3 +44,9 @@ record says so.
 | [D-011](D-011-newest-complete-sample-scoped-per-family.md) | Select the newest *complete* sample, scoped per metric family | Telemetry correctness |
 | [D-012](D-012-terminology-v4-hosts.md) | The NFSv4 client-attribution drill is called "v4 hosts" | Terminology |
 | [D-013](D-013-nvme-drill-batching-is-scope-dependent.md) | NVMe drill batching is scope-dependent and must be response-validated | API efficiency |
+| [D-014](D-014-host-view-latency-gauges-are-milliseconds.md) | `host_view` latency gauges are milliseconds, converted at ingestion | Telemetry semantics |
+| [D-015](D-015-catalog-units-field-is-display-convention.md) | The `/metrics/` catalog `units` field is a display convention, not the wire unit | Telemetry semantics |
+| [D-016](D-016-nfsv3-view-attribution-unavailable-on-546.md) | The NFSv3 VIEW drill presents an honest unavailable state where no valid source exists | Evidence |
+| [D-017](D-017-nfs41-delegation-lookup-wire-contract.md) | The NFSv4.1 delegation lookup wire contract | Telemetry provenance |
+| [D-018](D-018-compatibility-policy.md) | What opstat keeps compatible across releases | Compatibility |
+| [D-019](D-019-host-view-smb2-is-the-smb-attribution-source.md) | `host_view` `protocol=SMB2` is the SMB view and tenant attribution source | Telemetry provenance |

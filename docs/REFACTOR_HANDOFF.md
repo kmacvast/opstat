@@ -210,10 +210,15 @@ Fully refactored and validated against the real cluster.
   fallback.
 - Drill panel states attribution coverage honestly rather than scaling numbers.
 
-**Open item:** the NFSv3 VIEW drill still uses `ViewMetrics`. The same
-attribution weakness found for NFSv4.1 may apply — `host_view` carries
-`protocol=NFS3` series, so the exporter-backed rebuild done for NFSv4.1 is
-directly portable. Not yet investigated for v3.
+**RESOLVED (FR1/D-016, and FR14 2026-08-26).** The NFSv3 VIEW drill no
+longer uses `ViewMetrics`: it renders an honest capability notice at zero API
+cost. The prediction recorded here — that the NFSv4.1 `host_view` rebuild was
+"directly portable" because `host_view` carries `protocol=NFS3` — was
+investigated and **refuted**. The label exists; usable per-view attribution
+does not. On var204/5.5.0.1 under a proven 44,531 ops/s first-party NFSv3
+load through the exact target mount, `host_view` attributed none of it, while
+NFSv4 traffic from the same client to the same subtree WAS attributed in the
+same window. See [D-016](decisions/D-016-nfsv3-view-attribution-unavailable-on-546.md).
 
 ---
 
@@ -808,8 +813,11 @@ below are tracked there by FR number.
    `vast_drill.dispatch_queued_keys` + per-engine `_dispatch_key`;
    multi-key buffers regression-tested per engine
    (`tests/test_key_dispatch.py`, 25 tests).
-3. **NFSv3 VIEW drill** still uses `ViewMetrics`. The NFSv4.1 rebuild on
-   `host_view` may be portable — `host_view` carries `protocol=NFS3`.
+3. ~~**NFSv3 VIEW drill** still uses `ViewMetrics`~~ **RESOLVED** — it is an
+   honest capability notice (FR1/D-016). The hoped-for `host_view` port was
+   refuted by first-party evidence on var204/5.5.0.1 (FR14): the
+   `protocol=NFS3` label exists but does not attribute a controlled NFSv3
+   workload. NFSv3 TENANT joined it as a notice for the same reason (FR14).
 4. **Delegation diagnostic** not implemented. Needs a path-entry interaction.
 5. **Synchronous exporter scrape stalls the TUI** for 1.2–2.4 s on entry. A
    loading frame makes it legible, but whether that is acceptable in practice

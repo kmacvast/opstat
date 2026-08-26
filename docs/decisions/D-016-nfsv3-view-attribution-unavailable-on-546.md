@@ -88,6 +88,41 @@ conclusion is narrower than "host_view never carries NFS3":
 > but a proven ~5–6k ops/s NFSv3 load produced no attribution on the
 > 5.5.0.1 build.
 
+## 2026-08-26 production validation (appended; both records above stand)
+
+The corrective probe used a standalone scrape. This run drove the PRODUCTION
+engines against var204/5.5.0.1 through the committed FR14 validator, under a
+first-party NFSv3 workload proven through the exact target mount
+(`/mnt/var204-nfs3`, 105,548 client operations measured across the window),
+and it is the strongest form of this finding yet:
+
+| Check | Result |
+|---|---|
+| Cluster NFSv3 headline under load | **44,531 ops/s** - the cluster is unambiguously busy with NFSv3 |
+| `host_view` per-view NFSv3 attribution of that load | **none** |
+| `host_view` NFSv4 attribution, same cluster, same window | **294.95 IOPS**, attributed to `/`, `/kmacs/nfstest`, `/tx-tenant-csi` |
+| NFSv3 VIEW drill | capability notice, **0 API calls** |
+| NFSv3 TENANT drill | capability notice, **0 API calls** |
+
+So the exporter was working, and attributing, for another protocol on the same
+cluster in the same window - it simply did not attribute the NFSv3 workload.
+That removes the last benign explanation (an idle window, a broken scrape, a
+wrong cluster) for the negative result.
+
+**The conclusion is unchanged and still deliberately narrow.** `host_view`
+*can* carry `protocol=NFS3` rows - var203/5.4.6 was observed attributing a
+third-party tenant's background NFSv3 writes. What neither validated cluster
+provides is *usable per-view attribution of a controlled NFSv3 workload*.
+That distinction is the whole finding: presence of a label is not a
+capability.
+
+**Capability must therefore be decided from demonstrated telemetry behaviour,
+never from a version string.** var204 runs the 5.5.0.1-class build this record
+once expected to answer the question, and it does not. `view_attribution_source()`
+and its FR14 sibling `tenant_attribution_source()` stay deterministic `None`
+until a build demonstrably attributes a controlled workload under live
+validation.
+
 **Decision unchanged.** The honest unavailable notice remains the correct
 production behavior on both validated capability shapes, and
 `view_attribution_source()` remains deterministic `None`. Enablement still
