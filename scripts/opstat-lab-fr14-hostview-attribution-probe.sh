@@ -75,9 +75,18 @@ section "3. credentials and load generator"
 if [ -n "${VAST_TOKEN:-}" ]; then pass "credential: VAST_TOKEN present"
 elif [ -n "${VAST_PASSWORD:-}" ]; then pass "credential: VAST_PASSWORD present"
 else err "no VAST_TOKEN/VAST_PASSWORD in environment - aborting before any cluster contact"; exit 1; fi
+# PRESENCE ONLY - never proof. The lab's s3-loadgen is active while pointed
+# at another cluster entirely, which is the failure this probe exists to
+# prevent. The real gate is the /vips/ ownership check below. When the
+# caller supplies OPSTAT_WORKLOAD_IP (a temporary first-party workload with
+# no systemd unit), an inactive service is not a reason to abort.
 state=$(systemctl is-active "$LOADGEN.service" 2>&1)
-if [ "$state" = "active" ]; then pass "$LOADGEN active"; else
-  err "$LOADGEN is $state - attribution must be probed against LIVE load; aborting"
+if [ "$state" = "active" ]; then
+  pass "$LOADGEN is active (prerequisite only - not proof of traffic to $VMS)"
+elif [ -n "${OPSTAT_WORKLOAD_IP:-}" ]; then
+  warn "$LOADGEN is $state - caller supplied an explicit workload target; ownership still gates this run"
+else
+  err "$LOADGEN is $state and no OPSTAT_WORKLOAD_IP was supplied - nothing proves a workload exists; aborting"
   exit 1
 fi
 systemctl status "$LOADGEN.service" --no-pager -l > "$RUN/logs/loadgen-status.txt" 2>&1
@@ -89,8 +98,16 @@ systemctl status "$LOADGEN.service" --no-pager -l > "$RUN/logs/loadgen-status.tx
 # this address is owned by the probed VMS (checked against live /vips/).
 # This wrapper only DERIVES and REPORTS; it repairs nothing.
 section "3b. workload target derivation"
-WORKLOAD_IP=""
-case "$LOADGEN" in
+# An explicitly supplied target wins: a controlled first-party workload is
+# not described by any systemd unit. This does NOT weaken anything - the
+# address still has to be owned by the probed VMS (section 5), which is the
+# check that actually decides whether this run is evidence.
+WORKLOAD_IP="${OPSTAT_WORKLOAD_IP:-}"
+if [ -n "$WORKLOAD_IP" ]; then
+  pass "workload target supplied explicitly: $WORKLOAD_IP (ownership still enforced)"
+fi
+case "${WORKLOAD_IP:+supplied}${WORKLOAD_IP:-$LOADGEN}" in
+  supplied) ;;
   nfs3-loadgen|nfs41-loadgen)
     SRC=$(findmnt -no SOURCE "$NFS3_MOUNT" 2>/dev/null)
     WORKLOAD_IP="${SRC%%:*}"
