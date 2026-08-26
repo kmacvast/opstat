@@ -177,21 +177,53 @@ def correlate_candidates(refs, pools, index, s3_capable, view_id=None):
     hint into `s3_evidence` is precisely the inference this whole exercise
     exists to refuse, so it is done in one place and regression-tested.
     """
-    candidates = []
+    # A pool is typically referenced BOTH by id ("87") and by name
+    # ("mars-k8s-vip-qe"); both resolve to the same pool record, so iterating
+    # refs naively emitted every VIP twice. Identity is (ip, canonical pool),
+    # deduplicated here in the data rather than hidden at print time - the
+    # JSON is the evidence, and a duplicated row misreads as two findings.
+    # A pool is typically referenced BOTH by id ("87") and by name
+    # ("mars-k8s-vip-qe"), and both resolve to the same VIPs. The stable
+    # identity of a CANDIDATE is therefore the address: one endpoint reached
+    # two ways is one endpoint. Deduplicated here in the data, not at print
+    # time - the JSON is the evidence, and a repeated row reads as two
+    # independent findings. Every reference that reached it is still recorded.
+    by_ip = {}
+    order = []
     for ref in sorted(refs or []):
         pool = (pools or {}).get(str(ref)) or {}
+        resolved = bool(pool)
         pid = pool.get("id", ref)
         pname = pool.get("name", ref)
         for ip in pool_vips(index, pid, pname):
-            candidates.append({
-                "ip": ip, "pool_id": pid, "pool_name": pname,
-                "owned_by_cluster": True,
-                "s3_evidence": sorted((s3_capable or {}).get(ip, [])),
-                "pool_name_hint": "s3" in str(pname).lower(),
-                "chain": "view %s -> pool %s (%s) -> vip" % (view_id, pid, pname),
-            })
+            row = by_ip.get(ip)
+            if row is None:
+                row = {
+                    "ip": ip, "pool_id": pid, "pool_name": pname,
+                    "owned_by_cluster": True,
+                    "s3_evidence": sorted((s3_capable or {}).get(ip, [])),
+                    "pool_name_hint": "s3" in str(pname).lower(),
+                    "reached_via": [str(ref)],
+                    "chain": "view %s -> pool %s (%s) -> vip"
+                             % (view_id, pid, pname),
+                }
+                by_ip[ip] = row
+                order.append(ip)
+                continue
+            if str(ref) not in row["reached_via"]:
+                row["reached_via"].append(str(ref))
+            # Prefer the identity that came from an actual pool record.
+            if resolved and not isinstance(row["pool_id"], int):
+                row["pool_id"], row["pool_name"] = pid, pname
+                row["chain"] = ("view %s -> pool %s (%s) -> vip"
+                                % (view_id, pid, pname))
+            row["pool_name_hint"] = row["pool_name_hint"] or \
+                "s3" in str(pname).lower()
+    candidates = [by_ip[ip] for ip in order]
+    known = set(by_ip)
     for ip, why in sorted((s3_capable or {}).items()):
-        if not any(c["ip"] == ip for c in candidates):
+        if ip not in known:
+            known.add(ip)
             candidates.append({
                 "ip": ip, "pool_id": None, "pool_name": None,
                 "owned_by_cluster": None, "s3_evidence": sorted(why),
@@ -202,8 +234,17 @@ def correlate_candidates(refs, pools, index, s3_capable, view_id=None):
 
 
 def proven_candidates(candidates):
-    """Only rows with affirmative S3 evidence. Ownership is not enough."""
-    return [c for c in candidates or [] if c.get("s3_evidence")]
+    """Only rows with affirmative S3 evidence. Ownership is not enough.
+
+    One row per address: the same VIP reached through two references is one
+    endpoint, and listing it twice reads as two independent findings.
+    """
+    out, seen = [], set()
+    for c in candidates or []:
+        if c.get("s3_evidence") and c["ip"] not in seen:
+            seen.add(c["ip"])
+            out.append(c)
+    return out
 
 
 def pool_refs(obj, seen=None):
@@ -410,7 +451,7 @@ def main():
                  ("id", "path", "bucket", "tenant_id", "tenant_name", "protocols")},
         "policy_id": policy_id, "pool_refs": sorted(refs),
         "candidates": candidates,
-        "proven_s3_capable": [c["ip"] for c in proven],
+        "proven_s3_capable": sorted({c["ip"] for c in proven}),
     }
     try:
         os.makedirs(OUT, exist_ok=True)

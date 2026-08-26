@@ -189,3 +189,76 @@ def test_s3_evidence_outside_the_views_pools_is_still_surfaced():
 def test_no_refs_and_no_evidence_yields_nothing():
     assert d.correlate_candidates(set(), POOLS, INDEX, {}) == []
     assert d.proven_candidates([]) == []
+
+
+# ---------------------------------------------------------------------------
+# Duplication: a pool reached by BOTH id and name is ONE pool
+# ---------------------------------------------------------------------------
+# The literal var203 shape: pool_refs carried "87" and "mars-k8s-vip-qe", both
+# resolving to the same record, so every VIP was emitted twice and
+# proven_s3_capable listed 172.200.13.168 two times.
+MARS_POOLS = {"87": {"id": 87, "name": "mars-k8s-vip-qe"},
+              "mars-k8s-vip-qe": {"id": 87, "name": "mars-k8s-vip-qe"}}
+MARS_INDEX = {"87": ["172.200.13.168"], "mars-k8s-vip-qe": ["172.200.13.168"]}
+MARS_REFS = {"87", "mars-k8s-vip-qe"}
+
+
+def test_a_pool_referenced_by_id_and_name_yields_one_candidate():
+    cands = d.correlate_candidates(MARS_REFS, MARS_POOLS, MARS_INDEX,
+                                   s3_capable={}, view_id=222)
+    assert [c["ip"] for c in cands] == ["172.200.13.168"], cands
+    assert len({(c["ip"], c["pool_id"]) for c in cands}) == 1
+
+
+def test_proven_list_reports_each_endpoint_once():
+    cands = d.correlate_candidates(
+        MARS_REFS, MARS_POOLS, MARS_INDEX,
+        s3_capable={"172.200.13.168": {"vip_view protocol=S3"}}, view_id=222)
+    proven = d.proven_candidates(cands)
+    assert [c["ip"] for c in proven] == ["172.200.13.168"], (
+        "one VIP reached twice is one endpoint, not two findings")
+
+
+def test_dedup_survives_an_unresolvable_reference():
+    """A ref with no pool record must not reintroduce a duplicate row."""
+    pools = {"87": {"id": 87, "name": "mars-k8s-vip-qe"}}   # name key missing
+    index = {"87": ["172.200.13.168"], "mars-k8s-vip-qe": ["172.200.13.168"]}
+    cands = d.correlate_candidates({"87", "mars-k8s-vip-qe"}, pools, index,
+                                   s3_capable={}, view_id=222)
+    assert [c["ip"] for c in cands].count("172.200.13.168") == 1, cands
+
+
+def test_distinct_pools_sharing_no_vip_are_both_kept():
+    """Deduplication must not collapse genuinely different candidates."""
+    cands = d.correlate_candidates({"42", "2"}, POOLS, INDEX,
+                                   s3_capable={}, view_id=222)
+    assert sorted(c["ip"] for c in cands) == ["172.200.13.180", "172.200.203.6"]
+
+
+def test_an_s3_only_address_is_not_duplicated_by_the_extra_pass():
+    """An address already present as a pool candidate must not be appended
+    again by the 'S3 evidence only' pass."""
+    cands = d.correlate_candidates(
+        MARS_REFS, MARS_POOLS, MARS_INDEX,
+        s3_capable={"172.200.13.168": {"vip_view protocol=S3"}}, view_id=222)
+    assert len(cands) == 1, cands
+    assert cands[0]["owned_by_cluster"] is True
+
+
+def test_proven_candidates_dedups_a_duplicated_input_list():
+    """Defence in depth, tested where it bites.
+
+    correlate_candidates no longer produces duplicates, so routing this
+    through it cannot exercise the guard. A caller assembling candidates from
+    another source still must not get one endpoint reported twice.
+    """
+    dup = [
+        {"ip": "172.200.13.168", "s3_evidence": ["vip_view protocol=S3"]},
+        {"ip": "172.200.13.168", "s3_evidence": ["vip_view protocol=S3"]},
+        {"ip": "10.0.0.9", "s3_evidence": ["s3_true_ip_config"]},
+        {"ip": "10.0.0.10", "s3_evidence": []},
+    ]
+    proven = d.proven_candidates(dup)
+    assert [c["ip"] for c in proven] == ["172.200.13.168", "10.0.0.9"], proven
+    assert "10.0.0.10" not in [c["ip"] for c in proven], (
+        "an address with no evidence must never be proven")
