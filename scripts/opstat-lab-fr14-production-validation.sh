@@ -161,9 +161,22 @@ print("  vip literals: %s" % sorted(literals))
 print("  vip ranges  : %s" % ranges)
 sys.exit(0 if owned else 3)
 PYEOF
-[ "$OWNER_RC" -eq 0 ] && pass "workload target $WORKLOAD_IP belongs to $VMS" \
-  || err "TARGET MISMATCH: $WORKLOAD_IP is not owned by $VMS - this run is NOT evidence"
-[ "$OWNER_RC" -eq 0 ] || exit 1
+# Capture BOTH statuses on the very next line - any command in between
+# overwrites PIPESTATUS, and a failed tee means the evidence never landed.
+OWNER_STATUS=("${PIPESTATUS[@]}")   # ONE command: a second read sees it reset
+OWNER_RC=${OWNER_STATUS[0]}
+OWNER_TEE_RC=${OWNER_STATUS[1]:-1}
+if [ "${OWNER_TEE_RC:-1}" -ne 0 ]; then
+  err "could not write $RUN/logs/target-ownership.txt - evidence capture failed"
+  exit 1
+fi
+case "$OWNER_RC" in
+  0) pass "workload target $WORKLOAD_IP belongs to $VMS" ;;
+  3) err "TARGET MISMATCH: $WORKLOAD_IP is not owned by $VMS - this run is NOT evidence"
+     exit 1 ;;
+  *) err "ownership helper failed (rc=$OWNER_RC) - ownership UNPROVEN, refusing to continue"
+     exit 1 ;;
+esac
 
 # ------------- 6. client-side workload proof through the EXACT mount --------
 # Ownership (3b/5) proves the mount points at this cluster. It does NOT prove
@@ -265,10 +278,18 @@ else:
         print("  CIFS SMB/read/write counter delta: %d" % total)
 
 if total is None:
-    print("INCONCLUSIVE: no client-side counters for %s. The validator's "
-          "cluster-side 'live_traffic' checks are then the ONLY workload "
-          "evidence for this run." % mnt)
-    sys.exit(0)
+    tag = "FAIL    " if require else "ACCEPTED"
+    print("%s: INCONCLUSIVE - no client-side counters for %s." % (tag, mnt))
+    if require:
+        print("          Absence of counters is not evidence of work. Check")
+        print("          the mount is present and of the expected type, or")
+        print("          set OPSTAT_FR14_REQUIRE_TRAFFIC=0 to accept")
+        print("          cluster-side attribution as the only evidence.")
+    else:
+        print("          OPSTAT_FR14_REQUIRE_TRAFFIC=0 was set, so the")
+        print("          validator's cluster-side 'live_traffic' checks are")
+        print("          the ONLY workload evidence for this run.")
+    sys.exit(5 if require else 0)
 if total > 0:
     print("PASS    : %s client I/O through %s during the window: %d operations"
           % (kind, mnt, total))
@@ -348,9 +369,15 @@ echo
 echo "======================================================================"
 if [ "$FAILURES" -eq 0 ] && [ "$VAL_RC" -eq 0 ]; then
   echo "RESULT: PASS - return this ONE file:"
-else
-  echo "RESULT: $FAILURES script failure(s), validate rc $VAL_RC - return the archive anyway:"
+  echo
+  echo "    $ZIP"
+  echo "======================================================================"
+  exit 0
 fi
+echo "RESULT: $FAILURES script failure(s), validate rc $VAL_RC - return the archive anyway:"
 echo
 echo "    $ZIP"
 echo "======================================================================"
+# The banner is not the verdict: the exit status is. The ZIP is packaged
+# either way so a failed run still hands back its evidence.
+exit 1
